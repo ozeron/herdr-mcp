@@ -3,6 +3,7 @@ pub mod close;
 pub mod list;
 pub mod read;
 pub mod run;
+pub mod wait;
 
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};

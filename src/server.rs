@@ -14,6 +14,7 @@ use crate::herdr::{Client, HerdrError};
 use crate::log::Logger;
 use crate::profile::Profile;
 use crate::tools::{self, NOT_IMPLEMENTED};
+use crate::wait::Tuning;
 
 const INSTRUCTIONS: &str = include_str!("instructions.md");
 
@@ -41,6 +42,7 @@ pub struct Inner {
     pub ancestry: Arc<dyn Ancestry>,
     pub caller_env: CallerEnv,
     pub logger: Logger,
+    pub wait: Tuning,
 }
 
 impl Inner {
@@ -72,9 +74,18 @@ impl HerdrMcp {
                 ancestry: config.ancestry,
                 caller_env: config.caller_env,
                 logger: config.logger,
+                wait: Tuning::default(),
             }),
             tool_router,
         }
+    }
+
+    /// Replaces the wait timings; call right after `new`.
+    pub fn with_wait_tuning(mut self, tuning: Tuning) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("tuning is set before the server is shared")
+            .wait = tuning;
+        self
     }
 
     fn finish(
@@ -152,11 +163,17 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Wait for a pane, agent or process to reach a state. Bounded by the wait cap: on timed_out, call again.",
+        description = "Wait for a turn token, agent status, output line or process exit, bounded by the wait cap. A timeout never cancels the work: on timed_out, call again. Idle is not success; read the output.",
         annotations(read_only_hint = true)
     )]
-    async fn herdr_wait(&self) -> Result<CallToolResult, ErrorData> {
-        self.not_implemented("herdr_wait")
+    async fn herdr_wait(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<tools::wait::WaitParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let result = tools::wait::run(&self.inner, &ctx, params).await;
+        self.finish("herdr_wait", started, result)
     }
 
     #[tool(

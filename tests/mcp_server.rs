@@ -213,12 +213,7 @@ async fn control_mode_stubs_return_not_implemented() {
         ..Opts::default()
     })
     .await;
-    for name in [
-        "herdr_wait",
-        "herdr_launch",
-        "herdr_send",
-        "herdr_interrupt",
-    ] {
+    for name in ["herdr_launch", "herdr_send", "herdr_interrupt"] {
         let result = call(&h, name).await;
         assert_eq!(result.is_error, Some(true), "{name}");
         assert_eq!(

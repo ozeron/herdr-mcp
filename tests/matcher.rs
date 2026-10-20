@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use herdr_mcp::matcher::{MatchOutcome, Matcher, wait_for_match};
+use herdr_mcp::matcher::{MatchOutcome, Matcher, tail, wait_for_match};
 
 fn numbered(range: std::ops::Range<u32>) -> String {
     range.map(|n| format!("line {n}\n")).collect()
@@ -176,4 +176,10 @@ async fn wait_propagates_a_read_error() {
     )
     .await;
     assert_eq!(result, Err("gone"));
+}
+
+#[test]
+fn tail_skips_blank_lines_and_tui_rules() {
+    let screen = "answer line\n\n\n────────────\n❯ \n\n────────────\n  status bar\n";
+    assert_eq!(tail(screen), "answer line\n❯\n  status bar");
 }

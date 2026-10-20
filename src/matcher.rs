@@ -121,9 +121,15 @@ where
     }
 }
 
-/// The last lines of `text`, for reporting a timeout.
+/// The last meaningful lines of `text`. Blank lines and TUI rules (box-drawing only) are skipped.
 pub fn tail(text: &str) -> String {
-    let lines = split_lines(text);
+    let lines: Vec<_> = split_lines(text)
+        .into_iter()
+        .filter(|line| {
+            line.chars()
+                .any(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257F}').contains(&c))
+        })
+        .collect();
     let from = lines.len().saturating_sub(TAIL_LINES);
     truncate_tail(lines[from..].join("\n"), TAIL_MAX_CHARS).0
 }

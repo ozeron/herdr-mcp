@@ -171,7 +171,7 @@ async fn send(
     Ok(Matcher::new(&baseline, needle, command))
 }
 
-async fn read_text(client: &Client, pane_id: &str) -> Result<String, HerdrError> {
+pub(crate) async fn read_text(client: &Client, pane_id: &str) -> Result<String, HerdrError> {
     let mut params = PaneReadParams::new(pane_id);
     params.source = ReadSource::RecentUnwrapped;
     params.lines = Some(READ_LINES);
