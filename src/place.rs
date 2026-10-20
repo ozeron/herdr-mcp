@@ -53,7 +53,7 @@ pub struct Options {
     pub label: Option<String>,
 }
 
-/// What this call created, so a failure after placement closes only that (KTD11).
+/// What this call created, so a failure after placement closes only that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Created {
     Pane(String),
@@ -258,12 +258,8 @@ async fn existing(
         return Err(invalid("where.pane takes a pane ID or an agent name"));
     }
     guard::self_guard(resolution.guard_target.as_deref(), &resolved, false)?;
-    let info = client.pane_process_info(Some(&resolved.id)).await?;
-    let shell_in_front = matches!(
-        (info.shell_pid, info.foreground_process_group_id),
-        (Some(shell), Some(front)) if shell == front
-    );
-    if !shell_in_front {
+    let info = client.pane_process_info(&resolved.id).await?;
+    if !info.shell_in_front_strict() {
         return Err(HerdrError::tool(
             "pane_busy",
             format!(

@@ -4,10 +4,7 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, Implementation, MetaObject, ProgressNotificationParam, ServerCapabilities,
-    ServerConfig,
-};
+use rmcp::model::{CallToolResult, Implementation, MetaObject, ServerCapabilities, ServerConfig};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
@@ -30,6 +27,11 @@ const CONTROL_TOOLS: [&str; 5] = [
     "herdr_interrupt",
     "herdr_close",
 ];
+
+/// The calling client's name, as the profile's wait cap keys on it.
+fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    ctx.client_info().map(|info| info.name)
+}
 
 pub struct BridgeConfig {
     pub socket_path: PathBuf,
@@ -130,9 +132,7 @@ impl HerdrMcp {
                 tools::failure_with(err.code(), &err.to_string(), err.details()),
             ),
         };
-        self.inner
-            .logger
-            .call(tool, None, outcome, started.elapsed());
+        self.inner.logger.call(tool, outcome, started.elapsed());
         Ok(response)
     }
 }
@@ -148,12 +148,7 @@ impl HerdrMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let client_info = ctx.client_info();
-        let result = tools::capabilities::run(
-            &self.inner,
-            client_info.as_ref().map(|info| info.name.as_str()),
-        )
-        .await;
+        let result = tools::capabilities::run(&self.inner, client_name(&ctx).as_deref()).await;
         self.finish("herdr_capabilities", started, result)
     }
 
@@ -208,26 +203,11 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::launch::LaunchParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let client_info = ctx.client_info();
-        let progress = ctx.meta.get_progress_token().map(|token| {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::wait::Progress>();
-            let peer = ctx.peer.clone();
-            tokio::spawn(async move {
-                while let Some(tick) = rx.recv().await {
-                    let note =
-                        ProgressNotificationParam::new(token.clone(), tick.elapsed.as_secs_f64())
-                            .with_total(tick.cap.as_secs_f64())
-                            .with_message("still waiting");
-                    let _ = peer.notify_progress(note).await;
-                }
-            });
-            tx
-        });
         let result = tools::launch::run(
             &self.inner,
-            client_info.as_ref().map(|info| info.name.as_str()),
+            client_name(&ctx).as_deref(),
             ctx.ct.clone(),
-            progress,
+            tools::progress_sink(&ctx),
             params,
         )
         .await;
@@ -244,13 +224,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::run::RunParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let client_info = ctx.client_info();
-        let result = tools::run::run(
-            &self.inner,
-            client_info.as_ref().map(|info| info.name.as_str()),
-            params,
-        )
-        .await;
+        let result = tools::run::run(&self.inner, client_name(&ctx).as_deref(), params).await;
         self.finish("herdr_run", started, result)
     }
 
@@ -264,13 +238,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::send::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let client_info = ctx.client_info();
-        let result = tools::send::run(
-            &self.inner,
-            client_info.as_ref().map(|info| info.name.as_str()),
-            params,
-        )
-        .await;
+        let result = tools::send::run(&self.inner, client_name(&ctx).as_deref(), params).await;
         self.finish("herdr_send", started, result)
     }
 

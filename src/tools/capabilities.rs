@@ -38,9 +38,14 @@ pub(crate) fn mcp_status(inner: &Inner, kind: &str) -> McpStatus {
 
 pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value, HerdrError> {
     let client = inner.client()?;
-    let compat = client.check_compat().await?;
-    let resolution = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()).await?;
-    let manifests = client.agent_manifests().await?;
+    // `join!`, not `try_join!`, so an error is chosen by order (compat, caller, manifests) and not
+    // by whichever call fails first.
+    let (compat, resolution, manifests) = tokio::join!(
+        client.check_compat(),
+        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
+        client.agent_manifests(),
+    );
+    let (compat, resolution, manifests) = (compat?, resolution?, manifests?);
 
     let agents: Vec<Value> = manifests
         .iter()

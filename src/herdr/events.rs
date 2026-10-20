@@ -2,7 +2,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::client::LineReader;
+use super::client::{LineReader, error_parts};
 use super::error::{ApiErrorCode, HerdrError};
 use super::types::EventEnvelope;
 
@@ -29,6 +29,11 @@ impl Subscription {
 
     pub async fn next(&mut self) -> Option<SubscriptionEvent> {
         self.rx.recv().await
+    }
+
+    /// The next event already queued, without waiting.
+    pub fn try_next(&mut self) -> Option<SubscriptionEvent> {
+        self.rx.try_recv().ok()
     }
 }
 
@@ -61,21 +66,10 @@ async fn drain(mut reader: LineReader, tx: mpsc::UnboundedSender<SubscriptionEve
             }
         };
         if let Some(error) = value.get("error") {
-            let code = error
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let event = if ApiErrorCode::parse(code) == ApiErrorCode::EventsLost {
-                SubscriptionEvent::EventsLost
-            } else {
-                SubscriptionEvent::Error(HerdrError::Api {
-                    code: ApiErrorCode::parse(code),
-                    message: error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .into(),
-                })
+            let (code, message) = error_parts(error);
+            let event = match ApiErrorCode::parse(code) {
+                ApiErrorCode::EventsLost => SubscriptionEvent::EventsLost,
+                code => SubscriptionEvent::Error(HerdrError::Api { code, message }),
             };
             let _ = tx.send(event);
             return;

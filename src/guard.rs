@@ -1,4 +1,4 @@
-use crate::herdr::{ApiErrorCode, Client, HerdrError, SessionSnapshot};
+use crate::herdr::{Client, HerdrError, SessionSnapshot};
 use crate::provenance;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,19 +79,12 @@ pub async fn resolve_target(
     };
     match client.agent_get(target).await {
         Ok(agent) => resolve(snapshot, &agent.pane_id).ok_or_else(not_found),
-        Err(HerdrError::Api {
-            code:
-                ApiErrorCode::PaneNotFound
-                | ApiErrorCode::InvalidRequest
-                | ApiErrorCode::AgentNotRunning,
-            ..
-        }) => Err(not_found()),
-        Err(HerdrError::Api { code, .. }) if code.as_str() == "agent_not_found" => Err(not_found()),
+        Err(err) if err.is_target_gone() => Err(not_found()),
         Err(err) => Err(err),
     }
 }
 
-/// KTD10: refuse a target that is, or contains, the pane the guards protect.
+/// Refuse a target that is, or contains, the pane the guards protect.
 /// `guard_pane` is `Resolution::guard_target`, which fails closed for an unverified caller.
 pub fn self_guard(
     guard_pane: Option<&str>,
@@ -113,7 +106,7 @@ pub fn self_guard(
     Ok(())
 }
 
-/// KTD12: refuse a target with any pane no bridge launched, unless `force`.
+/// Refuse a target with any pane no bridge launched, unless `force`.
 pub fn provenance_guard(
     snapshot: &SessionSnapshot,
     target: &Resolved,

@@ -322,6 +322,90 @@ async fn list_filters_by_label() {
     assert_eq!(pane_ids(&list), ["w1:p4"]);
 }
 
+/// Every filter combination lists exactly what pruning the unfiltered tree by hand would.
+#[tokio::test]
+async fn list_filters_match_pruning_the_unfiltered_tree() {
+    let h = start(Some("w1:p1")).await;
+    script_tree(&h.fake);
+    let full = ok(&h, "herdr_list", json!({})).await;
+
+    let contains = |text: Option<&Value>, needle: &str| {
+        text.and_then(Value::as_str)
+            .is_some_and(|text| text.to_lowercase().contains(needle))
+    };
+    for kind in [None, Some("agent"), Some("process"), Some("shell")] {
+        for scope in [None, Some("tab"), Some("workspace")] {
+            for label in [None, Some("DEV"), Some("rev"), Some("zzz")] {
+                for status in [None, Some(["unknown"]), Some(["blocked"])] {
+                    let mut args = json!({});
+                    if let Some(kind) = kind {
+                        args["kind"] = json!(kind);
+                    }
+                    if let Some(scope) = scope {
+                        args["scope"] = json!(scope);
+                    }
+                    if let Some(label) = label {
+                        args["label_contains"] = json!(label);
+                    }
+                    if let Some(status) = status {
+                        args["status"] = json!(status);
+                    }
+                    let h = start(Some("w1:p1")).await;
+                    script_tree(&h.fake);
+                    let got = ok(&h, "herdr_list", args.clone()).await;
+
+                    let mut expected = full.clone();
+                    let needle = label.map(str::to_lowercase);
+                    for workspace in expected["workspaces"].as_array_mut().unwrap() {
+                        let ws_id = workspace["id"].clone();
+                        let ws_label = workspace["label"].clone();
+                        for tab in workspace["tabs"].as_array_mut().unwrap() {
+                            let tab_id = tab["id"].clone();
+                            let tab_label = tab["label"].clone();
+                            let in_scope = match scope {
+                                Some("tab") => tab_id == "w1:t1",
+                                Some("workspace") => ws_id == "w1",
+                                _ => true,
+                            };
+                            tab["panes"].as_array_mut().unwrap().retain(|pane| {
+                                in_scope
+                                    && kind.is_none_or(|kind| pane["kind"] == kind)
+                                    && status.is_none_or(|status| pane["status"] == status[0])
+                                    && needle.as_deref().is_none_or(|needle| {
+                                        contains(Some(&ws_label), needle)
+                                            || contains(Some(&tab_label), needle)
+                                            || contains(pane.get("label"), needle)
+                                            || contains(pane.get("name"), needle)
+                                    })
+                            });
+                        }
+                        workspace["tabs"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|tab| !tab["panes"].as_array().unwrap().is_empty());
+                    }
+                    expected["workspaces"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|workspace| !workspace["tabs"].as_array().unwrap().is_empty());
+                    assert_eq!(got, expected, "filters {args}");
+                    if kind == Some("agent") {
+                        // Only the caller check probes; no plain pane does.
+                        let probed = h
+                            .fake
+                            .requests()
+                            .iter()
+                            .filter(|r| r["method"] == "pane.process_info")
+                            .filter(|r| r["params"]["pane_id"] != "w1:p1")
+                            .count();
+                        assert_eq!(probed, 0, "filters {args}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn blocked_agent_has_a_short_reason_and_idle_agent_has_none() {
     let h = start(Some("w1:p1")).await;

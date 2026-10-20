@@ -1,21 +1,16 @@
-use std::time::Duration;
-
 use rmcp::RoleServer;
-use rmcp::model::ProgressNotificationParam;
 use rmcp::schemars::JsonSchema;
 use rmcp::service::RequestContext;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use crate::caller::resolve_caller;
 use crate::guard::{self, Resolved, TargetKind};
 use crate::herdr::{AgentStatus, HerdrError};
 use crate::server::Inner;
+use crate::tools::DEFAULT_TIMEOUT;
 use crate::turn::Turn;
 use crate::wait::{self, Condition, Request};
-
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -111,28 +106,25 @@ pub async fn run(
         .as_ref()
         .map(|info| info.client_info.name.as_str());
     let cap = inner.profile.wait_cap(client_name);
-    let asked = params
-        .timeout_ms
-        .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
-    let note = (asked > cap).then(|| {
-        format!(
-            "timeout_ms capped at the wait cap of {} ms",
-            cap.as_millis()
-        )
-    });
+    let (timeout, note) = super::clamp_timeout(params.timeout_ms, cap, DEFAULT_TIMEOUT);
 
     let client = inner.client()?;
     let pane = match &params.turn {
         Some(turn) => {
-            let resolution =
-                resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()).await?;
-            if let Some(target) = &params.target {
-                let snapshot = client.session_snapshot().await?;
-                let named = guard::resolve_target(&client, &snapshot, target).await?;
-                if named.id != turn.pane {
-                    return Err(invalid("target is not the pane this turn token belongs to"));
+            let caller = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref());
+            let resolution = match &params.target {
+                Some(target) => {
+                    // Joined, but checked in the old order: caller first, then snapshot.
+                    let (resolution, snapshot) = tokio::join!(caller, client.session_snapshot());
+                    let (resolution, snapshot) = (resolution?, snapshot?);
+                    let named = guard::resolve_target(&client, &snapshot, target).await?;
+                    if named.id != turn.pane {
+                        return Err(invalid("target is not the pane this turn token belongs to"));
+                    }
+                    resolution
                 }
-            }
+                None => caller.await?,
+            };
             let own = Resolved {
                 kind: TargetKind::Pane,
                 id: turn.pane.clone(),
@@ -170,31 +162,14 @@ pub async fn run(
     let request = Request {
         pane,
         condition,
-        cap: asked.min(cap),
+        cap: timeout,
     };
-    let progress_token = ctx.meta.get_progress_token();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let work = wait::wait(
-        &client,
-        &inner.wait,
-        request,
-        progress_token.is_some().then_some(tx),
-    );
+    let work = wait::wait(&client, &inner.wait, request, super::progress_sink(ctx));
     tokio::pin!(work);
-    let mut out = loop {
-        tokio::select! {
-            out = &mut work => break out?,
-            () = ctx.ct.cancelled() => {
-                return Err(HerdrError::tool("cancelled", "the client cancelled the wait"));
-            }
-            Some(tick) = rx.recv() => {
-                if let Some(token) = &progress_token {
-                    let note = ProgressNotificationParam::new(token.clone(), tick.elapsed.as_secs_f64())
-                        .with_total(tick.cap.as_secs_f64())
-                        .with_message("still waiting");
-                    let _ = ctx.peer.notify_progress(note).await;
-                }
-            }
+    let mut out = tokio::select! {
+        out = &mut work => out?,
+        () = ctx.ct.cancelled() => {
+            return Err(HerdrError::tool("cancelled", "the client cancelled the wait"));
         }
     };
     if let Some(note) = note {

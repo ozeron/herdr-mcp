@@ -10,6 +10,10 @@ pub enum ApiErrorCode {
     PaneNotFound,
     InvalidRequest,
     EventsLost,
+    AgentNotFound,
+    AgentPaneBusy,
+    AgentNotIdle,
+    Timeout,
     Other(String),
 }
 
@@ -22,6 +26,10 @@ impl ApiErrorCode {
             "pane_not_found" => Self::PaneNotFound,
             "invalid_request" => Self::InvalidRequest,
             "events_lost" => Self::EventsLost,
+            "agent_not_found" => Self::AgentNotFound,
+            "agent_pane_busy" => Self::AgentPaneBusy,
+            "agent_not_idle" => Self::AgentNotIdle,
+            "timeout" => Self::Timeout,
             other => Self::Other(other.into()),
         }
     }
@@ -34,6 +42,10 @@ impl ApiErrorCode {
             Self::PaneNotFound => "pane_not_found",
             Self::InvalidRequest => "invalid_request",
             Self::EventsLost => "events_lost",
+            Self::AgentNotFound => "agent_not_found",
+            Self::AgentPaneBusy => "agent_pane_busy",
+            Self::AgentNotIdle => "agent_not_idle",
+            Self::Timeout => "timeout",
             Self::Other(code) => code,
         }
     }
@@ -73,6 +85,20 @@ pub enum HerdrError {
 }
 
 impl HerdrError {
+    /// The pane, agent or request no longer resolves: Herdr answers a vanished target with any of these.
+    pub fn is_target_gone(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                code: ApiErrorCode::PaneNotFound
+                    | ApiErrorCode::InvalidRequest
+                    | ApiErrorCode::AgentNotRunning
+                    | ApiErrorCode::AgentNotFound,
+                ..
+            }
+        )
+    }
+
     pub fn code(&self) -> &str {
         match self {
             Self::NotRunning { .. } => "herdr_not_running",

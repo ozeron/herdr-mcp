@@ -633,7 +633,7 @@ async fn read_and_control_methods_send_the_expected_wire_requests() {
             "tty": "/dev/ttys001",
             "foreground_processes": [{"pid": 11, "name": "cargo", "cmdline": "cargo test"}]}}),
     );
-    let info = c.pane_process_info(Some("w1:p1")).await.unwrap();
+    let info = c.pane_process_info("w1:p1").await.unwrap();
     assert_eq!(info.foreground_processes[0].name, "cargo");
     assert_eq!(fake.last_request()["params"], json!({"pane_id": "w1:p1"}));
 

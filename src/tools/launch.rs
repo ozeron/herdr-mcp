@@ -13,12 +13,12 @@ use crate::caller::resolve_caller;
 use crate::cli::ToolMode;
 use crate::herdr::{AgentInfo, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError};
 use crate::install::shim::SHIM_NAME;
-use crate::matcher::tail;
+use crate::matcher::{read_text, tail};
 use crate::place::{self, Options, Placed, Where};
 use crate::providers::{is_ready, mcp_args};
 use crate::server::Inner;
+use crate::tools::DEFAULT_TIMEOUT;
 use crate::tools::capabilities::{McpStatus, mcp_status};
-use crate::tools::run::read_text;
 use crate::tools::send::{gated_prompt, prompt_error, turn_for};
 use crate::turn::TurnFrom;
 use crate::wait::{self, Condition, Progress, Request};
@@ -29,7 +29,6 @@ pub const READY_POLL: Duration = Duration::from_millis(250);
 pub const QUIET_WINDOW: Duration = Duration::from_secs(3);
 pub const STARTUP_GRACE: Duration = Duration::from_secs(3);
 pub const IDLE_POLL: Duration = Duration::from_millis(250);
-pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 pub struct LaunchTuning {
@@ -183,7 +182,7 @@ pub async fn run(
 
     let timeout = params
         .start_timeout_ms
-        .map_or(DEFAULT_START_TIMEOUT, Duration::from_millis);
+        .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
     let ready = await_ready(
         &client,
         &inner.launch,
@@ -286,8 +285,8 @@ pub async fn run(
     }
 }
 
-/// Per-launch MCP args apply only when no user-scope entry of ours exists (KTD5), and carry
-/// `--tools read` unless the call asked for control (KTD17).
+/// Per-launch MCP args apply only when no user-scope entry of ours exists, and carry
+/// `--tools read` unless the call asked for control.
 fn injection(
     inner: &Inner,
     kind: &str,
@@ -330,21 +329,6 @@ fn bridge_binary(inner: &Inner) -> Result<String, HerdrError> {
     })
 }
 
-fn shell_in_front(info: &crate::herdr::PaneProcessInfo) -> bool {
-    matches!(
-        (info.shell_pid, info.foreground_process_group_id),
-        (Some(shell), Some(front)) if shell == front
-    )
-}
-
-/// A non-shell foreground group is running: the typed command has exec'd.
-fn left_shell(info: &crate::herdr::PaneProcessInfo) -> bool {
-    matches!(
-        (info.shell_pid, info.foreground_process_group_id),
-        (Some(shell), Some(front)) if front != shell && front != 0
-    )
-}
-
 async fn terminal_of(client: &Client, pane: &str) -> Option<String> {
     let snapshot = client.session_snapshot().await.ok()?;
     snapshot
@@ -354,7 +338,7 @@ async fn terminal_of(client: &Client, pane: &str) -> Option<String> {
         .map(|candidate| candidate.terminal_id)
 }
 
-/// KTD7 pre-start: a fresh pane reports `agent_pane_busy` while its shell initialises. Retry while
+/// A fresh pane reports `agent_pane_busy` while its shell initialises. Retry while
 /// the shell is in front and the terminal is unchanged.
 async fn start_agent(
     client: &Client,
@@ -367,19 +351,20 @@ async fn start_agent(
     loop {
         let busy = match client.agent_start(params).await {
             Ok(_) => return Ok(()),
-            Err(HerdrError::Api { code, message }) if code.as_str() == "agent_pane_busy" => {
-                HerdrError::Api { code, message }
-            }
+            Err(
+                err @ HerdrError::Api {
+                    code: ApiErrorCode::AgentPaneBusy,
+                    ..
+                },
+            ) => err,
             Err(err) => return Err(err),
         };
         if Instant::now() >= deadline {
             return Err(busy);
         }
-        let initialising = client
-            .pane_process_info(Some(pane))
-            .await
-            .is_ok_and(|info| shell_in_front(&info));
-        let current = terminal_of(client, pane).await;
+        let (info, current) =
+            tokio::join!(client.pane_process_info(pane), terminal_of(client, pane));
+        let initialising = info.is_ok_and(|info| info.shell_in_front_strict());
         let unchanged = match (&terminal, &current) {
             (Some(was), Some(now)) => was == now,
             (None, Some(_)) => true,
@@ -398,7 +383,7 @@ struct NotReady {
     cleanup: bool,
 }
 
-/// KTD7 readiness plus the probed quiet window: after first ready, the agent must show no
+/// Readiness plus the probed quiet window: after first ready, the agent must show no
 /// `state_change_seq` change for `quiet_window` before it is prompted.
 async fn await_ready(
     client: &Client,
@@ -434,11 +419,12 @@ async fn await_ready(
             });
         }
         if agent.launch_pending
-            && let Ok(info) = client.pane_process_info(Some(pane)).await
+            && let Ok(info) = client.pane_process_info(pane).await
         {
-            if left_shell(&info) {
+            // A non-shell foreground group means the typed command has exec'd.
+            if info.left_shell_group().is_some() {
                 seen_group = true;
-            } else if shell_in_front(&info)
+            } else if info.shell_in_front_strict()
                 && (seen_group || started.elapsed() >= tuning.startup_grace)
             {
                 let mut details = progress(placed, name, "started");
@@ -472,6 +458,7 @@ async fn await_ready(
         }
 
         if now >= deadline {
+            // One agent.get after a readiness timeout releases the name Herdr reserved for the start.
             let _ = client.agent_get(pane).await;
             return Err(NotReady {
                 err: HerdrError::detailed(

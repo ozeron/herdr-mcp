@@ -175,6 +175,48 @@ pub struct PaneProcessInfo {
     pub foreground_processes: Vec<PaneProcessInfoProcess>,
 }
 
+impl PaneProcessInfo {
+    /// The shell's group is in front. A missing shell or foreground group is not a match.
+    pub fn shell_in_front_strict(&self) -> bool {
+        matches!(
+            (self.shell_pid, self.foreground_process_group_id),
+            (Some(shell), Some(front)) if shell == front
+        )
+    }
+
+    /// The shell's group is in front, or no foreground group is reported (a missing or zero
+    /// group counts as the shell).
+    pub fn shell_in_front_or_unknown(&self) -> bool {
+        match self.foreground_process_group_id {
+            None | Some(0) => true,
+            Some(front) => Some(front) == self.shell_pid,
+        }
+    }
+
+    /// The foreground group when both ids are known and a non-shell group (not 0) is in front.
+    pub fn left_shell_group(&self) -> Option<u32> {
+        match (self.shell_pid, self.foreground_process_group_id) {
+            (Some(shell), Some(front)) if front != shell && front != 0 => Some(front),
+            _ => None,
+        }
+    }
+
+    /// The foreground group to interrupt: any non-zero group other than the shell's. Unlike
+    /// `left_shell_group`, an unknown shell still yields the foreground group.
+    pub fn interrupt_group(&self) -> Option<u32> {
+        match (self.shell_pid, self.foreground_process_group_id) {
+            (Some(shell), Some(front)) if shell == front => None,
+            (_, Some(front)) if front != 0 => Some(front),
+            _ => None,
+        }
+    }
+
+    /// Both the shell and the foreground group are reported.
+    pub fn both_groups_known(&self) -> bool {
+        self.shell_pid.is_some() && self.foreground_process_group_id.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TabInfo {
     pub tab_id: String,
@@ -265,13 +307,6 @@ pub struct AgentManifestInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pong {
-    pub version: String,
-    pub protocol: u32,
-    pub capabilities: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Compat {
     pub version: String,
     pub protocol: u32,
     pub capabilities: Option<Value>,

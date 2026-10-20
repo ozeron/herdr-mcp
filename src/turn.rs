@@ -57,7 +57,7 @@ impl Turn {
     }
 }
 
-/// Applies the KTD6 rules to one `agent.get` snapshot.
+/// Judges one `agent.get` snapshot.
 ///
 /// `shell_pid` is the pane's current shell, when it could be read.
 pub fn evaluate(turn: &Turn, agent: &AgentInfo, shell_pid: Option<u32>) -> Verdict {

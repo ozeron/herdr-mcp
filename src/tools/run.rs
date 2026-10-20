@@ -10,16 +10,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::caller::resolve_caller;
-use crate::herdr::{
-    Client, HerdrError, PaneProcessInfo, PaneReadParams, PaneSendInputParams, ReadSource,
-};
-use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, READ_LINES, tail, wait_for_match};
-use crate::output::strip_ansi;
+use crate::herdr::{Client, HerdrError, PaneProcessInfo, PaneSendInputParams};
+use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, read_text, tail, wait_for_match};
 use crate::place::{self, Options, Placed, Where};
 use crate::server::Inner;
+use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 
-pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const OBSERVE_WINDOW: Duration = Duration::from_secs(2);
+const PGID_OBSERVE_WINDOW: Duration = Duration::from_secs(2);
 const STABLE_FOR: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -96,25 +93,21 @@ pub async fn run(
 
     let cap = inner.profile.wait_cap(client_info_name);
     let mut note = None;
-    let timeout = params.ready.as_ref().map_or(OBSERVE_WINDOW, |ready| {
-        let asked = ready
-            .timeout_ms
-            .map_or(DEFAULT_READY_TIMEOUT, Duration::from_millis);
-        if asked > cap {
-            note = Some(format!(
-                "timeout_ms capped at the wait cap of {} ms",
-                cap.as_millis()
-            ));
+    let timeout = match &params.ready {
+        Some(ready) => {
+            let (timeout, capped) = clamp_timeout(ready.timeout_ms, cap, DEFAULT_TIMEOUT);
+            note = capped;
+            timeout
         }
-        asked.min(cap)
-    });
+        None => PGID_OBSERVE_WINDOW,
+    };
 
     let tracker = Arc::new(Mutex::new(Tracker::new(first_word(&params.command))));
     let observer = tokio::spawn(observe_pgid(
         inner.client()?,
         placed.pane_id.clone(),
         Arc::clone(&tracker),
-        timeout.min(OBSERVE_WINDOW),
+        timeout.min(PGID_OBSERVE_WINDOW),
     ));
 
     let abort = observer.abort_handle();
@@ -137,7 +130,7 @@ pub async fn run(
     abort.abort();
 
     if tracker.lock().unwrap().pgid().is_none()
-        && let Ok(info) = client.pane_process_info(Some(&placed.pane_id)).await
+        && let Ok(info) = client.pane_process_info(&placed.pane_id).await
     {
         tracker.lock().unwrap().observe(&info, Instant::now());
     }
@@ -192,14 +185,6 @@ async fn send(
     Ok(Matcher::new(&baseline, needle, command))
 }
 
-pub(crate) async fn read_text(client: &Client, pane_id: &str) -> Result<String, HerdrError> {
-    let mut params = PaneReadParams::new(pane_id);
-    params.source = ReadSource::RecentUnwrapped;
-    params.lines = Some(READ_LINES);
-    let read = client.pane_read(&params).await?;
-    Ok(strip_ansi(&read.text))
-}
-
 /// Basename of the command's first word, skipping `env` and `VAR=value` assignments.
 fn first_word(command: &str) -> String {
     command
@@ -217,7 +202,7 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
-/// Picks the command's process group among the shell's prompt helpers (KTD13): the group holding a
+/// Picks the command's process group among the shell's prompt helpers: the group holding a
 /// process named like the command, else one that stayed in front across polls 200 ms apart.
 struct Tracker {
     name: String,
@@ -241,12 +226,9 @@ impl Tracker {
     }
 
     fn observe(&mut self, info: &PaneProcessInfo, now: Instant) {
-        let front = match (info.shell_pid, info.foreground_process_group_id) {
-            (Some(shell), Some(front)) if front != shell && front != 0 => front,
-            _ => {
-                self.candidate = None;
-                return;
-            }
+        let Some(front) = info.left_shell_group() else {
+            self.candidate = None;
+            return;
         };
         if self.matched.is_none() && self.names_command(info) {
             self.matched = Some(front);
@@ -286,7 +268,7 @@ async fn observe_pgid(
 ) {
     let deadline = Instant::now() + window;
     while tracker.lock().unwrap().matched.is_none() && Instant::now() < deadline {
-        if let Ok(info) = client.pane_process_info(Some(&pane_id)).await {
+        if let Ok(info) = client.pane_process_info(&pane_id).await {
             tracker.lock().unwrap().observe(&info, Instant::now());
         }
         tokio::time::sleep(POLL_INTERVAL).await;

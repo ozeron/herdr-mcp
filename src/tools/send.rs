@@ -13,10 +13,10 @@ use crate::herdr::{
 };
 use crate::provenance;
 use crate::server::Inner;
-use crate::tools::interrupt::{self, InterruptParams};
+use crate::tools::interrupt;
+use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::Turn;
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const ACTIVITY_GATE_MS: u64 = 6000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -113,7 +113,8 @@ pub async fn run(
         params.allow_self.unwrap_or(false),
     )?;
     let pane = target.id.as_str();
-    let is_agent = snapshot.agents.iter().any(|agent| agent.pane_id == pane);
+    let agent = snapshot.agents.iter().find(|agent| agent.pane_id == pane);
+    let is_agent = agent.is_some();
 
     match params.prompt.as_deref() {
         Some(prompt) => {
@@ -124,12 +125,13 @@ pub async fn run(
                 ));
             }
             let cap = inner.profile.wait_cap(client_info_name);
-            let timeout = params
-                .timeout_ms
-                .map_or(DEFAULT_TIMEOUT, Duration::from_millis)
-                .min(cap);
+            let (timeout, _) = clamp_timeout(params.timeout_ms, cap, DEFAULT_TIMEOUT);
             let mode = params.mode.unwrap_or(SendMode::Auto);
-            send_prompt(inner, &client, pane, prompt, mode, timeout, &params).await
+            let pacing = Pacing {
+                idle_poll: inner.launch.idle_poll,
+                settle: inner.interrupt_settle,
+            };
+            send_prompt(&client, pane, agent, prompt, mode, timeout, pacing).await
         }
         None => send_raw(&client, &resolution, pane, is_agent, &params).await,
     }
@@ -144,14 +146,23 @@ fn blocked(pane: &str) -> HerdrError {
     )
 }
 
+/// Waits between polls and after an interrupt.
+#[derive(Debug, Clone, Copy)]
+struct Pacing {
+    idle_poll: Duration,
+    settle: Duration,
+}
+
+/// `agent` is the pane's agent from the snapshot the target was resolved and guarded in, so a
+/// restart interrupts it without resolving and guarding the target again.
 async fn send_prompt(
-    inner: &Inner,
     client: &Client,
     pane: &str,
+    agent: Option<&AgentInfo>,
     prompt: &str,
     mode: SendMode,
     timeout: Duration,
-    params: &SendParams,
+    pacing: Pacing,
 ) -> Result<Value, HerdrError> {
     let status = client.agent_get(pane).await?.agent_status;
     if status == AgentStatus::Blocked {
@@ -181,26 +192,23 @@ async fn send_prompt(
             }
         },
         SendMode::AfterIdle => {
-            wait_idle(client, inner, pane, deadline, false).await?;
+            wait_idle(client, pacing.idle_poll, pane, deadline, false).await?;
             ("sent_after_idle", false)
         }
         SendMode::Restart => {
             let mut interrupted = false;
             if !matches!(status, AgentStatus::Idle | AgentStatus::Done) {
-                interrupt::run(
-                    inner,
-                    InterruptParams {
-                        target: pane.to_string(),
-                        method: None,
-                        keys: None,
-                        signal: None,
-                        allow_self: params.allow_self,
-                    },
+                interrupt::interrupt_pane(
+                    client,
+                    pacing.settle,
+                    pane,
+                    agent,
+                    interrupt::Action::default(),
                 )
                 .await?;
                 interrupted = true;
             }
-            wait_idle(client, inner, pane, deadline, interrupted).await?;
+            wait_idle(client, pacing.idle_poll, pane, deadline, interrupted).await?;
             ("restarted", interrupted)
         }
     };
@@ -228,7 +236,7 @@ async fn steer(client: &Client, pane: &str, prompt: &str) -> Result<Value, Herdr
 
 async fn wait_idle(
     client: &Client,
-    inner: &Inner,
+    idle_poll: Duration,
     pane: &str,
     deadline: Instant,
     interrupted: bool,
@@ -246,7 +254,7 @@ async fn wait_idle(
                 json!({"pane": pane, "interrupted": interrupted}),
             ));
         }
-        sleep(inner.launch.idle_poll).await;
+        sleep(idle_poll).await;
     }
 }
 
@@ -275,7 +283,7 @@ pub(crate) async fn gated_prompt(
 /// nor blocked.
 pub(crate) async fn turn_for(client: &Client, agent: &AgentInfo) -> Option<Turn> {
     let shell = client
-        .pane_process_info(Some(&agent.pane_id))
+        .pane_process_info(&agent.pane_id)
         .await
         .ok()
         .and_then(|info| info.shell_pid);

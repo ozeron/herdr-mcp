@@ -49,7 +49,7 @@ pub fn provider(kind: Option<&str>) -> &'static Provider {
         .unwrap_or(&FALLBACK)
 }
 
-/// KTD7: ready at `idle` or `done` with `interactive_ready`, or `idle` or `done` once the launch
+/// Ready at `idle` or `done` with `interactive_ready`, or `idle` or `done` once the launch
 /// is no longer pending, or, for Codex, `unknown` with `interactive_ready`.
 pub fn is_ready(kind: Option<&str>, agent: &AgentInfo) -> bool {
     match agent.agent_status {

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::caller::resolve_caller;
 use crate::guard::{self, TargetKind};
-use crate::herdr::{AgentStatus, Client, HerdrError, PaneProcessInfo};
+use crate::herdr::{AgentInfo, AgentStatus, Client, HerdrError, PaneProcessInfo};
 use crate::providers::{PROCESS_INTERRUPT_KEY, provider};
 use crate::server::Inner;
 
@@ -60,23 +60,10 @@ impl Signal {
     }
 }
 
-enum Fronted {
-    Shell,
-    Group(u32),
-}
-
-fn front(info: &PaneProcessInfo) -> Fronted {
-    match (info.shell_pid, info.foreground_process_group_id) {
-        (Some(shell), Some(front)) if shell == front => Fronted::Shell,
-        (_, Some(front)) if front != 0 => Fronted::Group(front),
-        _ => Fronted::Shell,
-    }
-}
-
 fn label(info: &PaneProcessInfo) -> &'static str {
-    match front(info) {
-        Fronted::Shell => "shell",
-        Fronted::Group(_) => "running",
+    match info.interrupt_group() {
+        None => "shell",
+        Some(_) => "running",
     }
 }
 
@@ -104,19 +91,40 @@ pub async fn run(inner: &Inner, params: InterruptParams) -> Result<Value, HerdrE
     )?;
 
     let pane = target.id.as_str();
-    let agent_kind = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.pane_id == pane)
-        .map(|agent| agent.agent.clone());
-    let agent_provider = agent_kind.as_ref().map(|kind| provider(kind.as_deref()));
+    let agent = snapshot.agents.iter().find(|agent| agent.pane_id == pane);
+    let action = Action {
+        method: params.method,
+        keys: params.keys,
+        signal: params.signal,
+    };
+    interrupt_pane(&client, inner.interrupt_settle, pane, agent, action).await
+}
 
-    match params.method.unwrap_or(Method::Auto) {
-        Method::Signal => signal(&client, inner, pane, params.signal.unwrap_or(Signal::Int)).await,
+/// How to interrupt, apart from where.
+#[derive(Debug, Default)]
+pub(crate) struct Action {
+    pub method: Option<Method>,
+    pub keys: Option<Vec<String>>,
+    pub signal: Option<Signal>,
+}
+
+/// Interrupts a pane the caller has already resolved and guarded. `agent` is the pane's agent
+/// from the snapshot the target was resolved in, if it has one.
+pub(crate) async fn interrupt_pane(
+    client: &Client,
+    settle: Duration,
+    pane: &str,
+    agent: Option<&AgentInfo>,
+    action: Action,
+) -> Result<Value, HerdrError> {
+    let agent_provider = agent.map(|agent| provider(agent.agent.as_deref()));
+
+    match action.method.unwrap_or(Method::Auto) {
+        Method::Signal => signal(client, settle, pane, action.signal.unwrap_or(Signal::Int)).await,
         Method::Keys => {
             let default = agent_provider.map_or(PROCESS_INTERRUPT_KEY, |p| p.interrupt_key);
-            let keys = params.keys.unwrap_or_else(|| vec![default.to_string()]);
-            send_keys(&client, inner, pane, agent_provider.is_some(), keys, None).await
+            let keys = action.keys.unwrap_or_else(|| vec![default.to_string()]);
+            send_keys(client, settle, pane, agent_provider.is_some(), keys, None).await
         }
         Method::Auto => match agent_provider {
             Some(provider) => {
@@ -124,7 +132,7 @@ pub async fn run(inner: &Inner, params: InterruptParams) -> Result<Value, HerdrE
                 match status {
                     AgentStatus::Working => {
                         let keys = vec![provider.interrupt_key.to_string()];
-                        send_keys(&client, inner, pane, true, keys, provider.interrupt_note).await
+                        send_keys(client, settle, pane, true, keys, provider.interrupt_note).await
                     }
                     AgentStatus::Idle | AgentStatus::Done => {
                         Ok(no_active_work(pane, "auto", status_name(status)))
@@ -140,12 +148,12 @@ pub async fn run(inner: &Inner, params: InterruptParams) -> Result<Value, HerdrE
                 }
             }
             None => {
-                let info = client.pane_process_info(Some(pane)).await?;
-                if matches!(front(&info), Fronted::Shell) {
+                let info = client.pane_process_info(pane).await?;
+                if info.interrupt_group().is_none() {
                     return Ok(no_active_work(pane, "auto", "shell"));
                 }
                 let keys = vec![PROCESS_INTERRUPT_KEY.to_string()];
-                send_keys(&client, inner, pane, false, keys, None).await
+                send_keys(client, settle, pane, false, keys, None).await
             }
         },
     }
@@ -163,21 +171,21 @@ fn status_name(status: AgentStatus) -> &'static str {
 
 async fn status_after(
     client: &Client,
-    inner: &Inner,
+    settle: Duration,
     pane: &str,
     is_agent: bool,
 ) -> Result<String, HerdrError> {
-    tokio::time::sleep(inner.interrupt_settle).await;
+    tokio::time::sleep(settle).await;
     if is_agent {
         Ok(status_name(client.agent_get(pane).await?.agent_status).to_string())
     } else {
-        Ok(label(&client.pane_process_info(Some(pane)).await?).to_string())
+        Ok(label(&client.pane_process_info(pane).await?).to_string())
     }
 }
 
 async fn send_keys(
     client: &Client,
-    inner: &Inner,
+    settle: Duration,
     pane: &str,
     is_agent: bool,
     keys: Vec<String>,
@@ -190,7 +198,7 @@ async fn send_keys(
     }
     let mut out = json!({
         "result": "interrupt_requested", "method": "keys", "pane": pane, "keys": keys,
-        "status_after": status_after(client, inner, pane, is_agent).await?,
+        "status_after": status_after(client, settle, pane, is_agent).await?,
     });
     if let Some(note) = note {
         out["note"] = json!(note);
@@ -200,14 +208,13 @@ async fn send_keys(
 
 async fn signal(
     client: &Client,
-    inner: &Inner,
+    settle: Duration,
     pane: &str,
     signal: Signal,
 ) -> Result<Value, HerdrError> {
-    let info = client.pane_process_info(Some(pane)).await?;
-    let pgid = match front(&info) {
-        Fronted::Shell => return Ok(no_active_work(pane, "signal", "shell")),
-        Fronted::Group(pgid) => pgid,
+    let info = client.pane_process_info(pane).await?;
+    let Some(pgid) = info.interrupt_group() else {
+        return Ok(no_active_work(pane, "signal", "shell"));
     };
     let Some(group) = i32::try_from(pgid).ok().filter(|group| *group > 1) else {
         return Err(HerdrError::tool(
@@ -244,7 +251,7 @@ async fn signal(
     let out = json!({
         "result": "interrupt_requested", "method": "signal", "pane": pane,
         "signal": signal.name(), "pgid": pgid,
-        "status_after": status_after(client, inner, pane, false).await?,
+        "status_after": status_after(client, settle, pane, false).await?,
     });
     Ok(out)
 }

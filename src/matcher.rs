@@ -3,11 +3,22 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::herdr::{Client, HerdrError, PaneReadParams, ReadSource};
 use crate::output::{strip_ansi, truncate_tail};
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Herdr's cap for `pane.read`; reading all of it keeps a fast scroll from hiding the match.
 pub const READ_LINES: u32 = 1000;
+
+/// The pane's recent unwrapped output with ANSI escapes stripped.
+pub async fn read_text(client: &Client, pane_id: &str) -> Result<String, HerdrError> {
+    let mut params = PaneReadParams::new(pane_id);
+    params.source = ReadSource::RecentUnwrapped;
+    params.lines = Some(READ_LINES);
+    let read = client.pane_read(&params).await?;
+    Ok(strip_ansi(&read.text))
+}
+
 const EXCERPT_CONTEXT: usize = 4;
 const TAIL_LINES: usize = 20;
 const TAIL_MAX_CHARS: usize = 4000;
@@ -142,14 +153,19 @@ where
     Fut: Future<Output = Result<String, E>>,
 {
     let deadline = Instant::now() + timeout;
+    let mut previous: Option<String> = None;
     loop {
         let text = read().await?;
-        if let Some(excerpt) = matcher.find(&text) {
+        // `find` is a pure function of the text, so a repeat of the last poll cannot match.
+        if previous.as_deref() != Some(text.as_str())
+            && let Some(excerpt) = matcher.find(&text)
+        {
             return Ok(MatchOutcome::Matched { excerpt });
         }
         if Instant::now() >= deadline {
             return Ok(MatchOutcome::TimedOut { tail: tail(&text) });
         }
+        previous = Some(text);
         tokio::time::sleep(interval.min(deadline - Instant::now())).await;
     }
 }

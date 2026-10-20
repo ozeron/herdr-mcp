@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::caller::resolve_caller;
 use crate::herdr::{
-    AgentInfo, AgentStatus, Client, HerdrError, PaneInfo, PaneProcessInfo, WorkspaceInfo,
+    AgentInfo, AgentStatus, Client, HerdrError, PaneInfo, PaneProcessInfo, TabInfo, WorkspaceInfo,
     WorktreeList, WorktreeListParams,
 };
 use crate::output::truncate_head;
@@ -16,6 +18,8 @@ use crate::provenance;
 use crate::server::Inner;
 
 const MAX_CMDLINE_CHARS: usize = 200;
+/// Most Herdr calls one listing keeps in flight at a time.
+const FAN_OUT_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -64,42 +68,6 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
         .map(|agent| (agent.pane_id.as_str(), agent))
         .collect();
 
-    let probe_ids = snapshot
-        .panes
-        .iter()
-        .filter(|pane| !agent_by_pane.contains_key(pane.pane_id.as_str()))
-        .map(|pane| pane.pane_id.clone())
-        .collect();
-    let explain_ids = agents
-        .iter()
-        .filter(|agent| agent.agent_status == AgentStatus::Blocked)
-        .map(|agent| agent.pane_id.clone())
-        .collect();
-    let worktree_ids = snapshot
-        .workspaces
-        .iter()
-        .filter(|workspace| workspace.worktree.is_some())
-        .map(|workspace| workspace.workspace_id.clone())
-        .collect();
-    let (processes, explains, worktrees) = tokio::join!(
-        fan_out(inner, probe_ids, |client, id| async move {
-            let info = client.pane_process_info(Some(&id)).await;
-            (id, info)
-        }),
-        fan_out(inner, explain_ids, |client, id| async move {
-            let explain = client.agent_explain(&id).await;
-            (id, explain)
-        }),
-        fan_out(inner, worktree_ids, |client, id| async move {
-            let params = WorktreeListParams {
-                workspace_id: Some(id.clone()),
-                ..WorktreeListParams::default()
-            };
-            let list = client.worktree_list(&params).await;
-            (id, list)
-        }),
-    );
-
     let caller_pane = resolution.caller.as_ref().map(|c| c.pane_id.as_str());
     let caller_location =
         caller_pane.map(
@@ -122,6 +90,86 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
         ));
     }
     let needle = params.label_contains.as_deref().map(str::to_lowercase);
+    let in_scope = |tab: &TabInfo| match (&caller_location, scope) {
+        (Some((ws, _)), Scope::Workspace) => *ws == tab.workspace_id,
+        (Some((_, t)), Scope::Tab) => *t == tab.tab_id,
+        _ => true,
+    };
+    let label_matches =
+        |workspace: &WorkspaceInfo, tab: &TabInfo, pane: &PaneInfo, agent: Option<&AgentInfo>| {
+            needle.as_ref().is_none_or(|needle| {
+                [
+                    Some(workspace.label.as_str()),
+                    Some(tab.label.as_str()),
+                    pane.label.as_deref(),
+                    agent.and_then(|a| a.name.as_deref()),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|text| text.to_lowercase().contains(needle))
+            })
+        };
+    let status_matches = |status: AgentStatus| {
+        params
+            .status
+            .as_ref()
+            .is_none_or(|statuses| statuses.contains(&status))
+    };
+
+    // Only panes the listing can show are probed, and never for `kind: agent`, which no plain
+    // pane can match. Agent panes need no probe at all.
+    let mut probe_ids = Vec::new();
+    if params.kind != Some(Kind::Agent) {
+        for workspace in &snapshot.workspaces {
+            for tab in snapshot
+                .tabs
+                .iter()
+                .filter(|tab| tab.workspace_id == workspace.workspace_id && in_scope(tab))
+            {
+                probe_ids.extend(
+                    snapshot
+                        .panes
+                        .iter()
+                        .filter(|pane| pane.tab_id == tab.tab_id)
+                        .filter(|pane| !agent_by_pane.contains_key(pane.pane_id.as_str()))
+                        .filter(|pane| {
+                            status_matches(pane.agent_status)
+                                && label_matches(workspace, tab, pane, None)
+                        })
+                        .map(|pane| pane.pane_id.clone()),
+                );
+            }
+        }
+    }
+    let explain_ids = agents
+        .iter()
+        .filter(|agent| agent.agent_status == AgentStatus::Blocked)
+        .map(|agent| agent.pane_id.clone())
+        .collect();
+    let worktree_ids = snapshot
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.worktree.is_some())
+        .map(|workspace| workspace.workspace_id.clone())
+        .collect();
+    let (processes, explains, worktrees) = tokio::join!(
+        fan_out(inner, probe_ids, |client, id| async move {
+            let info = client.pane_process_info(&id).await;
+            (id, info)
+        }),
+        fan_out(inner, explain_ids, |client, id| async move {
+            let explain = client.agent_explain(&id).await;
+            (id, explain)
+        }),
+        fan_out(inner, worktree_ids, |client, id| async move {
+            let params = WorktreeListParams {
+                workspace_id: Some(id.clone()),
+                ..WorktreeListParams::default()
+            };
+            let list = client.worktree_list(&params).await;
+            (id, list)
+        }),
+    );
 
     let mut workspaces = Vec::new();
     for workspace in &snapshot.workspaces {
@@ -132,12 +180,7 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
             .iter()
             .filter(|tab| tab.workspace_id == workspace.workspace_id)
         {
-            let in_scope = match (&caller_location, scope) {
-                (Some((ws, _)), Scope::Workspace) => *ws == tab.workspace_id,
-                (Some((_, t)), Scope::Tab) => *t == tab.tab_id,
-                _ => true,
-            };
-            if !in_scope {
+            if !in_scope(tab) {
                 continue;
             }
             let panes: Vec<Value> = snapshot
@@ -152,21 +195,8 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
                     };
                     let status = agent.map_or(pane.agent_status, |a| a.agent_status);
                     let wanted = params.kind.is_none_or(|k| k == kind)
-                        && params
-                            .status
-                            .as_ref()
-                            .is_none_or(|statuses| statuses.contains(&status))
-                        && needle.as_ref().is_none_or(|needle| {
-                            [
-                                Some(workspace.label.as_str()),
-                                Some(tab.label.as_str()),
-                                pane.label.as_deref(),
-                                agent.and_then(|a| a.name.as_deref()),
-                            ]
-                            .into_iter()
-                            .flatten()
-                            .any(|text| text.to_lowercase().contains(needle))
-                        });
+                        && status_matches(status)
+                        && label_matches(workspace, tab, pane, agent);
                     wanted.then(|| {
                         pane_json(
                             pane,
@@ -233,10 +263,16 @@ where
     F: Fn(Client, String) -> Fut,
     Fut: Future<Output = (String, Result<T, HerdrError>)> + Send + 'static,
 {
+    let permits = Arc::new(Semaphore::new(FAN_OUT_LIMIT));
     let mut tasks = JoinSet::new();
     for id in ids {
         if let Ok(client) = inner.client() {
-            tasks.spawn(call(client, id));
+            let call = call(client, id);
+            let permits = Arc::clone(&permits);
+            tasks.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                call.await
+            });
         }
     }
     let mut results = HashMap::new();
@@ -259,10 +295,12 @@ fn workspace_branch(workspace: &WorkspaceInfo, list: Option<&WorktreeList>) -> O
 }
 
 fn classify(info: &PaneProcessInfo) -> Kind {
-    match (info.shell_pid, info.foreground_process_group_id) {
-        (Some(shell), Some(foreground)) if shell == foreground => Kind::Shell,
-        (Some(_), Some(_)) => Kind::Process,
-        _ => Kind::Unknown,
+    if info.shell_in_front_strict() {
+        Kind::Shell
+    } else if info.both_groups_known() {
+        Kind::Process
+    } else {
+        Kind::Unknown
     }
 }
 

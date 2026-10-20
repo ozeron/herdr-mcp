@@ -5,11 +5,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 
 use crate::herdr::{
-    AgentInfo, AgentStatus, ApiErrorCode, Client, HerdrError, PaneProcessInfo, Subscription,
-    SubscriptionEvent,
+    AgentInfo, AgentStatus, ApiErrorCode, Client, HerdrError, Subscription, SubscriptionEvent,
 };
-use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, tail, wait_for_match};
-use crate::tools::run::read_text;
+use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, read_text, tail, wait_for_match};
 use crate::turn::{Turn, TurnFrom, Verdict, evaluate};
 
 pub const AGENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -28,7 +26,7 @@ pub struct Tuning {
     pub progress_interval: Duration,
     /// How long `process_exit` without a pgid looks for a non-shell foreground group.
     pub observe_window: Duration,
-    /// KTD13: the second look that confirms the shell is really in front.
+    /// The second look that confirms the shell is really in front.
     pub recheck_delay: Duration,
     /// Poll for waits that read the pane: `output` and `process_exit`.
     pub pane_interval: Duration,
@@ -168,20 +166,6 @@ fn closed(err: HerdrError) -> HerdrError {
     }
 }
 
-fn is_gone(err: &HerdrError) -> bool {
-    match err {
-        HerdrError::Api { code, .. } => {
-            matches!(
-                code,
-                ApiErrorCode::PaneNotFound
-                    | ApiErrorCode::AgentNotRunning
-                    | ApiErrorCode::InvalidRequest
-            ) || code.as_str() == "agent_not_found"
-        }
-        _ => false,
-    }
-}
-
 /// Event and poll wake-ups for one pane. Events say "look again"; they never decide anything.
 struct Wakeups<'a> {
     client: &'a Client,
@@ -224,16 +208,21 @@ impl<'a> Wakeups<'a> {
             self.resubscribe().await;
             return;
         };
-        let event = tokio::select! {
-            event = sub.next() => Some(event),
-            _ = sleep(limit) => None,
+        let mut event = tokio::select! {
+            event = sub.next() => event,
+            () = sleep(limit) => return,
         };
-        match event {
-            None | Some(Some(SubscriptionEvent::Event(_))) => {}
-            Some(Some(SubscriptionEvent::EventsLost)) => self.resubscribe().await,
-            Some(Some(SubscriptionEvent::Closed | SubscriptionEvent::Error(_)) | None) => {
-                self.sub = None;
+        // Queued events all mean "look again", so they fold into this wake-up instead of costing
+        // a lookup each. A lost or closed stream ends the drain and is handled as before.
+        while let Some(SubscriptionEvent::Event(_)) = event {
+            match sub.try_next() {
+                Some(queued) => event = Some(queued),
+                None => return,
             }
+        }
+        match event {
+            Some(SubscriptionEvent::EventsLost) => self.resubscribe().await,
+            _ => self.sub = None,
         }
     }
 }
@@ -267,7 +256,7 @@ async fn lookup(
             Some(known) if *known == agent.terminal_id => return Ok(Ok(agent)),
             Some(_) => true,
         },
-        Err(err) if is_gone(&err) => false,
+        Err(err) if err.is_target_gone() => false,
         Err(err) => return Err(err),
     };
     let Some(known) = terminal_id.as_deref() else {
@@ -299,7 +288,7 @@ async fn lookup(
 }
 
 async fn shell_pid(client: &Client, pane: &str) -> Option<u32> {
-    client.pane_process_info(Some(pane)).await.ok()?.shell_pid
+    client.pane_process_info(pane).await.ok()?.shell_pid
 }
 
 async fn excerpt(client: &Client, pane: &str) -> String {
@@ -337,7 +326,7 @@ async fn agent_result(
     out
 }
 
-/// KTD6: each snapshot is judged by `evaluate`; a blocked-then-approved agent re-bases the token.
+/// Each snapshot is judged by `evaluate`; a blocked-then-approved agent re-bases the token.
 async fn wait_for_turn(
     client: &Client,
     tuning: &Tuning,
@@ -348,13 +337,22 @@ async fn wait_for_turn(
     let mut pane = turn.pane.clone();
     let mut terminal_id = Some(turn.terminal_id.clone());
     loop {
-        let agent = lookup(client, &mut pane, &mut terminal_id)
-            .await?
-            .map_err(Lost::into_error)?;
+        // The shell probe runs beside the lookup, on the pane as last known. If the lookup finds
+        // the agent in another pane, the probe is repeated there.
+        let probed = pane.clone();
+        let (found, early_shell) =
+            tokio::join!(lookup(client, &mut pane, &mut terminal_id), async {
+                match turn.shell_pid {
+                    Some(_) => Some(shell_pid(client, &probed).await),
+                    None => None,
+                }
+            });
+        let agent = found?.map_err(Lost::into_error)?;
         turn.pane.clone_from(&agent.pane_id);
-        let shell = match turn.shell_pid {
-            Some(_) => shell_pid(client, &agent.pane_id).await,
-            None => None,
+        let shell = match (turn.shell_pid, early_shell) {
+            (Some(_), Some(shell)) if agent.pane_id == probed => shell,
+            (Some(_), _) => shell_pid(client, &agent.pane_id).await,
+            (None, _) => None,
         };
         match evaluate(&turn, &agent, shell) {
             Verdict::Stale => return Err(stale()),
@@ -445,14 +443,7 @@ async fn wait_for_output(
     Ok(out)
 }
 
-fn shell_in_front(info: &PaneProcessInfo) -> bool {
-    match info.foreground_process_group_id {
-        None | Some(0) => true,
-        Some(front) => Some(front) == info.shell_pid,
-    }
-}
-
-/// KTD13: matches when the tracked process group has left the foreground and a recheck still
+/// Matches when the tracked process group has left the foreground and a recheck still
 /// finds the shell in front, so `a && b` does not match between jobs.
 async fn wait_for_process(
     client: &Client,
@@ -465,9 +456,9 @@ async fn wait_for_process(
     let mut tracked = pgid;
     let done = |tracked: Option<u32>, matched: bool, timed_out: bool| json!({"matched": matched, "timed_out": timed_out, "pane": pane, "pgid": tracked});
     loop {
-        let info = client.pane_process_info(Some(pane)).await.map_err(closed)?;
+        let info = client.pane_process_info(pane).await.map_err(closed)?;
         match tracked {
-            None if !shell_in_front(&info) => tracked = info.foreground_process_group_id,
+            None if !info.shell_in_front_or_unknown() => tracked = info.foreground_process_group_id,
             None => {
                 if Instant::now() >= observe_until {
                     let mut out = done(None, false, false);
@@ -476,10 +467,12 @@ async fn wait_for_process(
                 }
             }
             Some(group) => {
-                if info.foreground_process_group_id != Some(group) && shell_in_front(&info) {
+                if info.foreground_process_group_id != Some(group)
+                    && info.shell_in_front_or_unknown()
+                {
                     sleep(tuning.recheck_delay).await;
-                    let again = client.pane_process_info(Some(pane)).await.map_err(closed)?;
-                    if shell_in_front(&again) {
+                    let again = client.pane_process_info(pane).await.map_err(closed)?;
+                    if again.shell_in_front_or_unknown() {
                         return Ok(done(tracked, true, false));
                     }
                 }

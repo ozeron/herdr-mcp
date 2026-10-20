@@ -15,7 +15,8 @@ struct LogFile {
     size: u64,
 }
 
-/// Lines carry only the tool name, a target ID, an outcome code and a duration.
+/// Lines carry only the tool name, an outcome code and a duration; the `target` field is a fixed
+/// `-`, kept so the line format does not change.
 /// Each field is restricted to ID-shaped characters, so free text cannot reach the log.
 #[derive(Clone, Default)]
 pub struct Logger {
@@ -40,14 +41,13 @@ impl Logger {
         })
     }
 
-    pub fn call(&self, tool: &str, target: Option<&str>, outcome: &str, elapsed: Duration) {
+    pub fn call(&self, tool: &str, outcome: &str, elapsed: Duration) {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let line = format!(
-            "{secs} tool={} target={} outcome={} ms={}\n",
+            "{secs} tool={} target=- outcome={} ms={}\n",
             clean(tool),
-            clean(target.unwrap_or("-")),
             clean(outcome),
             elapsed.as_millis()
         );

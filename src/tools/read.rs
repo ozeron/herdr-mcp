@@ -85,7 +85,10 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     });
     let status = agent.map(|agent| agent.agent_status);
     let result = match first {
-        Err(err) if is_code(&err, "agent_not_idle") && source == Source::Recent => {
+        Err(HerdrError::Api {
+            code: ApiErrorCode::AgentNotIdle,
+            ..
+        }) if source == Source::Recent => {
             source = Source::Visible;
             notes.push(
                 "agent is busy in a full-screen UI, so scrollback is unavailable; returned the visible screen"
@@ -93,9 +96,10 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
             );
             read_agent(&client, &target, source, rows).await?
         }
-        Err(err) if is_code(&err, "agent_not_found") => {
-            read_pane(&client, &target, source, rows).await?
-        }
+        Err(HerdrError::Api {
+            code: ApiErrorCode::AgentNotFound,
+            ..
+        }) => read_pane(&client, &target, source, rows).await?,
         other => other?,
     };
 
@@ -124,10 +128,6 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         out["note"] = Value::String(notes.join("; "));
     }
     Ok(out)
-}
-
-fn is_code(err: &HerdrError, code: &str) -> bool {
-    matches!(err, HerdrError::Api { code: c, .. } if c.as_str() == code)
 }
 
 async fn read_agent(

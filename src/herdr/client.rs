@@ -96,10 +96,6 @@ impl Client {
         })
     }
 
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
     async fn connect(&self) -> Result<UnixStream, HerdrError> {
         UnixStream::connect(&self.socket_path)
             .await
@@ -146,7 +142,7 @@ impl Client {
         match self.call_reply(method, params).await? {
             Reply::Result(result) => pick_result(method, *result, pick),
             Reply::Timeout(message) => Err(HerdrError::Api {
-                code: ApiErrorCode::Other("timeout".into()),
+                code: ApiErrorCode::Timeout,
                 message,
             }),
         }
@@ -180,7 +176,7 @@ impl Client {
         .await
     }
 
-    pub async fn check_compat(&self) -> Result<Compat, HerdrError> {
+    pub async fn check_compat(&self) -> Result<Pong, HerdrError> {
         let pong = self.ping().await?;
         let parsed = parse_version(&pong.version).ok_or_else(|| {
             HerdrError::incompatible(format!("unparseable herdr version {:?}", pong.version))
@@ -192,11 +188,7 @@ impl Client {
                 pong.version
             )));
         }
-        Ok(Compat {
-            version: pong.version,
-            protocol: pong.protocol,
-            capabilities: pong.capabilities,
-        })
+        Ok(pong)
     }
 
     pub async fn session_snapshot(&self) -> Result<SessionSnapshot, HerdrError> {
@@ -278,18 +270,15 @@ impl Client {
         self.call("pane.read", params, pick_read).await
     }
 
-    pub async fn pane_process_info(
-        &self,
-        pane_id: Option<&str>,
-    ) -> Result<PaneProcessInfo, HerdrError> {
-        let params = match pane_id {
-            Some(pane_id) => json!({"pane_id": pane_id}),
-            None => json!({}),
-        };
-        self.call("pane.process_info", params, |r| match r {
-            ResponseResult::PaneProcessInfo { process_info } => Some(process_info),
-            _ => None,
-        })
+    pub async fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        self.call(
+            "pane.process_info",
+            json!({"pane_id": pane_id}),
+            |r| match r {
+                ResponseResult::PaneProcessInfo { process_info } => Some(process_info),
+                _ => None,
+            },
+        )
         .await
     }
 
@@ -417,7 +406,7 @@ impl Client {
                 "{method}: expected subscription_started"
             ))),
             Reply::Timeout(message) => Err(HerdrError::Api {
-                code: ApiErrorCode::Other("timeout".into()),
+                code: ApiErrorCode::Timeout,
                 message,
             }),
         }
@@ -449,15 +438,7 @@ fn parse_response(method: &str, line: &str) -> Result<Reply, HerdrError> {
     let mut value: Value = serde_json::from_str(line)
         .map_err(|err| HerdrError::protocol(format!("{method}: invalid json response: {err}")))?;
     if let Some(error) = value.get("error") {
-        let code = error
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let (code, message) = error_parts(error);
         return map_error(code, message);
     }
     let result = value.get_mut("result").map(Value::take).ok_or_else(|| {
@@ -466,6 +447,12 @@ fn parse_response(method: &str, line: &str) -> Result<Reply, HerdrError> {
     serde_json::from_value(result)
         .map(|result| Reply::Result(Box::new(result)))
         .map_err(|err| HerdrError::incompatible(format!("{method}: cannot decode result: {err}")))
+}
+
+/// The `code` and `message` of a response's `error` object; either is empty when missing.
+pub(crate) fn error_parts(error: &Value) -> (&str, String) {
+    let field = |name: &str| error.get(name).and_then(Value::as_str).unwrap_or_default();
+    (field("code"), field("message").to_string())
 }
 
 fn map_error(code: &str, message: String) -> Result<Reply, HerdrError> {
