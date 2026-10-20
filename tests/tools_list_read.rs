@@ -1,28 +1,21 @@
 #[path = "support/fake_herdr.rs"]
 mod fake_herdr;
+#[path = "support/harness.rs"]
+mod harness;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fake_herdr::{FakeHerdr, Script};
+use harness::{Harness, count, err_code, ok, process_info_named as process_info};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, Implementation,
-};
-use rmcp::service::RunningService;
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
 use serde_json::{Value, json};
-use tempfile::TempDir;
-
-struct Harness {
-    fake: FakeHerdr,
-    client: RunningService<RoleClient, ClientConfig>,
-    _log_dir: TempDir,
-}
 
 async fn start(env_pane: Option<&'static str>) -> Harness {
     let fake = FakeHerdr::start().await;
@@ -58,27 +51,6 @@ async fn start(env_pane: Option<&'static str>) -> Harness {
         client,
         _log_dir: log_dir,
     }
-}
-
-async fn call(h: &Harness, name: &'static str, args: Value) -> CallToolResult {
-    let mut params = CallToolRequestParams::new(name);
-    params.arguments = args.as_object().cloned();
-    h.client.call_tool(params).await.unwrap()
-}
-
-async fn ok(h: &Harness, name: &'static str, args: Value) -> Value {
-    let result = call(h, name, args).await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
-    result.structured_content.expect("structured content")
-}
-
-async fn err_code(h: &Harness, name: &'static str, args: Value) -> String {
-    let result = call(h, name, args).await;
-    assert_eq!(result.is_error, Some(true), "{result:?}");
-    result.structured_content.unwrap()["code"]
-        .as_str()
-        .unwrap()
-        .to_string()
 }
 
 fn pane(id: &str, tab: &str, ws: &str, status: &str) -> Value {
@@ -139,13 +111,6 @@ fn fixture() -> (Value, Value) {
         "agents": agents,
     });
     (snapshot, json!(agents))
-}
-
-fn process_info(pane_id: &str, shell: u32, fg: u32, name: &str, cmdline: &str) -> Value {
-    json!({"type": "pane_process_info", "process_info": {
-        "pane_id": pane_id, "shell_pid": shell, "foreground_process_group_id": fg,
-        "tty": "/dev/ttys001",
-        "foreground_processes": [{"pid": fg, "name": name, "cmdline": cmdline}]}})
 }
 
 fn script_tree(fake: &FakeHerdr) {
@@ -217,13 +182,6 @@ fn read_result(pane_id: &str, text: &str) -> Value {
     json!({"type": "pane_read", "read": {
         "pane_id": pane_id, "workspace_id": "w1", "tab_id": "w1:t1", "source": "recent",
         "format": "text", "text": text, "revision": 7, "truncated": false}})
-}
-
-fn count(fake: &FakeHerdr, method: &str) -> usize {
-    fake.requests()
-        .iter()
-        .filter(|r| r["method"] == method)
-        .count()
 }
 
 #[tokio::test]

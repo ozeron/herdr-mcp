@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rmcp::schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::caller::resolve_caller;
@@ -36,7 +36,7 @@ pub enum Method {
     Signal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Signal {
@@ -45,13 +45,6 @@ pub enum Signal {
 }
 
 impl Signal {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Int => "INT",
-            Self::Term => "TERM",
-        }
-    }
-
     fn number(self) -> i32 {
         match self {
             Self::Int => libc::SIGINT,
@@ -67,7 +60,7 @@ fn label(info: &PaneProcessInfo) -> &'static str {
     }
 }
 
-fn no_active_work(pane: &str, method: &str, status_after: &str) -> Value {
+fn no_active_work(pane: &str, method: &str, status_after: impl Serialize) -> Value {
     json!({"result": "no_active_work", "method": method, "pane": pane, "status_after": status_after})
 }
 
@@ -135,7 +128,7 @@ pub(crate) async fn interrupt_pane(
                         send_keys(client, settle, pane, true, keys, provider.interrupt_note).await
                     }
                     AgentStatus::Idle | AgentStatus::Done => {
-                        Ok(no_active_work(pane, "auto", status_name(status)))
+                        Ok(no_active_work(pane, "auto", status))
                     }
                     AgentStatus::Blocked => Err(HerdrError::tool(
                         "agent_blocked",
@@ -159,27 +152,17 @@ pub(crate) async fn interrupt_pane(
     }
 }
 
-fn status_name(status: AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Idle => "idle",
-        AgentStatus::Working => "working",
-        AgentStatus::Blocked => "blocked",
-        AgentStatus::Done => "done",
-        AgentStatus::Unknown => "unknown",
-    }
-}
-
 async fn status_after(
     client: &Client,
     settle: Duration,
     pane: &str,
     is_agent: bool,
-) -> Result<String, HerdrError> {
+) -> Result<Value, HerdrError> {
     tokio::time::sleep(settle).await;
     if is_agent {
-        Ok(status_name(client.agent_get(pane).await?.agent_status).to_string())
+        Ok(json!(client.agent_get(pane).await?.agent_status))
     } else {
-        Ok(label(&client.pane_process_info(pane).await?).to_string())
+        Ok(json!(label(&client.pane_process_info(pane).await?)))
     }
 }
 
@@ -250,7 +233,7 @@ async fn signal(
     }
     let out = json!({
         "result": "interrupt_requested", "method": "signal", "pane": pane,
-        "signal": signal.name(), "pgid": pgid,
+        "signal": signal, "pgid": pgid,
         "status_after": status_after(client, settle, pane, false).await?,
     });
     Ok(out)

@@ -7,6 +7,7 @@ use serde_json::Value;
 use super::status::Entry;
 use super::{InstallEnv, InstallError, run_cli};
 use crate::cli::ToolMode;
+use crate::providers::server_args;
 
 pub struct Read {
     pub entry: Option<Entry>,
@@ -74,24 +75,10 @@ pub fn read(env: &InstallEnv) -> Result<Read, InstallError> {
 }
 
 pub fn add(env: &InstallEnv, mode: ToolMode) -> Result<(), InstallError> {
-    let shim = env.shim_path();
-    run_cli(
-        env,
-        "claude",
-        &[
-            "mcp",
-            "add",
-            "--scope",
-            "user",
-            "herdr",
-            "--",
-            &shim.display().to_string(),
-            "--client",
-            "claude",
-            "--tools",
-            mode.as_str(),
-        ],
-    )
+    let shim = env.shim_path().display().to_string();
+    let mut args = vec!["mcp", "add", "--scope", "user", "herdr", "--", &shim];
+    args.extend(server_args("claude", mode));
+    run_cli(env, "claude", &args)
 }
 
 pub fn remove(env: &InstallEnv) -> Result<(), InstallError> {

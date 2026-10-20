@@ -125,14 +125,17 @@ impl HerdrMcp {
         started: Instant,
         result: Result<serde_json::Value, HerdrError>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (outcome, response) = match &result {
-            Ok(value) => ("ok", tools::success(value.clone())),
-            Err(err) => (
-                err.code(),
-                tools::failure_with(err.code(), &err.to_string(), err.details()),
-            ),
+        let elapsed = started.elapsed();
+        let response = match result {
+            Ok(value) => {
+                self.inner.logger.call(tool, "ok", elapsed);
+                tools::success(value)
+            }
+            Err(err) => {
+                self.inner.logger.call(tool, err.code(), elapsed);
+                tools::failure_with(err.code(), &err.to_string(), err.details())
+            }
         };
-        self.inner.logger.call(tool, outcome, started.elapsed());
         Ok(response)
     }
 }

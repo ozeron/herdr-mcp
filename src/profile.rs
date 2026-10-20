@@ -13,6 +13,23 @@ pub enum ClientKind {
     Codex,
 }
 
+impl ClientKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn from_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
     client: Option<ClientKind>,

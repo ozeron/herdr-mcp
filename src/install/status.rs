@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use clap::ValueEnum;
+
 use super::shim::{self, ShimState};
 use super::{InstallEnv, InstallError, claude, codex};
 use crate::cli::ToolMode;
@@ -69,29 +71,18 @@ pub struct Classification {
     pub warnings: Vec<String>,
 }
 
-pub fn kind_name(kind: ClientKind) -> &'static str {
-    match kind {
-        ClientKind::Claude => "claude",
-        ClientKind::Codex => "codex",
-    }
-}
-
 fn parse_mode(args: &[String]) -> Option<ToolMode> {
     let value = args
         .iter()
         .position(|arg| arg == "--tools")
         .and_then(|at| args.get(at + 1))?;
-    match value.as_str() {
-        "read" => Some(ToolMode::Read),
-        "control" => Some(ToolMode::Control),
-        _ => None,
-    }
+    ToolMode::from_str(value, false).ok()
 }
 
 fn args_match(kind: ClientKind, args: &[String]) -> bool {
     args.len() == 4
         && args[0] == "--client"
-        && args[1] == kind_name(kind)
+        && args[1] == kind.as_str()
         && args[2] == "--tools"
         && parse_mode(args).is_some()
 }
@@ -115,19 +106,17 @@ pub fn classify(
             format!("a project-scope `herdr` entry in {dir} shadows the user entry in that project")
         })
         .collect();
-    let done = |state, mode, drift| Classification {
+    let (state, mode, drift) = match entry {
+        None => (State::Absent, None, Vec::new()),
+        Some(entry) => classify_entry(env, kind, desired, &entry),
+    };
+    Ok(Classification {
         state,
         mode,
         drift,
-        config_path: config_path.clone(),
-        warnings: Vec::new(),
-    };
-    let mut result = match entry {
-        None => done(State::Absent, None, Vec::new()),
-        Some(entry) => classify_entry(env, kind, desired, &entry, done),
-    };
-    result.warnings = warnings;
-    Ok(result)
+        config_path,
+        warnings,
+    })
 }
 
 fn classify_entry(
@@ -135,17 +124,16 @@ fn classify_entry(
     kind: ClientKind,
     desired: Option<ToolMode>,
     entry: &Entry,
-    done: impl Fn(State, Option<ToolMode>, Vec<Drift>) -> Classification,
-) -> Classification {
+) -> (State, Option<ToolMode>, Vec<Drift>) {
     let mode = parse_mode(&entry.args);
     if entry.command != env.shim_path().display().to_string() {
-        return done(State::Foreign, mode, Vec::new());
+        return (State::Foreign, mode, Vec::new());
     }
     let shim = shim::inspect(env);
     match shim {
-        ShimState::Foreign => return done(State::Foreign, mode, Vec::new()),
+        ShimState::Foreign => return (State::Foreign, mode, Vec::new()),
         ShimState::Missing | ShimState::Dangling => {
-            return done(State::ShimBroken, mode, Vec::new());
+            return (State::ShimBroken, mode, Vec::new());
         }
         ShimState::Current | ShimState::Moved => {}
     }
@@ -176,16 +164,14 @@ fn classify_entry(
     } else {
         State::Drifted
     };
-    done(state, mode, drift)
+    (state, mode, drift)
 }
 
 /// How the bridge reaches an agent kind: `global` when the user-scope entry is ours
 /// (even if drifted), otherwise `injectable` for claude and codex.
 pub fn mcp_status(env: &InstallEnv, kind: &str) -> McpStatus {
-    let kind = match kind {
-        "claude" => ClientKind::Claude,
-        "codex" => ClientKind::Codex,
-        _ => return McpStatus::Unsupported,
+    let Some(kind) = ClientKind::from_kind(kind) else {
+        return McpStatus::Unsupported;
     };
     match classify(env, kind, None) {
         Ok(found) if matches!(found.state, State::Ours | State::Drifted) => McpStatus::Global,

@@ -68,20 +68,21 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
         .map(|agent| (agent.pane_id.as_str(), agent))
         .collect();
 
-    let caller_pane = resolution.caller.as_ref().map(|c| c.pane_id.as_str());
-    let caller_location =
-        caller_pane.map(
-            |id| match snapshot.panes.iter().find(|pane| pane.pane_id == id) {
-                Some(pane) => (pane.workspace_id.clone(), pane.tab_id.clone()),
-                None => {
-                    let caller = resolution.caller.as_ref().unwrap();
-                    (
-                        caller.workspace_id.clone().unwrap_or_default(),
-                        caller.tab_id.clone().unwrap_or_default(),
-                    )
-                }
-            },
-        );
+    let caller = resolution.caller.as_ref();
+    let caller_pane = caller.map(|caller| caller.pane_id.as_str());
+    let caller_location = caller.map(|caller| {
+        match snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == caller.pane_id)
+        {
+            Some(pane) => (pane.workspace_id.clone(), pane.tab_id.clone()),
+            None => (
+                caller.workspace_id.clone().unwrap_or_default(),
+                caller.tab_id.clone().unwrap_or_default(),
+            ),
+        }
+    });
     let scope = params.scope.unwrap_or(Scope::All);
     if scope != Scope::All && caller_location.is_none() {
         return Err(HerdrError::tool(
@@ -89,37 +90,16 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
             "scope needs a caller pane, and none is known; use scope all",
         ));
     }
-    let needle = params.label_contains.as_deref().map(str::to_lowercase);
+    let filter = Filter::new(&params);
     let in_scope = |tab: &TabInfo| match (&caller_location, scope) {
         (Some((ws, _)), Scope::Workspace) => *ws == tab.workspace_id,
         (Some((_, t)), Scope::Tab) => *t == tab.tab_id,
         _ => true,
     };
-    let label_matches =
-        |workspace: &WorkspaceInfo, tab: &TabInfo, pane: &PaneInfo, agent: Option<&AgentInfo>| {
-            needle.as_ref().is_none_or(|needle| {
-                [
-                    Some(workspace.label.as_str()),
-                    Some(tab.label.as_str()),
-                    pane.label.as_deref(),
-                    agent.and_then(|a| a.name.as_deref()),
-                ]
-                .into_iter()
-                .flatten()
-                .any(|text| text.to_lowercase().contains(needle))
-            })
-        };
-    let status_matches = |status: AgentStatus| {
-        params
-            .status
-            .as_ref()
-            .is_none_or(|statuses| statuses.contains(&status))
-    };
-
     // Only panes the listing can show are probed, and never for `kind: agent`, which no plain
     // pane can match. Agent panes need no probe at all.
     let mut probe_ids = Vec::new();
-    if params.kind != Some(Kind::Agent) {
+    if filter.kind != Some(Kind::Agent) {
         for workspace in &snapshot.workspaces {
             for tab in snapshot
                 .tabs
@@ -133,8 +113,8 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
                         .filter(|pane| pane.tab_id == tab.tab_id)
                         .filter(|pane| !agent_by_pane.contains_key(pane.pane_id.as_str()))
                         .filter(|pane| {
-                            status_matches(pane.agent_status)
-                                && label_matches(workspace, tab, pane, None)
+                            filter.status_matches(pane.agent_status)
+                                && filter.label_matches(workspace, tab, pane, None)
                         })
                         .map(|pane| pane.pane_id.clone()),
                 );
@@ -194,36 +174,28 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
                         None => processes.get(&pane.pane_id).map_or(Kind::Unknown, classify),
                     };
                     let status = agent.map_or(pane.agent_status, |a| a.agent_status);
-                    let wanted = params.kind.is_none_or(|k| k == kind)
-                        && status_matches(status)
-                        && label_matches(workspace, tab, pane, agent);
-                    wanted.then(|| {
-                        pane_json(
-                            pane,
-                            agent,
-                            kind,
-                            status,
-                            Extras {
-                                process: processes.get(&pane.pane_id),
-                                explain: explains.get(&pane.pane_id),
-                                branch: branch.as_deref(),
-                            },
-                            caller_pane == Some(pane.pane_id.as_str()),
-                        )
-                    })
+                    filter
+                        .pane_wanted(workspace, tab, pane, agent, kind, status)
+                        .then(|| {
+                            pane_json(
+                                pane,
+                                agent,
+                                kind,
+                                status,
+                                Extras {
+                                    process: processes.get(&pane.pane_id),
+                                    explain: explains.get(&pane.pane_id),
+                                    branch: branch.as_deref(),
+                                },
+                                caller_pane == Some(pane.pane_id.as_str()),
+                            )
+                        })
                 })
                 .collect();
             if panes.is_empty() {
                 continue;
             }
-            tabs.push(json!({
-                "id": tab.tab_id,
-                "label": tab.label,
-                "number": tab.number,
-                "focused": tab.focused,
-                "status": tab.agent_status,
-                "panes": panes,
-            }));
+            tabs.push(tab_json(tab, panes));
         }
         if tabs.is_empty() {
             continue;
@@ -248,12 +220,78 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
     }
 
     Ok(json!({
-        "caller": resolution.caller.as_ref().map(|caller| json!({
+        "caller": caller.map(|caller| json!({
             "pane_id": caller.pane_id,
             "verified": resolution.caller_verified,
         })),
         "workspaces": workspaces,
     }))
+}
+
+struct Filter<'a> {
+    kind: Option<Kind>,
+    statuses: Option<&'a [AgentStatus]>,
+    needle: Option<String>,
+}
+
+impl<'a> Filter<'a> {
+    fn new(params: &'a ListParams) -> Self {
+        Self {
+            kind: params.kind,
+            statuses: params.status.as_deref(),
+            needle: params.label_contains.as_deref().map(str::to_lowercase),
+        }
+    }
+
+    fn status_matches(&self, status: AgentStatus) -> bool {
+        self.statuses
+            .is_none_or(|statuses| statuses.contains(&status))
+    }
+
+    fn label_matches(
+        &self,
+        workspace: &WorkspaceInfo,
+        tab: &TabInfo,
+        pane: &PaneInfo,
+        agent: Option<&AgentInfo>,
+    ) -> bool {
+        self.needle.as_ref().is_none_or(|needle| {
+            [
+                Some(workspace.label.as_str()),
+                Some(tab.label.as_str()),
+                pane.label.as_deref(),
+                agent.and_then(|a| a.name.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|text| text.to_lowercase().contains(needle))
+        })
+    }
+
+    fn pane_wanted(
+        &self,
+        workspace: &WorkspaceInfo,
+        tab: &TabInfo,
+        pane: &PaneInfo,
+        agent: Option<&AgentInfo>,
+        kind: Kind,
+        status: AgentStatus,
+    ) -> bool {
+        self.kind.is_none_or(|wanted| wanted == kind)
+            && self.status_matches(status)
+            && self.label_matches(workspace, tab, pane, agent)
+    }
+}
+
+fn tab_json(tab: &TabInfo, panes: Vec<Value>) -> Value {
+    json!({
+        "id": tab.tab_id,
+        "label": tab.label,
+        "number": tab.number,
+        "focused": tab.focused,
+        "status": tab.agent_status,
+        "panes": panes,
+    })
 }
 
 /// Runs one Herdr call per id on its own connection; a failed call leaves its id out.

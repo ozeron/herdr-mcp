@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rmcp::schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
 
@@ -19,7 +19,7 @@ use crate::turn::Turn;
 
 pub const ACTIVITY_GATE_MS: u64 = 6000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "snake_case")]
 pub enum SendMode {
@@ -27,17 +27,6 @@ pub enum SendMode {
     AfterIdle,
     Steer,
     Restart,
-}
-
-impl SendMode {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::AfterIdle => "after_idle",
-            Self::Steer => "steer",
-            Self::Restart => "restart",
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -217,7 +206,7 @@ async fn send_prompt(
         .map_err(|err| prompt_error(err, pane, json!({"phase": "prompted", "pane": pane})))?;
     let turn = turn_for(client, &agent).await;
     let mut out = json!({
-        "result": result, "mode": mode.name(), "pane": pane,
+        "result": result, "mode": mode, "pane": pane,
         "status": agent.agent_status, "turn": turn,
     });
     if mode == SendMode::Restart {

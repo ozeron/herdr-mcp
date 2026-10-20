@@ -12,14 +12,6 @@ use crate::herdr::{
 };
 use crate::provenance;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-#[schemars(crate = "rmcp::schemars")]
-pub enum Direction {
-    Right,
-    Down,
-}
-
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct WorktreeWhere {
@@ -36,7 +28,7 @@ pub struct Where {
     /// An existing idle shell pane (ID or agent name). Refused if its foreground is not the shell.
     pub pane: Option<String>,
     /// Split the calling pane (or the focused pane for external callers).
-    pub split: Option<Direction>,
+    pub split: Option<SplitDirection>,
     /// A new tab in the calling pane's workspace (or the focused workspace). This is the default.
     pub tab: Option<bool>,
     /// A new workspace.
@@ -96,7 +88,7 @@ fn invalid(message: &str) -> HerdrError {
 
 enum Plan<'a> {
     Existing(&'a str),
-    Split(Direction),
+    Split(SplitDirection),
     Tab,
     Workspace,
     Worktree(&'a WorktreeWhere),
@@ -169,10 +161,7 @@ pub async fn place(
         Plan::Split(direction) => {
             let params = PaneSplitParams {
                 target_pane_id: verified.map(|caller| caller.pane_id.clone()),
-                direction: match direction {
-                    Direction::Right => SplitDirection::Right,
-                    Direction::Down => SplitDirection::Down,
-                },
+                direction,
                 cwd: options.cwd.clone(),
                 env: options.env.clone(),
                 ..PaneSplitParams::default()

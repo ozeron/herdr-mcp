@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::env::env_nonempty_string;
+
 pub const SOCKET_PATH_ENV: &str = "HERDR_SOCKET_PATH";
 pub const SESSION_ENV: &str = "HERDR_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
@@ -25,9 +27,7 @@ pub struct SessionEnv {
 
 impl SessionEnv {
     pub fn from_process() -> Self {
-        fn var(name: &str) -> Option<String> {
-            std::env::var(name).ok().filter(|value| !value.is_empty())
-        }
+        let var = env_nonempty_string;
         Self {
             socket_path: var(SOCKET_PATH_ENV).map(PathBuf::from),
             session: var(SESSION_ENV),

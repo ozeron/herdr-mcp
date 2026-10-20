@@ -64,7 +64,7 @@ pub fn mcp_args(kind: &str, bin: &str, mode: ToolMode) -> Option<Vec<String>> {
     provider(Some(kind)).mcp_args.map(|build| build(bin, mode))
 }
 
-fn server_args(client: &str, mode: ToolMode) -> [&str; 4] {
+pub(crate) fn server_args(client: &str, mode: ToolMode) -> [&str; 4] {
     ["--client", client, "--tools", mode.as_str()]
 }
 

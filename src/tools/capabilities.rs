@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use crate::caller::resolve_caller;
 use crate::herdr::HerdrError;
 use crate::install::status;
+use crate::profile::ClientKind;
 use crate::server::Inner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,10 +30,9 @@ impl McpStatus {
 pub(crate) fn mcp_status(inner: &Inner, kind: &str) -> McpStatus {
     match &inner.install_env {
         Some(env) => status::mcp_status(env, kind),
-        None => match kind {
-            "claude" | "codex" => McpStatus::Injectable,
-            _ => McpStatus::Unsupported,
-        },
+        None => {
+            ClientKind::from_kind(kind).map_or(McpStatus::Unsupported, |_| McpStatus::Injectable)
+        }
     }
 }
 

@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use futures_util::StreamExt;
 use futures_util::stream;
 
+use crate::env::env_nonempty_string;
 use crate::herdr::{Client, HerdrError, PaneProcessInfo, SessionSnapshot};
 
 const MAX_ANCESTOR_DEPTH: usize = 64;
@@ -19,9 +20,7 @@ pub struct CallerEnv {
 
 impl CallerEnv {
     pub fn from_process() -> Self {
-        fn var(name: &str) -> Option<String> {
-            std::env::var(name).ok().filter(|value| !value.is_empty())
-        }
+        let var = env_nonempty_string;
         let pane_id = var("HERDR_PANE_ID");
         let tab_id = var("HERDR_TAB_ID");
         let workspace_id = var("HERDR_WORKSPACE_ID");

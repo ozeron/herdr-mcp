@@ -33,8 +33,9 @@ pub enum ReadFormat {
     Ansi,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars", rename = "Direction")]
 pub enum SplitDirection {
     #[default]
     Right,

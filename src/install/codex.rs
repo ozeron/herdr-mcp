@@ -7,6 +7,7 @@ use toml_edit::{Array, DocumentMut, Item, Value};
 use super::status::Entry;
 use super::{InstallEnv, InstallError, run_cli};
 use crate::cli::ToolMode;
+use crate::providers::server_args;
 
 pub const ENV_VARS: [&str; 7] = [
     "HERDR_SOCKET_PATH",
@@ -100,22 +101,10 @@ fn write_extras(env: &InstallEnv) -> Result<(), InstallError> {
 }
 
 pub fn add(env: &InstallEnv, mode: ToolMode) -> Result<(), InstallError> {
-    let shim = env.shim_path();
-    run_cli(
-        env,
-        "codex",
-        &[
-            "mcp",
-            "add",
-            "herdr",
-            "--",
-            &shim.display().to_string(),
-            "--client",
-            "codex",
-            "--tools",
-            mode.as_str(),
-        ],
-    )?;
+    let shim = env.shim_path().display().to_string();
+    let mut args = vec!["mcp", "add", "herdr", "--", &shim];
+    args.extend(server_args("codex", mode));
+    run_cli(env, "codex", &args)?;
     write_extras(env)
 }
 

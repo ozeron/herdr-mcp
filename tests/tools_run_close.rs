@@ -1,28 +1,23 @@
 #[path = "support/fake_herdr.rs"]
 mod fake_herdr;
+#[path = "support/harness.rs"]
+mod harness;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fake_herdr::{FakeHerdr, Script};
+use harness::{
+    Harness, PARENT, count, err, err_code, ok, ok_reply, pane, requests, snapshot, tab, workspace,
+};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, Implementation,
-};
-use rmcp::service::RunningService;
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::ServiceExt;
+use rmcp::model::{ClientCapabilities, ClientConfig, Implementation};
 use serde_json::{Value, json};
-use tempfile::TempDir;
-
-struct Harness {
-    fake: FakeHerdr,
-    client: RunningService<RoleClient, ClientConfig>,
-    _log_dir: TempDir,
-}
 
 struct Opts {
     env_pane: Option<&'static str>,
@@ -74,106 +69,11 @@ async fn start(opts: Opts) -> Harness {
     }
 }
 
-async fn call(h: &Harness, name: &'static str, args: Value) -> CallToolResult {
-    let mut params = CallToolRequestParams::new(name);
-    params.arguments = args.as_object().cloned();
-    h.client.call_tool(params).await.unwrap()
-}
-
-async fn ok(h: &Harness, name: &'static str, args: Value) -> Value {
-    let result = call(h, name, args).await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
-    result.structured_content.expect("structured content")
-}
-
-async fn err(h: &Harness, name: &'static str, args: Value) -> Value {
-    let result = call(h, name, args).await;
-    assert_eq!(result.is_error, Some(true), "{result:?}");
-    result.structured_content.unwrap()
-}
-
-async fn err_code(h: &Harness, name: &'static str, args: Value) -> String {
-    err(h, name, args).await["code"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
-
-fn requests(fake: &FakeHerdr, method: &str) -> Vec<Value> {
-    fake.requests()
-        .into_iter()
-        .filter(|r| r["method"] == method)
-        .collect()
-}
-
-fn count(fake: &FakeHerdr, method: &str) -> usize {
-    requests(fake, method).len()
-}
-
-const PARENT: &str = "herdr_mcp_parent";
-
-fn pane(id: &str, tab: &str, ws: &str, parent: Option<&str>) -> Value {
-    let mut pane = json!({
-        "pane_id": id, "terminal_id": format!("t-{id}"), "tab_id": tab, "workspace_id": ws,
-        "focused": false, "cwd": "/work", "agent_status": "unknown", "revision": 1,
-    });
-    if let Some(parent) = parent {
-        pane["tokens"] = json!({ PARENT: parent });
-    }
-    pane
-}
-
-fn tab(id: &str, ws: &str, number: u32) -> Value {
-    json!({
-        "tab_id": id, "workspace_id": ws, "number": number, "label": id,
-        "focused": false, "pane_count": 1, "agent_status": "idle",
-    })
-}
-
-fn workspace(id: &str, number: u32, tab: &str) -> Value {
-    json!({
-        "workspace_id": id, "number": number, "label": id, "focused": number == 1,
-        "pane_count": 1, "tab_count": 1, "active_tab_id": tab, "agent_status": "idle",
-    })
-}
-
-fn agent(id: &str, tab: &str, ws: &str, name: &str) -> Value {
-    json!({
-        "terminal_id": format!("t-{id}"), "name": name, "agent": "codex", "agent_status": "idle",
-        "pane_id": id, "tab_id": tab, "workspace_id": ws, "focused": false, "revision": 1,
-        "state_change_seq": 3, "interactive_ready": true, "launch_pending": false,
-    })
-}
-
 /// w1:t1 holds the caller w1:p1 and a human pane w1:p2.
 /// w1:t2 holds w1:p3 (launched by the caller) and w1:p4 (the agent "rev", launched by the caller).
 /// w1:t3 holds w1:p5 (launched by the caller) alone. w2:t1 holds w2:p1 alone.
-fn snapshot(caller_tag: Option<&str>) -> Value {
-    json!({
-        "type": "session_snapshot",
-        "snapshot": {
-            "version": "0.9.3", "protocol": 22, "layouts": [],
-            "focused_workspace_id": "w1", "focused_tab_id": "w1:t1", "focused_pane_id": "w1:p1",
-            "workspaces": [workspace("w1", 1, "w1:t1"), workspace("w2", 2, "w2:t1")],
-            "tabs": [tab("w1:t1", "w1", 1), tab("w1:t2", "w1", 2), tab("w1:t3", "w1", 3), tab("w2:t1", "w2", 1)],
-            "panes": [
-                pane("w1:p1", "w1:t1", "w1", caller_tag),
-                pane("w1:p2", "w1:t1", "w1", None),
-                pane("w1:p3", "w1:t2", "w1", Some("w1:p1")),
-                pane("w1:p4", "w1:t2", "w1", Some("w1:p1")),
-                pane("w1:p5", "w1:t3", "w1", Some("w1:p1")),
-                pane("w2:p1", "w2:t1", "w2", None),
-            ],
-            "agents": [agent("w1:p4", "w1:t2", "w1", "rev")],
-        }
-    })
-}
-
 fn process_info(pane_id: &str, shell: u32, fg: u32) -> Value {
-    json!({"type": "pane_process_info", "process_info": {
-        "pane_id": pane_id, "shell_pid": shell, "foreground_process_group_id": fg,
-        "tty": "/dev/ttys001",
-        "foreground_processes": [{"pid": fg, "name": "node", "cmdline": "node"}]}})
+    harness::process_info_named(pane_id, shell, fg, "node", "node")
 }
 
 fn process_named(pane_id: &str, shell: u32, fg: u32, name: &str) -> Value {
@@ -194,10 +94,6 @@ fn pane_info(id: &str, tab: &str, ws: &str) -> Value {
 
 fn tab_created(tab_id: &str, ws: &str, root: &str) -> Value {
     json!({"type": "tab_created", "tab": tab(tab_id, ws, 9), "root_pane": pane(root, tab_id, ws, None)})
-}
-
-fn ok_reply() -> Value {
-    json!({"type": "ok"})
 }
 
 fn script_caller(fake: &FakeHerdr) {

@@ -6,13 +6,14 @@ pub mod status;
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use thiserror::Error;
 
 use self::shim::ShimState;
-use self::status::{Classification, State, classify, kind_name};
+use self::status::{Classification, State, classify};
 use crate::cli::ToolMode;
+use crate::env::env_nonempty;
 use crate::profile::ClientKind;
 
 const KINDS: [ClientKind; 2] = [ClientKind::Claude, ClientKind::Codex];
@@ -32,6 +33,11 @@ impl InstallError {
     }
 }
 
+/// The stable shim location under `home`.
+pub fn shim_path_in(home: &Path) -> PathBuf {
+    home.join(".local/bin").join(shim::SHIM_NAME)
+}
+
 #[derive(Debug, Clone)]
 pub struct InstallEnv {
     pub home: PathBuf,
@@ -43,7 +49,7 @@ pub struct InstallEnv {
 
 impl InstallEnv {
     pub fn from_process() -> Result<Self, InstallError> {
-        let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+        let var = env_nonempty;
         let home = var("HOME").ok_or_else(|| InstallError::new("HOME is not set"))?;
         let exe = std::env::current_exe()
             .and_then(std::path::absolute)
@@ -58,7 +64,7 @@ impl InstallEnv {
     }
 
     pub fn shim_path(&self) -> PathBuf {
-        self.home.join(".local/bin").join(shim::SHIM_NAME)
+        shim_path_in(&self.home)
     }
 
     fn find(&self, program: &str) -> Option<PathBuf> {
@@ -82,16 +88,19 @@ impl InstallEnv {
     }
 }
 
-pub(crate) fn run_cli(env: &InstallEnv, program: &str, args: &[&str]) -> Result<(), InstallError> {
+fn run_capture(env: &InstallEnv, program: &str, args: &[&str]) -> Result<Output, InstallError> {
     let path = env
         .find(program)
         .ok_or_else(|| InstallError::new(format!("{program} not found on PATH")))?;
-    let output = env
-        .command(&path)
+    env.command(&path)
         .args(args)
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .output()
-        .map_err(|err| InstallError::new(format!("{program}: {err}")))?;
+        .map_err(|err| InstallError::new(format!("{program}: {err}")))
+}
+
+pub(crate) fn run_cli(env: &InstallEnv, program: &str, args: &[&str]) -> Result<(), InstallError> {
+    let output = run_capture(env, program, args)?;
     if output.status.success() {
         return Ok(());
     }
@@ -150,7 +159,7 @@ fn describe(found: &Classification) -> String {
 
 fn status_report(env: &InstallEnv, io: &mut Io) -> i32 {
     for kind in KINDS {
-        let name = kind_name(kind);
+        let name = kind.as_str();
         match classify(env, kind, None) {
             Ok(found) => {
                 let _ = writeln!(io.out, "{name}: {}", describe(&found));
@@ -177,12 +186,7 @@ fn status_report(env: &InstallEnv, io: &mut Io) -> i32 {
 }
 
 fn integration_states(env: &InstallEnv) -> Option<Vec<(ClientKind, bool)>> {
-    let herdr = env.find("herdr")?;
-    let output = env
-        .command(&herdr)
-        .args(["integration", "status"])
-        .stdin(std::process::Stdio::null())
-        .output()
+    let output = run_capture(env, "herdr", &["integration", "status"])
         .ok()
         .filter(|output| output.status.success())?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -190,7 +194,7 @@ fn integration_states(env: &InstallEnv) -> Option<Vec<(ClientKind, bool)>> {
         KINDS
             .into_iter()
             .map(|kind| {
-                let prefix = format!("{}:", kind_name(kind));
+                let prefix = format!("{}:", kind.as_str());
                 let installed = text
                     .lines()
                     .find_map(|line| line.strip_prefix(prefix.as_str()))
@@ -217,7 +221,7 @@ fn integrations_report(env: &InstallEnv, io: &mut Io) {
             } else {
                 "not installed"
             };
-            format!("{} {state}", kind_name(*kind))
+            format!("{} {state}", kind.as_str())
         })
         .collect();
     let _ = writeln!(io.out, "resume-on-restore hooks: {}", summary.join(", "));
@@ -226,7 +230,7 @@ fn integrations_report(env: &InstallEnv, io: &mut Io) {
             let _ = writeln!(
                 io.out,
                 "  agents of this kind are not resumed after a Herdr restart until you run `herdr integration install {}`; this installer never runs it",
-                kind_name(kind)
+                kind.as_str()
             );
         }
     }
@@ -294,15 +298,11 @@ fn print_disclosure(io: &mut Io, control: bool) {
 }
 
 fn install(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
-    let mode = if options.control {
-        ToolMode::Control
-    } else {
-        ToolMode::Read
-    };
+    let mode = ToolMode::from_control(options.control);
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
     for kind in KINDS {
-        if env.find(kind_name(kind)).is_none() {
+        if env.find(kind.as_str()).is_none() {
             skipped.push(kind);
             continue;
         }
@@ -311,7 +311,7 @@ fn install(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
                 let step = step_for(&found);
                 targets.push(Target { kind, found, step });
             }
-            Err(err) => return fail(io, format!("{}: {err}", kind_name(kind))),
+            Err(err) => return fail(io, format!("{}: {err}", kind.as_str())),
         }
     }
     if targets.is_empty() {
@@ -336,7 +336,7 @@ fn install(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
                 io,
                 format!(
                     "{}: foreign `herdr` entry in {} points elsewhere; refusing to overwrite it. Nothing was changed.",
-                    kind_name(target.kind),
+                    target.kind.as_str(),
                     target.found.config_path.display()
                 ),
             );
@@ -362,7 +362,7 @@ fn install(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
         let _ = writeln!(
             io.out,
             "  {}: {action} in {} ({})",
-            kind_name(target.kind),
+            target.kind.as_str(),
             target.found.config_path.display(),
             describe(&target.found)
         );
@@ -371,7 +371,7 @@ fn install(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
         let _ = writeln!(
             io.out,
             "  {}: skipped, CLI not found on PATH",
-            kind_name(*kind)
+            kind.as_str()
         );
     }
     print_disclosure(io, options.control);
@@ -389,14 +389,14 @@ fn install(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
     }
     for target in &targets {
         if let Err(err) = apply(env, target, mode) {
-            return fail(io, format!("{}: {err}", kind_name(target.kind)));
+            return fail(io, format!("{}: {err}", target.kind.as_str()));
         }
     }
     let mut code = 0;
     for target in &targets {
         match classify(env, target.kind, Some(mode)) {
             Ok(found) => {
-                let _ = writeln!(io.out, "{}: {}", kind_name(target.kind), describe(&found));
+                let _ = writeln!(io.out, "{}: {}", target.kind.as_str(), describe(&found));
                 if found.state != State::Ours {
                     code = 1;
                 }
@@ -424,7 +424,7 @@ fn remove(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
     let mut kept_ours = false;
     let _ = writeln!(io.out, "herdr-mcp remove plan");
     for kind in KINDS {
-        let name = kind_name(kind);
+        let name = kind.as_str();
         let found = match classify(env, kind, None) {
             Ok(found) => found,
             Err(err) => return fail(io, format!("{name}: {err}")),
@@ -474,7 +474,7 @@ fn remove(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
             ClientKind::Codex => codex::remove(env),
         };
         if let Err(err) = result {
-            return fail(io, format!("{}: {err}", kind_name(kind)));
+            return fail(io, format!("{}: {err}", kind.as_str()));
         }
     }
     if drop_shim && let Err(err) = shim::unlink(env) {

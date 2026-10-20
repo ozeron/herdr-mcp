@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rmcp::schemars::JsonSchema;
@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::caller::resolve_caller;
 use crate::cli::ToolMode;
 use crate::herdr::{AgentInfo, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError};
-use crate::install::shim::SHIM_NAME;
+use crate::install::shim_path_in;
 use crate::matcher::{read_text, tail};
 use crate::place::{self, Options, Placed, Where};
 use crate::providers::{is_ready, mcp_args};
@@ -296,11 +296,7 @@ fn injection(
     if status != McpStatus::Injectable {
         return Ok((Vec::new(), status.as_str()));
     }
-    let mode = if control {
-        ToolMode::Control
-    } else {
-        ToolMode::Read
-    };
+    let mode = ToolMode::from_control(control);
     let bin = bridge_binary(inner)?;
     match mcp_args(kind, &bin, mode) {
         Some(args) => Ok((args, McpStatus::Injected.as_str())),
@@ -311,8 +307,7 @@ fn injection(
 fn bridge_binary(inner: &Inner) -> Result<String, HerdrError> {
     let shim: Option<PathBuf> = match &inner.install_env {
         Some(env) => Some(env.shim_path()),
-        None => std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".local/bin").join(SHIM_NAME)),
+        None => std::env::var_os("HOME").map(|home| shim_path_in(Path::new(&home))),
     };
     if let Some(shim) = shim.filter(|shim| shim.exists()) {
         return Ok(shim.display().to_string());

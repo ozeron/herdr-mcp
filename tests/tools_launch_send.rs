@@ -1,5 +1,7 @@
 #[path = "support/fake_herdr.rs"]
 mod fake_herdr;
+#[path = "support/harness.rs"]
+mod harness;
 
 use std::ffi::OsString;
 use std::fs;
@@ -9,6 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fake_herdr::{FakeHerdr, Script, StreamEnd};
+use harness::{
+    Harness, PARENT, count, err, err_code, ok, ok_reply, pane, process_info, requests, tab,
+    workspace,
+};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::herdr::HerdrError;
@@ -18,16 +24,12 @@ use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp, Inner};
 use herdr_mcp::tools::launch::{self, LaunchTuning};
 use herdr_mcp::wait::Tuning;
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, Implementation,
-};
-use rmcp::service::RunningService;
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::ServiceExt;
+use rmcp::model::{ClientCapabilities, ClientConfig, Implementation};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-const PARENT: &str = "herdr_mcp_parent";
 const QUIET: Duration = Duration::from_millis(120);
 
 fn launch_tuning() -> LaunchTuning {
@@ -97,12 +99,6 @@ impl Sandbox {
             self.env.exe.display().to_string()
         }
     }
-}
-
-struct Harness {
-    fake: FakeHerdr,
-    client: RunningService<RoleClient, ClientConfig>,
-    _log_dir: TempDir,
 }
 
 struct Opts {
@@ -189,67 +185,6 @@ fn direct_inner(fake: &FakeHerdr, mode: ToolMode, log_dir: &TempDir) -> Inner {
     }
 }
 
-async fn call(h: &Harness, name: &'static str, args: Value) -> CallToolResult {
-    let mut params = CallToolRequestParams::new(name);
-    params.arguments = args.as_object().cloned();
-    h.client.call_tool(params).await.unwrap()
-}
-
-async fn ok(h: &Harness, name: &'static str, args: Value) -> Value {
-    let result = call(h, name, args).await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
-    result.structured_content.expect("structured content")
-}
-
-async fn err(h: &Harness, name: &'static str, args: Value) -> Value {
-    let result = call(h, name, args).await;
-    assert_eq!(result.is_error, Some(true), "{result:?}");
-    result.structured_content.unwrap()
-}
-
-async fn err_code(h: &Harness, name: &'static str, args: Value) -> String {
-    err(h, name, args).await["code"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
-
-fn requests(fake: &FakeHerdr, method: &str) -> Vec<Value> {
-    fake.requests()
-        .into_iter()
-        .filter(|r| r["method"] == method)
-        .collect()
-}
-
-fn count(fake: &FakeHerdr, method: &str) -> usize {
-    requests(fake, method).len()
-}
-
-fn pane(id: &str, tab: &str, ws: &str, parent: Option<&str>) -> Value {
-    let mut pane = json!({
-        "pane_id": id, "terminal_id": format!("t-{id}"), "tab_id": tab, "workspace_id": ws,
-        "focused": false, "cwd": "/work", "agent_status": "unknown", "revision": 1,
-    });
-    if let Some(parent) = parent {
-        pane["tokens"] = json!({ PARENT: parent });
-    }
-    pane
-}
-
-fn tab(id: &str, ws: &str, number: u32) -> Value {
-    json!({
-        "tab_id": id, "workspace_id": ws, "number": number, "label": id,
-        "focused": false, "pane_count": 1, "agent_status": "idle",
-    })
-}
-
-fn workspace(id: &str, number: u32, tab: &str) -> Value {
-    json!({
-        "workspace_id": id, "number": number, "label": id, "focused": number == 1,
-        "pane_count": 1, "tab_count": 1, "active_tab_id": tab, "agent_status": "idle",
-    })
-}
-
 struct Rev {
     status: &'static str,
     seq: u64,
@@ -318,16 +253,6 @@ fn snapshot(with_new: bool, rev_tokens: Option<&'static str>) -> Value {
         "workspaces": [workspace("w1", 1, "w1:t1")], "tabs": tabs, "panes": panes,
         "agents": [Rev {status: "idle", seq: 3, parent: rev_tokens, kind: "codex"}.json()],
     }})
-}
-
-fn process_info(pane_id: &str, shell: u32, fg: u32) -> Value {
-    json!({"type": "pane_process_info", "process_info": {
-        "pane_id": pane_id, "shell_pid": shell, "foreground_process_group_id": fg,
-        "tty": "/dev/ttys001", "foreground_processes": []}})
-}
-
-fn ok_reply() -> Value {
-    json!({"type": "ok"})
 }
 
 fn read_result(text: &str) -> Value {

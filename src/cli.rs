@@ -9,6 +9,10 @@ pub enum ToolMode {
 }
 
 impl ToolMode {
+    pub fn from_control(control: bool) -> Self {
+        if control { Self::Control } else { Self::Read }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",

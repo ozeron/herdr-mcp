@@ -1,5 +1,6 @@
 pub mod caller;
 pub mod cli;
+pub mod env;
 pub mod guard;
 pub mod herdr;
 pub mod install;

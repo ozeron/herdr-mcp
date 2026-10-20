@@ -1,10 +1,13 @@
 #[path = "support/fake_herdr.rs"]
 mod fake_herdr;
+#[path = "support/harness.rs"]
+mod harness;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fake_herdr::{FakeHerdr, Script, StreamEnd};
+use harness::{count, process_info, requests};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::herdr::{AgentStatus, Client, HerdrError};
@@ -63,27 +66,10 @@ fn token(after: u64, from: TurnFrom) -> Turn {
     }
 }
 
-fn process_info(pane_id: &str, shell: u32, fg: u32) -> Value {
-    json!({"type": "pane_process_info", "process_info": {
-        "pane_id": pane_id, "shell_pid": shell, "foreground_process_group_id": fg,
-        "tty": "/dev/ttys001", "foreground_processes": []}})
-}
-
 fn read_result(text: &str) -> Value {
     json!({"type": "pane_read", "read": {
         "pane_id": PANE, "workspace_id": "w1", "tab_id": "w1:t2", "source": "recent_unwrapped",
         "format": "text", "text": text, "revision": 7, "truncated": false}})
-}
-
-fn requests(fake: &FakeHerdr, method: &str) -> Vec<Value> {
-    fake.requests()
-        .into_iter()
-        .filter(|r| r["method"] == method)
-        .collect()
-}
-
-fn count(fake: &FakeHerdr, method: &str) -> usize {
-    requests(fake, method).len()
 }
 
 fn hold_stream(fake: &FakeHerdr, events: Vec<Value>) {
