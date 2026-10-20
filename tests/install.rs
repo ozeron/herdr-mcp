@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use herdr_mcp::cli::ToolMode;
-use herdr_mcp::install::status::{State, classify, mcp_status};
+use herdr_mcp::install::status::{McpStatus, State, classify, mcp_status};
 use herdr_mcp::install::{Action, InstallEnv, Io, Options, run};
 use herdr_mcp::profile::ClientKind;
-use herdr_mcp::tools::capabilities::McpStatus;
 use tempfile::TempDir;
 
 const FAKE_CLI: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/fake_cli");

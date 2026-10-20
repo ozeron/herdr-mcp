@@ -236,6 +236,42 @@ async fn auto_refuses_a_blocked_agent_but_explicit_keys_are_sent() {
 }
 
 #[tokio::test]
+async fn keys_other_than_the_interrupt_key_are_refused_for_a_blocked_agent() {
+    let h = start(Opts::default()).await;
+    script_agent(&h.fake, &["blocked", "blocked"]);
+
+    let out = err(
+        &h,
+        "herdr_interrupt",
+        json!({"target": "rev", "method": "keys", "keys": ["y"]}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "answer_refused");
+    assert!(out["message"].as_str().unwrap().contains("answer_blocked"));
+    assert_eq!(count(&h.fake, "agent.send_keys"), 0);
+    assert_eq!(count(&h.fake, "pane.send_keys"), 0);
+}
+
+#[tokio::test]
+async fn the_interrupt_key_is_allowed_for_a_blocked_agent() {
+    for args in [
+        json!({"target": "rev", "method": "keys", "keys": ["esc"]}),
+        json!({"target": "rev", "method": "keys"}),
+    ] {
+        let h = start(Opts::default()).await;
+        script_agent(&h.fake, &["blocked", "blocked"]);
+
+        let out = ok(&h, "herdr_interrupt", args).await;
+
+        assert_eq!(out["result"], "interrupt_requested");
+        let sent = requests(&h.fake, "agent.send_keys");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["params"]["keys"], json!(["esc"]));
+    }
+}
+
+#[tokio::test]
 async fn auto_on_a_process_pane_sends_ctrl_c() {
     let h = start(Opts::default()).await;
     script_process(&h.fake, 100, 555);

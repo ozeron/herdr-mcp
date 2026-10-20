@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use fake_herdr::{FakeHerdr, Script, StreamEnd};
 use harness::{
-    Harness, PARENT, count, err, err_code, ok, ok_reply, pane, process_info, requests, tab,
-    workspace,
+    AGENT_PARENT, Harness, PARENT, count, err, err_code, ok, ok_reply, pane, process_info,
+    requests, tab, workspace,
 };
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
@@ -23,6 +23,7 @@ use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp, Inner};
 use herdr_mcp::tools::launch::{self, LaunchTuning};
+use herdr_mcp::tools::send::{self, SendParams};
 use herdr_mcp::wait::Tuning;
 use rmcp::ServiceExt;
 use rmcp::model::{ClientCapabilities, ClientConfig, Implementation};
@@ -85,11 +86,27 @@ impl Sandbox {
     }
 
     fn claude_entry_is_ours(&self) {
+        self.claude_entry(ToolMode::Read);
+    }
+
+    fn claude_entry(&self, mode: ToolMode) {
         self.link_shim();
         let config = json!({"mcpServers": {"herdr": {
             "type": "stdio", "command": self.shim(),
-            "args": ["--client", "claude", "--tools", "read"], "env": {}}}});
+            "args": ["--client", "claude", "--tools", mode.as_str()], "env": {}}}});
         fs::write(self.env.home.join(".claude.json"), config.to_string()).unwrap();
+    }
+
+    fn codex_entry(&self, mode: ToolMode) {
+        self.link_shim();
+        let dir = self.env.home.join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            "[mcp_servers.herdr]\ncommand = {}\nargs = [\"--client\", \"codex\", \"--tools\", \"{}\"]\n",
+            json!(self.shim().display().to_string()),
+            mode.as_str()
+        );
+        fs::write(dir.join("config.toml"), toml).unwrap();
     }
 
     fn bin(&self) -> String {
@@ -297,7 +314,7 @@ fn script_launch_then(fake: &FakeHerdr, spec: Launch, after_prompt: Value) {
         vec![snapshot(false, None), snapshot(true, None)],
     );
     fake.reply("tab.create", tab_created());
-    fake.reply("pane.report_metadata", ok_reply());
+    fake.reply_seq("pane.report_metadata", vec![ok_reply()]);
     let mut starts: Vec<Script> = (0..spec.busy)
         .map(|_| Script::error("agent_pane_busy", "pane is busy"))
         .collect();
@@ -395,6 +412,97 @@ async fn launches_codex_in_a_new_tab_retries_a_busy_start_and_waits_for_the_turn
     );
     assert!(index_of(&h.fake, "pane.report_metadata") < index_of(&h.fake, "agent.start"));
     assert_no_cleanup(&h.fake);
+}
+
+fn tokens_of(h: &Harness) -> Vec<(String, Value)> {
+    requests(&h.fake, "pane.report_metadata")
+        .into_iter()
+        .map(|r| {
+            (
+                r["params"]["pane_id"].as_str().unwrap().to_string(),
+                r["params"]["tokens"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_launch_into_an_existing_pane_tags_only_the_agent_parent() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake.reply_params(
+        "pane.process_info",
+        json!({"pane_id": "w1:p2"}),
+        process_info("w1:p2", 200, 200),
+    );
+
+    ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "where": {"pane": "w1:p2"}}),
+    )
+    .await;
+
+    assert_eq!(
+        tokens_of(&h),
+        vec![("w1:p2".to_string(), json!({ AGENT_PARENT: "w1:p1" }))]
+    );
+    assert!(index_of(&h.fake, "agent.start") < index_of(&h.fake, "pane.report_metadata"));
+    assert_eq!(count(&h.fake, "tab.create"), 0);
+}
+
+#[tokio::test]
+async fn a_launch_into_a_new_pane_tags_the_agent_parent_too() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+
+    ok(&h, "herdr_launch", json!({"kind": "codex", "name": "kid"})).await;
+
+    assert_eq!(
+        tokens_of(&h),
+        vec![
+            ("w1:p9".to_string(), json!({ PARENT: "w1:p1" })),
+            ("w1:p9".to_string(), json!({ AGENT_PARENT: "w1:p1" })),
+        ]
+    );
+}
+
+fn blocked_with_tokens(tokens: Value) -> Value {
+    let mut agent = rev_with("blocked", 3, None);
+    agent["agent"]["tokens"] = tokens;
+    agent
+}
+
+#[tokio::test]
+async fn answer_blocked_follows_the_agent_parent_before_the_pane_parent() {
+    let allowed = blocked_with_tokens(json!({ AGENT_PARENT: "w1:p1", PARENT: "w1:p2" }));
+    let denied = blocked_with_tokens(json!({ AGENT_PARENT: "w1:p2", PARENT: "w1:p1" }));
+    let only_agent = blocked_with_tokens(json!({ AGENT_PARENT: "w1:p1" }));
+
+    for (agent, ok_expected) in [(allowed, true), (only_agent, true), (denied, false)] {
+        let h = start(Opts::default()).await;
+        script_send(&h.fake, None, vec![agent]);
+        let args = json!({"target": "rev", "keys": ["y"], "answer_blocked": true});
+
+        if ok_expected {
+            assert_eq!(ok(&h, "herdr_send", args).await["result"], "answered");
+        } else {
+            assert_eq!(err_code(&h, "herdr_send", args).await, "answer_refused");
+            assert_nothing_typed(&h.fake);
+        }
+    }
 }
 
 #[tokio::test]
@@ -853,6 +961,118 @@ async fn without_an_install_env_every_supported_kind_is_injectable() {
     assert_eq!(params["args"][0], "--mcp-config");
 }
 
+async fn launch_both(sandbox: &Sandbox, kind: &str, control: bool) -> (Value, Value) {
+    let h = start(Opts {
+        install_env: Some(sandbox.env.clone()),
+        ..Opts::default()
+    })
+    .await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": kind, "name": "kid", "control": control}),
+    )
+    .await;
+    (out, start_params(&h))
+}
+
+fn no_args(params: &Value) -> bool {
+    params
+        .get("args")
+        .is_none_or(|args| args.as_array().unwrap().is_empty())
+}
+
+#[tokio::test]
+async fn codex_with_a_global_entry_in_another_mode_gets_a_tools_override() {
+    for (global, control) in [(ToolMode::Control, false), (ToolMode::Read, true)] {
+        let sandbox = Sandbox::new();
+        sandbox.codex_entry(global);
+        let requested = ToolMode::from_control(control).as_str();
+
+        let (out, params) = launch_both(&sandbox, "codex", control).await;
+
+        assert_eq!(out["mcp"], "global");
+        assert_eq!(out["child_tools"], requested);
+        assert!(out.get("note").is_none(), "{out}");
+        assert_eq!(
+            params["args"],
+            json!([
+                "-c",
+                format!(r#"mcp_servers.herdr.args=["--client","codex","--tools","{requested}"]"#)
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_with_a_global_entry_in_the_requested_mode_gets_no_args() {
+    for mode in [ToolMode::Read, ToolMode::Control] {
+        let sandbox = Sandbox::new();
+        sandbox.codex_entry(mode);
+
+        let (out, params) = launch_both(&sandbox, "codex", mode == ToolMode::Control).await;
+
+        assert_eq!(out["mcp"], "global");
+        assert_eq!(out["child_tools"], mode.as_str());
+        assert!(no_args(&params), "{params}");
+    }
+}
+
+#[tokio::test]
+async fn claude_reports_the_global_mode_and_notes_a_mismatch() {
+    for (global, control, differs) in [
+        (ToolMode::Control, false, true),
+        (ToolMode::Read, true, true),
+        (ToolMode::Read, false, false),
+        (ToolMode::Control, true, false),
+    ] {
+        let sandbox = Sandbox::new();
+        sandbox.claude_entry(global);
+
+        let (out, params) = launch_both(&sandbox, "claude", control).await;
+
+        assert_eq!(out["mcp"], "global");
+        assert_eq!(out["child_tools"], global.as_str());
+        assert!(no_args(&params), "{params}");
+        assert_eq!(out.get("note").is_some(), differs, "{out}");
+        if differs {
+            let note = out["note"].as_str().unwrap();
+            assert!(note.contains(global.as_str()), "{note}");
+            assert!(
+                note.contains(ToolMode::from_control(control).as_str()),
+                "{note}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_injected_launch_reports_the_injected_mode_as_child_tools() {
+    for control in [false, true] {
+        let sandbox = Sandbox::new();
+        let (out, _) = launch_both(&sandbox, "claude", control).await;
+
+        assert_eq!(out["mcp"], "injected");
+        assert_eq!(out["child_tools"], ToolMode::from_control(control).as_str());
+    }
+}
+
+#[tokio::test]
+async fn a_kind_without_mcp_reports_read_child_tools() {
+    let sandbox = Sandbox::new();
+    let (out, _) = launch_both(&sandbox, "opencode", false).await;
+
+    assert_eq!(out["mcp"], "unsupported");
+    assert_eq!(out["child_tools"], "read");
+}
+
 #[tokio::test]
 async fn control_true_from_a_read_mode_caller_is_refused_before_anything_is_created() {
     let fake = FakeHerdr::start().await;
@@ -903,6 +1123,180 @@ async fn cancel_during_the_wait_reports_phase_waiting_and_leaves_the_pane_and_pr
     assert_eq!(details["pane"], "w1:p9");
     assert_eq!(details["turn"]["after"], 7);
     assert_eq!(count(&fake, "agent.prompt"), 1);
+    assert_no_cleanup(&fake);
+}
+
+fn capped_inner(fake: &FakeHerdr, log_dir: &TempDir, cap_ms: u64) -> Inner {
+    let mut inner = direct_inner(fake, ToolMode::Control, log_dir);
+    inner.profile = Profile::new(None, Some(Duration::from_millis(cap_ms)));
+    inner
+}
+
+fn launch_params(extra: Value) -> launch::LaunchParams {
+    let mut args = json!({"kind": "claude", "name": "kid"});
+    for (key, value) in extra.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    serde_json::from_value(args).unwrap()
+}
+
+#[tokio::test]
+async fn a_start_timeout_above_the_wait_cap_is_capped_and_noted() {
+    let fake = FakeHerdr::start().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let inner = capped_inner(&fake, &log_dir, 300);
+    script_launch(
+        &fake,
+        Launch {
+            busy: 0,
+            ready: vec![kid("unknown", 1, false, true)],
+        },
+    );
+
+    let began = Instant::now();
+    let err = launch::run(
+        &inner,
+        None,
+        CancellationToken::new(),
+        None,
+        launch_params(json!({"start_timeout_ms": 2000})),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code(), "agent_not_ready");
+    assert!(err.to_string().contains("300 ms"), "{err}");
+    assert!(began.elapsed() < Duration::from_millis(1500));
+
+    let fake = FakeHerdr::start().await;
+    let inner = capped_inner(&fake, &log_dir, 300);
+    script_launch(
+        &fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let out = launch::run(
+        &inner,
+        None,
+        CancellationToken::new(),
+        None,
+        launch_params(json!({"start_timeout_ms": 2000})),
+    )
+    .await
+    .unwrap();
+    assert!(out["note"].as_str().unwrap().contains("capped"), "{out}");
+}
+
+#[tokio::test]
+async fn a_slow_start_leaves_the_turn_wait_only_what_is_left_of_the_cap() {
+    let fake = FakeHerdr::start().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let inner = capped_inner(&fake, &log_dir, 1000);
+    script_launch_then(
+        &fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+        kid("working", 7, true, false),
+    );
+    fake.on_seq(
+        "agent.start",
+        vec![Script::Delayed(
+            Duration::from_millis(400),
+            Box::new(Script::Reply(started())),
+        )],
+    );
+
+    let began = Instant::now();
+    let out = launch::run(
+        &inner,
+        None,
+        CancellationToken::new(),
+        None,
+        launch_params(json!({"instructions": "go", "wait": "turn"})),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(out["timed_out"], true, "{out}");
+    assert!(
+        began.elapsed() < Duration::from_millis(1250),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn nothing_left_of_the_cap_returns_the_turn_without_waiting() {
+    let fake = FakeHerdr::start().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let inner = capped_inner(&fake, &log_dir, 300);
+    script_launch_then(
+        &fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+        kid("working", 7, true, false),
+    );
+    fake.on_seq(
+        "agent.start",
+        vec![Script::Delayed(
+            Duration::from_millis(400),
+            Box::new(Script::Reply(started())),
+        )],
+    );
+
+    let out = launch::run(
+        &inner,
+        None,
+        CancellationToken::new(),
+        None,
+        launch_params(json!({"instructions": "go", "wait": "turn"})),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(out["timed_out"], true, "{out}");
+    assert_eq!(out["phase"], "waiting");
+    assert_eq!(out["turn"]["after"], 7);
+    assert_eq!(count(&fake, "events.subscribe"), 0);
+    assert_eq!(count(&fake, "agent.prompt"), 1);
+}
+
+#[tokio::test]
+async fn cancel_during_readiness_keeps_the_pane_and_reports_it() {
+    let fake = FakeHerdr::start().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let inner = direct_inner(&fake, ToolMode::Control, &log_dir);
+    script_launch(
+        &fake,
+        Launch {
+            busy: 0,
+            ready: vec![kid("unknown", 1, false, true)],
+        },
+    );
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        canceller.cancel();
+    });
+
+    let began = Instant::now();
+    let result = launch::run(&inner, None, cancel, None, launch_params(json!({}))).await;
+    task.await.unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), "cancelled");
+    let details = err.details().expect("details");
+    assert_eq!(details["phase"], "started");
+    assert_eq!(details["pane"], "w1:p9");
+    assert!(began.elapsed() < Duration::from_secs(2));
+    assert_eq!(count(&fake, "agent.prompt"), 0);
     assert_no_cleanup(&fake);
 }
 
@@ -976,6 +1370,7 @@ fn script_send(fake: &FakeHerdr, rev_tokens: Option<&'static str>, gets: Vec<Val
     fake.reply_seq("agent.send_keys", vec![ok_reply()]);
     fake.reply_seq("pane.send_keys", vec![ok_reply()]);
     fake.reply_seq("pane.send_text", vec![ok_reply()]);
+    fake.reply_seq("pane.send_input", vec![ok_reply()]);
 }
 
 fn assert_nothing_typed(fake: &FakeHerdr) {
@@ -1047,6 +1442,40 @@ async fn after_idle_waits_for_idle_then_sends() {
     assert_eq!(out["turn"]["after"], 5);
     assert!(count(&h.fake, "agent.get") >= 3);
     assert_eq!(count(&h.fake, "agent.prompt"), 1);
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_idle_sends_nothing() {
+    for (mode, interrupted) in [("after_idle", false), ("restart", true)] {
+        let fake = FakeHerdr::start().await;
+        let log_dir = tempfile::tempdir().unwrap();
+        let inner = direct_inner(&fake, ToolMode::Control, &log_dir);
+        script_send(&fake, Some("w1:p1"), vec![rev("working", 3)]);
+        let params: SendParams = serde_json::from_value(
+            json!({"target": "rev", "prompt": "next", "mode": mode, "timeout_ms": 4000}),
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+
+        let began = Instant::now();
+        let result = send::run(&inner, None, &cancel, params).await;
+        task.await.unwrap();
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "cancelled", "{mode}");
+        let details = err.details().expect("details");
+        assert_eq!(details["pane"], "w1:p4");
+        assert_eq!(details["sent"], false);
+        assert_eq!(details["interrupted"], interrupted, "{mode}");
+        assert!(began.elapsed() < Duration::from_secs(2), "{mode}");
+        assert_eq!(count(&fake, "agent.prompt"), 0, "{mode}");
+        assert_eq!(count(&fake, "pane.send_text"), 0, "{mode}");
+    }
 }
 
 #[tokio::test]
@@ -1301,15 +1730,66 @@ async fn text_and_keys_to_a_plain_pane_are_typed_without_a_prompt() {
     .await;
 
     assert_eq!(out["result"], "sent");
+    assert_eq!(out["text_sent"], true);
+    let sent = requests(&h.fake, "pane.send_input");
+    assert_eq!(sent.len(), 1);
     assert_eq!(
-        requests(&h.fake, "pane.send_text")[0]["params"]["text"],
-        "ls"
+        sent[0]["params"],
+        json!({"pane_id": "w1:p3", "text": "ls", "keys": ["Enter"]})
     );
-    assert_eq!(
-        requests(&h.fake, "pane.send_keys")[0]["params"]["keys"],
-        json!(["Enter"])
-    );
+    assert_eq!(count(&h.fake, "pane.send_text"), 0);
+    assert_eq!(count(&h.fake, "pane.send_keys"), 0);
     assert_eq!(count(&h.fake, "agent.prompt"), 0);
+}
+
+#[tokio::test]
+async fn a_rejected_key_with_text_to_a_plain_pane_types_nothing() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+    h.fake.on_seq(
+        "pane.send_input",
+        vec![Script::error("invalid_key", "unsupported key zz")],
+    );
+
+    let code = err_code(
+        &h,
+        "herdr_send",
+        json!({"target": "w1:p3", "text": "ls", "keys": ["zz"]}),
+    )
+    .await;
+
+    assert_eq!(code, "invalid_key");
+    assert_eq!(count(&h.fake, "pane.send_text"), 0);
+    assert_eq!(count(&h.fake, "pane.send_keys"), 0);
+}
+
+#[tokio::test]
+async fn a_keys_failure_after_text_to_an_agent_reports_the_text_as_sent() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+    h.fake.on_seq(
+        "agent.send_keys",
+        vec![Script::error("invalid_key", "unsupported key zz")],
+    );
+
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "text": "ls", "keys": ["zz"]}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "keys_failed");
+    assert_eq!(out["text_sent"], true);
+    assert_eq!(out["pane"], "w1:p4");
+    assert!(
+        out["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported key zz")
+    );
+    assert_eq!(count(&h.fake, "pane.send_text"), 1);
+    assert_eq!(count(&h.fake, "pane.send_input"), 0);
 }
 
 #[tokio::test]

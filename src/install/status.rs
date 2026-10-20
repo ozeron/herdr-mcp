@@ -6,7 +6,25 @@ use super::shim::{self, ShimState};
 use super::{InstallEnv, InstallError, claude, codex};
 use crate::cli::ToolMode;
 use crate::profile::ClientKind;
-use crate::tools::capabilities::McpStatus;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpStatus {
+    Global,
+    Injected,
+    Injectable,
+    Unsupported,
+}
+
+impl McpStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Injected => "injected",
+            Self::Injectable => "injectable",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -176,5 +194,23 @@ pub fn mcp_status(env: &InstallEnv, kind: &str) -> McpStatus {
     match classify(env, kind, None) {
         Ok(found) if matches!(found.state, State::Ours | State::Drifted) => McpStatus::Global,
         _ => McpStatus::Injectable,
+    }
+}
+
+/// The tools mode of the user-scope entry, read with the same classifier as `mcp_status`.
+/// An entry whose args carry no readable mode runs in the bridge default, read.
+pub fn global_mode(env: &InstallEnv, kind: &str) -> Option<ToolMode> {
+    let kind = ClientKind::from_kind(kind)?;
+    let found = classify(env, kind, None).ok()?;
+    Some(found.mode.unwrap_or(ToolMode::Read))
+}
+
+/// `mcp_status`, or `injectable` for claude and codex when there is no install environment.
+pub fn mcp_status_for(env: Option<&InstallEnv>, kind: &str) -> McpStatus {
+    match env {
+        Some(env) => mcp_status(env, kind),
+        None => {
+            ClientKind::from_kind(kind).map_or(McpStatus::Unsupported, |_| McpStatus::Injectable)
+        }
     }
 }

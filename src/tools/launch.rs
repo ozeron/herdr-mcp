@@ -13,13 +13,14 @@ use crate::caller::resolve_caller;
 use crate::cli::ToolMode;
 use crate::herdr::{AgentInfo, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError};
 use crate::install::shim_path_in;
+use crate::install::status::{McpStatus, global_mode, mcp_status_for};
 use crate::matcher::{read_text, tail};
 use crate::place::{self, Options, Placed, Where};
-use crate::providers::{is_ready, mcp_args};
+use crate::provenance;
+use crate::providers::{is_ready, mcp_args, mode_args};
 use crate::server::Inner;
-use crate::tools::DEFAULT_TIMEOUT;
-use crate::tools::capabilities::{McpStatus, mcp_status};
 use crate::tools::send::{gated_prompt, prompt_error, turn_for};
+use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::TurnFrom;
 use crate::wait::{self, Condition, Progress, Request};
 
@@ -72,7 +73,7 @@ pub enum LaunchWait {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct LaunchParams {
-    /// Agent kind: claude or codex.
+    /// Herdr agent kind, e.g. claude, codex. MCP is handed only to claude and codex; other kinds start without it.
     pub kind: String,
     /// Unique agent name. Refused while an agent with this name is live.
     pub name: String,
@@ -95,16 +96,16 @@ pub struct LaunchParams {
     pub start_timeout_ms: Option<u64>,
 }
 
-fn invalid(message: &str) -> HerdrError {
-    HerdrError::tool("invalid_params", message)
-}
-
 /// What this call made, reported with every phase so a timeout or cancel never leads to a repeat.
 fn progress(placed: &Placed, name: &str, phase: &str) -> Value {
     json!({
         "phase": phase, "name": name, "pane": placed.pane_id, "tab": placed.tab_id,
         "workspace": placed.workspace_id, "created": placed.created_json(),
     })
+}
+
+fn cancelled(message: &str, details: Value) -> HerdrError {
+    HerdrError::detailed("cancelled", message, details)
 }
 
 fn detailed(err: HerdrError, details: Value) -> HerdrError {
@@ -121,14 +122,19 @@ pub async fn run(
     ticks: Option<UnboundedSender<Progress>>,
     params: LaunchParams,
 ) -> Result<Value, HerdrError> {
+    let call_start = Instant::now();
     if params.name.trim().is_empty() || params.kind.trim().is_empty() {
-        return Err(invalid("kind and name must not be empty"));
+        return Err(HerdrError::invalid_params(
+            "kind and name must not be empty",
+        ));
     }
     let wait = params.wait.unwrap_or(LaunchWait::None);
     match params.instructions.as_deref() {
-        Some("") => return Err(invalid("instructions must not be empty")),
+        Some("") => return Err(HerdrError::invalid_params("instructions must not be empty")),
         None if wait == LaunchWait::Turn => {
-            return Err(invalid("wait turn needs instructions to start a turn"));
+            return Err(HerdrError::invalid_params(
+                "wait turn needs instructions to start a turn",
+            ));
         }
         _ => {}
     }
@@ -166,7 +172,7 @@ pub async fn run(
     }
     let placed = place::place(&client, &resolution, params.placement.as_ref(), &options).await?;
 
-    let (args, mcp) = match injection(inner, &params.kind, control) {
+    let injected = match injection(inner, &params.kind, control) {
         Ok(found) => found,
         Err(err) => {
             placed.cleanup(&client).await;
@@ -174,24 +180,56 @@ pub async fn run(
         }
     };
     let mut start = AgentStartParams::new(&params.name, &params.kind, &placed.pane_id);
-    start.args = args;
-    if let Err(err) = start_agent(&client, &inner.launch, &placed.pane_id, &start).await {
+    start.args = injected.args;
+    let cap = inner.profile.wait_cap(client_info_name);
+    let (timeout, cap_note) = clamp_timeout(params.start_timeout_ms, cap, DEFAULT_TIMEOUT);
+    let started = tokio::select! {
+        started = start_agent(&client, &inner.launch, &placed.pane_id, &start) => started,
+        () = cancel.cancelled() => {
+            return Err(cancelled(
+                "the client cancelled the launch before the agent started. The pane is kept: read it, then continue with herdr_send or close it",
+                progress(&placed, &params.name, "placed"),
+            ));
+        }
+    };
+    if let Err(err) = started {
         placed.cleanup(&client).await;
         return Err(err);
     }
 
-    let timeout = params
-        .start_timeout_ms
-        .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
-    let ready = await_ready(
+    if let Err(err) = provenance::tag_agent(
         &client,
-        &inner.launch,
-        &placed,
-        &params.kind,
-        &params.name,
-        timeout,
+        &placed.pane_id,
+        provenance::parent_value(&resolution),
     )
-    .await;
+    .await
+    {
+        placed.cleanup(&client).await;
+        return Err(HerdrError::detailed(
+            "provenance_failed",
+            format!(
+                "the agent started but could not be tagged with its launcher ({err}); the pane is kept unless this call created it"
+            ),
+            progress(&placed, &params.name, "started"),
+        ));
+    }
+
+    let ready = tokio::select! {
+        ready = await_ready(
+            &client,
+            &inner.launch,
+            &placed,
+            &params.kind,
+            &params.name,
+            timeout,
+        ) => ready,
+        () = cancel.cancelled() => {
+            return Err(cancelled(
+                "the client cancelled the launch while the agent was starting. The pane is kept: read it, then continue with herdr_send or close it",
+                progress(&placed, &params.name, "started"),
+            ));
+        }
+    };
     if let Err(failure) = ready {
         if failure.cleanup {
             placed.cleanup(&client).await;
@@ -201,7 +239,15 @@ pub async fn run(
 
     let mut out = progress(&placed, &params.name, "started");
     out["kind"] = json!(params.kind);
-    out["mcp"] = json!(mcp);
+    out["mcp"] = json!(injected.mcp);
+    out["child_tools"] = json!(injected.child_tools.as_str());
+    if let Some(note) = &injected.note {
+        add_note(&mut out, note);
+    }
+    // The default timeout is the bridge's own choice, so only a timeout the caller asked for is noted.
+    if let Some(note) = cap_note.filter(|_| params.start_timeout_ms.is_some()) {
+        add_note(&mut out, &note);
+    }
     out["turn"] = Value::Null;
     let Some(instructions) = params.instructions.as_deref() else {
         return Ok(out);
@@ -229,8 +275,9 @@ pub async fn run(
     out["turn"] = json!(turn);
 
     let Some(turn) = turn else {
-        out["note"] = json!(
-            "the prompt was accepted but the agent is neither working nor blocked, so there is no turn to wait on; read the pane"
+        add_note(
+            &mut out,
+            "the prompt was accepted but the agent is neither working nor blocked, so there is no turn to wait on; read the pane",
         );
         return Ok(out);
     };
@@ -252,20 +299,27 @@ pub async fn run(
         return Ok(out);
     }
 
-    let cap = inner.profile.wait_cap(client_info_name);
     let waiting = progress(&placed, &params.name, "waiting");
+    let remaining = cap.saturating_sub(call_start.elapsed());
+    if remaining.is_zero() {
+        out["timed_out"] = json!(true);
+        add_note(
+            &mut out,
+            "the wait cap was used up before the turn could be waited on; call herdr_wait with the turn",
+        );
+        return Ok(out);
+    }
     let result = tokio::select! {
         result = wait::wait(
             &client,
             &inner.wait,
-            Request { pane: turn.pane.clone(), condition: Condition::Turn(turn.clone()), cap },
+            Request { pane: turn.pane.clone(), condition: Condition::Turn(turn.clone()), cap: remaining },
             ticks,
         ) => result,
         () = cancel.cancelled() => {
             let mut details = waiting.clone();
             details["turn"] = json!(turn);
-            return Err(HerdrError::detailed(
-                "cancelled",
+            return Err(cancelled(
                 "the client cancelled the wait; the agent keeps working. Call herdr_wait with the turn to resume",
                 details,
             ));
@@ -285,22 +339,82 @@ pub async fn run(
     }
 }
 
-/// Per-launch MCP args apply only when no user-scope entry of ours exists, and carry
-/// `--tools read` unless the call asked for control.
-fn injection(
-    inner: &Inner,
-    kind: &str,
-    control: bool,
-) -> Result<(Vec<String>, &'static str), HerdrError> {
-    let status = mcp_status(inner, kind);
-    if status != McpStatus::Injectable {
-        return Ok((Vec::new(), status.as_str()));
+/// What the child is handed: extra start args, how it reaches the bridge, and its tool mode.
+struct Injection {
+    args: Vec<String>,
+    mcp: &'static str,
+    child_tools: ToolMode,
+    note: Option<String>,
+}
+
+fn add_note(out: &mut Value, note: &str) {
+    out["note"] = match out["note"].as_str() {
+        Some(existing) => json!(format!("{existing}; {note}")),
+        None => json!(note),
+    };
+}
+
+/// With no user-scope entry of ours, the child gets per-launch MCP args carrying `--tools read`
+/// unless the call asked for control. With one, Codex gets a `-c` override of just the tool mode
+/// when it differs from the request. Claude cannot be overridden per launch, so the global mode
+/// is reported and a mismatch noted.
+fn injection(inner: &Inner, kind: &str, control: bool) -> Result<Injection, HerdrError> {
+    let requested = ToolMode::from_control(control);
+    let status = mcp_status_for(inner.install_env.as_ref(), kind);
+    match status {
+        McpStatus::Injectable => {
+            let bin = bridge_binary(inner)?;
+            Ok(match mcp_args(kind, &bin, requested) {
+                Some(args) => Injection {
+                    args,
+                    mcp: McpStatus::Injected.as_str(),
+                    child_tools: requested,
+                    note: None,
+                },
+                None => unsupported(),
+            })
+        }
+        McpStatus::Global => {
+            let global = inner
+                .install_env
+                .as_ref()
+                .and_then(|env| global_mode(env, kind))
+                .unwrap_or(ToolMode::Read);
+            let mut injection = Injection {
+                args: Vec::new(),
+                mcp: status.as_str(),
+                child_tools: global,
+                note: None,
+            };
+            if global == requested {
+                return Ok(injection);
+            }
+            match mode_args(kind, requested) {
+                Some(args) => {
+                    injection.args = args;
+                    injection.child_tools = requested;
+                }
+                None => {
+                    injection.note = Some(format!(
+                        "the global herdr entry gives the child {} tools and cannot be overridden per launch, so the requested {} tools were not applied",
+                        global.as_str(),
+                        requested.as_str()
+                    ));
+                }
+            }
+            Ok(injection)
+        }
+        McpStatus::Injected | McpStatus::Unsupported => Ok(unsupported()),
     }
-    let mode = ToolMode::from_control(control);
-    let bin = bridge_binary(inner)?;
-    match mcp_args(kind, &bin, mode) {
-        Some(args) => Ok((args, McpStatus::Injected.as_str())),
-        None => Ok((Vec::new(), McpStatus::Unsupported.as_str())),
+}
+
+/// No MCP is handed to the child, so it has no control tools.
+fn unsupported() -> Injection {
+    Injection {
+        args: Vec::new(),
+        mcp: McpStatus::Unsupported.as_str(),
+        child_tools: ToolMode::Read,
+        note: None,
     }
 }
 

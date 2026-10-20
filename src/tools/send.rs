@@ -4,12 +4,13 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
+use tokio_util::sync::CancellationToken;
 
 use crate::caller::{Resolution, resolve_caller};
 use crate::guard::{self, TargetKind};
 use crate::herdr::{
     AgentInfo, AgentPromptParams, AgentStatus, ApiErrorCode, Client, HerdrError, Outcome,
-    PromptWait,
+    PaneSendInputParams, PromptWait,
 };
 use crate::provenance;
 use crate::server::Inner;
@@ -50,28 +51,36 @@ pub struct SendParams {
     pub allow_self: Option<bool>,
 }
 
-fn invalid(message: &str) -> HerdrError {
-    HerdrError::tool("invalid_params", message)
-}
-
 fn validate(params: &SendParams) -> Result<(), HerdrError> {
     let raw = params.text.is_some() || params.keys.is_some();
     match (&params.prompt, raw) {
-        (None, false) => return Err(invalid("give prompt, or text and/or keys")),
-        (Some(_), true) => return Err(invalid("give prompt, or text and/or keys, not both")),
+        (None, false) => {
+            return Err(HerdrError::invalid_params(
+                "give prompt, or text and/or keys",
+            ));
+        }
+        (Some(_), true) => {
+            return Err(HerdrError::invalid_params(
+                "give prompt, or text and/or keys, not both",
+            ));
+        }
         _ => {}
     }
     if params.prompt.as_deref().is_some_and(str::is_empty)
         || params.text.as_deref().is_some_and(str::is_empty)
         || params.keys.as_ref().is_some_and(Vec::is_empty)
     {
-        return Err(invalid("prompt, text and keys must not be empty"));
+        return Err(HerdrError::invalid_params(
+            "prompt, text and keys must not be empty",
+        ));
     }
     if raw && params.mode.is_some() {
-        return Err(invalid("mode applies to a prompt, not to text or keys"));
+        return Err(HerdrError::invalid_params(
+            "mode applies to a prompt, not to text or keys",
+        ));
     }
     if params.prompt.is_some() && params.answer_blocked == Some(true) {
-        return Err(invalid(
+        return Err(HerdrError::invalid_params(
             "answer_blocked applies to text or keys, not a prompt",
         ));
     }
@@ -81,6 +90,7 @@ fn validate(params: &SendParams) -> Result<(), HerdrError> {
 pub async fn run(
     inner: &Inner,
     client_info_name: Option<&str>,
+    ct: &CancellationToken,
     params: SendParams,
 ) -> Result<Value, HerdrError> {
     validate(&params)?;
@@ -119,8 +129,9 @@ pub async fn run(
             let pacing = Pacing {
                 idle_poll: inner.launch.idle_poll,
                 settle: inner.interrupt_settle,
+                timeout,
             };
-            send_prompt(&client, pane, agent, prompt, mode, timeout, pacing).await
+            send_prompt(&client, pane, agent, prompt, mode, pacing, ct).await
         }
         None => send_raw(&client, &resolution, pane, is_agent, &params).await,
     }
@@ -140,6 +151,17 @@ fn blocked(pane: &str) -> HerdrError {
 struct Pacing {
     idle_poll: Duration,
     settle: Duration,
+    /// How long to wait for idle.
+    timeout: Duration,
+}
+
+/// Cancellation while waiting for idle, with nothing typed.
+fn cancelled(pane: &str, interrupted: bool) -> HerdrError {
+    HerdrError::detailed(
+        "cancelled",
+        format!("the client cancelled the call; nothing was typed into {pane}"),
+        json!({"pane": pane, "sent": false, "interrupted": interrupted}),
+    )
 }
 
 /// `agent` is the pane's agent from the snapshot the target was resolved and guarded in, so a
@@ -150,14 +172,14 @@ async fn send_prompt(
     agent: Option<&AgentInfo>,
     prompt: &str,
     mode: SendMode,
-    timeout: Duration,
     pacing: Pacing,
+    ct: &CancellationToken,
 ) -> Result<Value, HerdrError> {
     let status = client.agent_get(pane).await?.agent_status;
     if status == AgentStatus::Blocked {
         return Err(blocked(pane));
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + pacing.timeout;
     let (result, interrupted) = match mode {
         SendMode::Steer => return steer(client, pane, prompt).await,
         SendMode::Auto => match status {
@@ -181,7 +203,10 @@ async fn send_prompt(
             }
         },
         SendMode::AfterIdle => {
-            wait_idle(client, pacing.idle_poll, pane, deadline, false).await?;
+            tokio::select! {
+                idle = wait_idle(client, pacing.idle_poll, pane, deadline, false) => idle?,
+                () = ct.cancelled() => return Err(cancelled(pane, false)),
+            }
             ("sent_after_idle", false)
         }
         SendMode::Restart => {
@@ -197,10 +222,16 @@ async fn send_prompt(
                 .await?;
                 interrupted = true;
             }
-            wait_idle(client, pacing.idle_poll, pane, deadline, interrupted).await?;
+            tokio::select! {
+                idle = wait_idle(client, pacing.idle_poll, pane, deadline, interrupted) => idle?,
+                () = ct.cancelled() => return Err(cancelled(pane, interrupted)),
+            }
             ("restarted", interrupted)
         }
     };
+    if ct.is_cancelled() {
+        return Err(cancelled(pane, interrupted));
+    }
     let agent = gated_prompt(client, pane, prompt)
         .await
         .map_err(|err| prompt_error(err, pane, json!({"phase": "prompted", "pane": pane})))?;
@@ -337,7 +368,7 @@ async fn send_raw(
         let caller = resolution.caller.as_ref().map(|c| c.pane_id.as_str());
         let own_child = resolution.caller_verified
             && caller.is_some()
-            && provenance::parent_of(&agent.tokens) == caller;
+            && provenance::answer_parent_of(&agent.tokens) == caller;
         if !own_child {
             return Err(refused(
                 "only a verified caller may answer an agent it launched itself",
@@ -349,14 +380,39 @@ async fn send_raw(
         ));
     }
 
-    if let Some(text) = &params.text {
-        client.pane_send_text(pane, text).await?;
-    }
-    if let Some(keys) = &params.keys {
-        if is_agent {
-            client.agent_send_keys(pane, keys).await?;
-        } else {
-            client.pane_send_keys(pane, keys).await?;
+    match (&params.text, &params.keys) {
+        // One request: Herdr validates the keys before it types any of it.
+        (Some(text), Some(keys)) if !is_agent => {
+            client
+                .pane_send_input(&PaneSendInputParams {
+                    pane_id: pane.to_string(),
+                    text: text.clone(),
+                    keys: keys.clone(),
+                })
+                .await?;
+        }
+        (text, keys) => {
+            if let Some(text) = text {
+                client.pane_send_text(pane, text).await?;
+            }
+            if let Some(keys) = keys {
+                let sent = if is_agent {
+                    client.agent_send_keys(pane, keys).await
+                } else {
+                    client.pane_send_keys(pane, keys).await
+                };
+                if let Err(err) = sent {
+                    return Err(if text.is_some() {
+                        HerdrError::detailed(
+                            "keys_failed",
+                            format!("the text was typed into {pane} but the keys failed: {err}"),
+                            json!({"pane": pane, "text_sent": true, "cause": err.code()}),
+                        )
+                    } else {
+                        err
+                    });
+                }
+            }
         }
     }
     Ok(json!({

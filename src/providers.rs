@@ -12,6 +12,9 @@ pub struct Provider {
     pub ready_at_unknown: bool,
     /// Per-launch MCP arguments for the herdr server, given the binary and the tool mode.
     pub mcp_args: Option<fn(bin: &str, mode: ToolMode) -> Vec<String>>,
+    /// Per-launch arguments that change only the tool mode of an existing user-scope entry,
+    /// for kinds whose overrides merge over it.
+    pub mode_args: Option<fn(mode: ToolMode) -> Vec<String>>,
 }
 
 pub const PROCESS_INTERRUPT_KEY: &str = "ctrl+c";
@@ -25,6 +28,7 @@ const FALLBACK: Provider = Provider {
     interrupt_note: UNVERIFIED,
     ready_at_unknown: false,
     mcp_args: None,
+    mode_args: None,
 };
 
 const PROVIDERS: &[Provider] = &[
@@ -34,6 +38,7 @@ const PROVIDERS: &[Provider] = &[
         interrupt_note: None,
         ready_at_unknown: false,
         mcp_args: Some(claude_mcp_args),
+        mode_args: None,
     },
     Provider {
         kind: "codex",
@@ -41,6 +46,7 @@ const PROVIDERS: &[Provider] = &[
         interrupt_note: None,
         ready_at_unknown: true,
         mcp_args: Some(codex_mcp_args),
+        mode_args: Some(codex_mode_args),
     },
 ];
 
@@ -64,6 +70,12 @@ pub fn mcp_args(kind: &str, bin: &str, mode: ToolMode) -> Option<Vec<String>> {
     provider(Some(kind)).mcp_args.map(|build| build(bin, mode))
 }
 
+/// Per-launch arguments that set only the tool mode of the user-scope entry, or `None` when
+/// `kind` cannot override it that way.
+pub fn mode_args(kind: &str, mode: ToolMode) -> Option<Vec<String>> {
+    provider(Some(kind)).mode_args.map(|build| build(mode))
+}
+
 pub(crate) fn server_args(client: &str, mode: ToolMode) -> [&str; 4] {
     ["--client", client, "--tools", mode.as_str()]
 }
@@ -72,6 +84,16 @@ fn claude_mcp_args(bin: &str, mode: ToolMode) -> Vec<String> {
     let config = json!({"mcpServers": {"herdr": {
         "command": bin, "args": server_args("claude", mode)}}});
     vec!["--mcp-config".into(), config.to_string()]
+}
+
+fn codex_mode_args(mode: ToolMode) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!(
+            "mcp_servers.herdr.args={}",
+            json!(server_args("codex", mode))
+        ),
+    ]
 }
 
 fn codex_mcp_args(bin: &str, mode: ToolMode) -> Vec<String> {

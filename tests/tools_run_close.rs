@@ -687,6 +687,23 @@ async fn close_refuses_a_pane_without_bridge_provenance_unless_forced() {
 }
 
 #[tokio::test]
+async fn an_agent_only_launch_token_does_not_let_close_skip_force() {
+    let h = start(Opts::default()).await;
+    script_caller(&h.fake);
+    let mut snap = snapshot(None);
+    snap["snapshot"]["panes"][1]["tokens"] = json!({ harness::AGENT_PARENT: "w1:p1" });
+    h.fake.reply_seq("session.snapshot", vec![snap]);
+    h.fake.reply("pane.close", ok_reply());
+
+    let code = err_code(&h, "herdr_close", json!({"target": "w1:p2"})).await;
+    assert_eq!(code, "not_launched_by_bridge");
+    assert_eq!(count(&h.fake, "pane.close"), 0);
+
+    let out = ok(&h, "herdr_close", json!({"target": "w1:p2", "force": true})).await;
+    assert_eq!(out["closed"], true);
+}
+
+#[tokio::test]
 async fn close_removes_a_pane_the_bridge_launched() {
     let h = start(Opts::default()).await;
     script_close(&h.fake, None);

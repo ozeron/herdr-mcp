@@ -117,6 +117,18 @@ pub(crate) async fn interrupt_pane(
         Method::Keys => {
             let default = agent_provider.map_or(PROCESS_INTERRUPT_KEY, |p| p.interrupt_key);
             let keys = action.keys.unwrap_or_else(|| vec![default.to_string()]);
+            // Anything but the interrupt key would answer the prompt, which only a launcher may do.
+            if agent_provider.is_some()
+                && client.agent_get(pane).await?.agent_status == AgentStatus::Blocked
+                && !keys.iter().all(|key| key.eq_ignore_ascii_case(default))
+            {
+                return Err(HerdrError::tool(
+                    "answer_refused",
+                    format!(
+                        "nothing was typed: the agent is blocked on a prompt, so only {default} (which denies it) is allowed here; use herdr_send with answer_blocked to answer"
+                    ),
+                ));
+            }
             send_keys(client, settle, pane, agent_provider.is_some(), keys, None).await
         }
         Method::Auto => match agent_provider {

@@ -241,7 +241,8 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::send::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let result = tools::send::run(&self.inner, client_name(&ctx).as_deref(), params).await;
+        let result =
+            tools::send::run(&self.inner, client_name(&ctx).as_deref(), &ctx.ct, params).await;
         self.finish("herdr_send", started, result)
     }
 

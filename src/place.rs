@@ -82,10 +82,6 @@ impl Placed {
     }
 }
 
-fn invalid(message: &str) -> HerdrError {
-    HerdrError::tool("invalid_params", message)
-}
-
 enum Plan<'a> {
     Existing(&'a str),
     Split(SplitDirection),
@@ -118,21 +114,21 @@ fn plan<'a>(where_: Option<&'a Where>, options: &Options) -> Result<Plan<'a>, He
         0 => Plan::Tab,
         1 => chosen.remove(0),
         _ => {
-            return Err(invalid(
+            return Err(HerdrError::invalid_params(
                 "where takes one of pane, split, tab, workspace or worktree",
             ));
         }
     };
     match plan {
-        Plan::Existing(_) if options.cwd.is_some() || !options.env.is_empty() => {
-            Err(invalid("cwd and env cannot be applied to an existing pane"))
-        }
-        Plan::Worktree(_) if !options.env.is_empty() => {
-            Err(invalid("env cannot be applied to a new worktree"))
-        }
-        Plan::Existing(_) | Plan::Split(_) if options.label.is_some() => Err(invalid(
-            "label names a new tab, workspace or worktree, not a pane",
+        Plan::Existing(_) if options.cwd.is_some() || !options.env.is_empty() => Err(
+            HerdrError::invalid_params("cwd and env cannot be applied to an existing pane"),
+        ),
+        Plan::Worktree(_) if !options.env.is_empty() => Err(HerdrError::invalid_params(
+            "env cannot be applied to a new worktree",
         )),
+        Plan::Existing(_) | Plan::Split(_) if options.label.is_some() => Err(
+            HerdrError::invalid_params("label names a new tab, workspace or worktree, not a pane"),
+        ),
         plan => Ok(plan),
     }
 }
@@ -244,7 +240,9 @@ async fn existing(
     let snapshot = client.session_snapshot().await?;
     let resolved = guard::resolve_target(client, &snapshot, target).await?;
     if resolved.kind != TargetKind::Pane {
-        return Err(invalid("where.pane takes a pane ID or an agent name"));
+        return Err(HerdrError::invalid_params(
+            "where.pane takes a pane ID or an agent name",
+        ));
     }
     guard::self_guard(resolution.guard_target.as_deref(), &resolved, false)?;
     let info = client.pane_process_info(&resolved.id).await?;

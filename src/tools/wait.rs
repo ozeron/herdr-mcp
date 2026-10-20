@@ -48,10 +48,6 @@ pub struct WaitParams {
     pub allow_self: Option<bool>,
 }
 
-fn invalid(message: &str) -> HerdrError {
-    HerdrError::tool("invalid_params", message)
-}
-
 fn condition(params: &WaitParams) -> Result<Condition, HerdrError> {
     let given = [
         params.turn.is_some(),
@@ -63,7 +59,7 @@ fn condition(params: &WaitParams) -> Result<Condition, HerdrError> {
     .filter(|set| *set)
     .count();
     if given != 1 {
-        return Err(invalid(
+        return Err(HerdrError::invalid_params(
             "give exactly one of turn, until, output or process_exit",
         ));
     }
@@ -72,13 +68,15 @@ fn condition(params: &WaitParams) -> Result<Condition, HerdrError> {
     }
     if let Some(until) = &params.until {
         if until.is_empty() {
-            return Err(invalid("until must list at least one status"));
+            return Err(HerdrError::invalid_params(
+                "until must list at least one status",
+            ));
         }
         return Ok(Condition::Until(until.clone()));
     }
     if let Some(output) = &params.output {
         if output.pattern.is_empty() {
-            return Err(invalid("output.match must not be empty"));
+            return Err(HerdrError::invalid_params("output.match must not be empty"));
         }
         return Ok(Condition::Output {
             needle: output.pattern.clone(),
@@ -99,7 +97,9 @@ pub async fn run(
 ) -> Result<Value, HerdrError> {
     let condition = condition(&params)?;
     if params.turn.is_none() && params.target.is_none() {
-        return Err(invalid("target is required unless a turn token is given"));
+        return Err(HerdrError::invalid_params(
+            "target is required unless a turn token is given",
+        ));
     }
     let client_info = ctx.peer.peer_info();
     let client_name = client_info
@@ -119,7 +119,9 @@ pub async fn run(
                     let (resolution, snapshot) = (resolution?, snapshot?);
                     let named = guard::resolve_target(&client, &snapshot, target).await?;
                     if named.id != turn.pane {
-                        return Err(invalid("target is not the pane this turn token belongs to"));
+                        return Err(HerdrError::invalid_params(
+                            "target is not the pane this turn token belongs to",
+                        ));
                     }
                     resolution
                 }

@@ -53,6 +53,7 @@ pub fn count(fake: &FakeHerdr, method: &str) -> usize {
 }
 
 pub const PARENT: &str = "herdr_mcp_parent";
+pub const AGENT_PARENT: &str = "herdr_mcp_agent_parent";
 
 pub fn pane(id: &str, tab: &str, ws: &str, parent: Option<&str>) -> Value {
     let mut pane = json!({

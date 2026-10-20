@@ -5,36 +5,7 @@ use serde_json::{Value, json};
 use crate::caller::resolve_caller;
 use crate::herdr::HerdrError;
 use crate::install::status;
-use crate::profile::ClientKind;
 use crate::server::Inner;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum McpStatus {
-    Global,
-    Injected,
-    Injectable,
-    Unsupported,
-}
-
-impl McpStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Global => "global",
-            Self::Injected => "injected",
-            Self::Injectable => "injectable",
-            Self::Unsupported => "unsupported",
-        }
-    }
-}
-
-pub(crate) fn mcp_status(inner: &Inner, kind: &str) -> McpStatus {
-    match &inner.install_env {
-        Some(env) => status::mcp_status(env, kind),
-        None => {
-            ClientKind::from_kind(kind).map_or(McpStatus::Unsupported, |_| McpStatus::Injectable)
-        }
-    }
-}
 
 pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value, HerdrError> {
     let client = inner.client()?;
@@ -52,7 +23,7 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
         .map(|manifest| {
             json!({
                 "kind": manifest.agent,
-                "mcp": mcp_status(inner, &manifest.agent).as_str(),
+                "mcp": status::mcp_status_for(inner.install_env.as_ref(), &manifest.agent).as_str(),
                 "active_version": manifest.active_version,
             })
         })

@@ -139,6 +139,10 @@ impl HerdrError {
         }
     }
 
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self::tool("invalid_params", message)
+    }
+
     pub(crate) fn incompatible(reason: impl Into<String>) -> Self {
         Self::Incompatible {
             reason: reason.into(),

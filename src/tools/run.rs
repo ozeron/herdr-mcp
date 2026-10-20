@@ -53,20 +53,14 @@ pub async fn run(
     params: RunParams,
 ) -> Result<Value, HerdrError> {
     if params.command.trim().is_empty() {
-        return Err(HerdrError::tool(
-            "invalid_params",
-            "command must not be empty",
-        ));
+        return Err(HerdrError::invalid_params("command must not be empty"));
     }
     if params
         .ready
         .as_ref()
         .is_some_and(|ready| ready.pattern.is_empty())
     {
-        return Err(HerdrError::tool(
-            "invalid_params",
-            "ready.match must not be empty",
-        ));
+        return Err(HerdrError::invalid_params("ready.match must not be empty"));
     }
     let options = Options {
         cwd: params.cwd,
