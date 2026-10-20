@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::caller::resolve_caller;
-use crate::herdr::{Client, HerdrError, PaneReadParams, PaneSendInputParams, ReadSource};
+use crate::herdr::{
+    Client, HerdrError, PaneProcessInfo, PaneReadParams, PaneSendInputParams, ReadSource,
+};
 use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, READ_LINES, tail, wait_for_match};
 use crate::output::strip_ansi;
 use crate::place::{self, Options, Placed, Where};
@@ -16,6 +20,7 @@ use crate::server::Inner;
 
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const OBSERVE_WINDOW: Duration = Duration::from_secs(2);
+const STABLE_FOR: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -104,11 +109,11 @@ pub async fn run(
         asked.min(cap)
     });
 
-    let pgid = Arc::new(AtomicU32::new(0));
+    let tracker = Arc::new(Mutex::new(Tracker::new(first_word(&params.command))));
     let observer = tokio::spawn(observe_pgid(
         inner.client()?,
         placed.pane_id.clone(),
-        Arc::clone(&pgid),
+        Arc::clone(&tracker),
         timeout.min(OBSERVE_WINDOW),
     ));
 
@@ -131,8 +136,18 @@ pub async fn run(
     };
     abort.abort();
 
-    if pgid.load(Ordering::Relaxed) == 0 {
-        record_front(&client, &placed.pane_id, &pgid).await;
+    if tracker.lock().unwrap().pgid().is_none()
+        && let Ok(info) = client.pane_process_info(Some(&placed.pane_id)).await
+    {
+        tracker.lock().unwrap().observe(&info, Instant::now());
+    }
+    let pgid = tracker.lock().unwrap().pgid();
+    let name = tracker.lock().unwrap().name.clone();
+    if pgid.is_none() {
+        let unmatched = format!(
+            "no foreground process group was identified as {name:?}; pgid is null, so do not wait on a process exit"
+        );
+        note = Some(note.map_or(unmatched.clone(), |n| format!("{n}; {unmatched}")));
     }
 
     let mut out = json!({
@@ -140,7 +155,7 @@ pub async fn run(
         "tab": placed.tab_id,
         "workspace": placed.workspace_id,
         "created": placed.created_json(),
-        "pgid": match pgid.load(Ordering::Relaxed) { 0 => Value::Null, n => json!(n) },
+        "pgid": pgid,
         "timed_out": timed_out,
         "excerpt": excerpt,
     });
@@ -179,23 +194,95 @@ pub(crate) async fn read_text(client: &Client, pane_id: &str) -> Result<String, 
     Ok(strip_ansi(&read.text))
 }
 
-/// Stores the first foreground process group that is not the shell's (KTD13).
-async fn record_front(client: &Client, pane_id: &str, pgid: &AtomicU32) {
-    let Ok(info) = client.pane_process_info(Some(pane_id)).await else {
-        return;
-    };
-    if let (Some(shell), Some(front)) = (info.shell_pid, info.foreground_process_group_id)
-        && front != shell
-        && front != 0
-    {
-        pgid.store(front, Ordering::Relaxed);
+/// Basename of the command's first word, skipping `env` and `VAR=value` assignments.
+fn first_word(command: &str) -> String {
+    command
+        .split_whitespace()
+        .find(|word| *word != "env" && !is_assignment(word))
+        .map(|word| word.rsplit('/').next().unwrap_or(word).to_string())
+        .unwrap_or_default()
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Picks the command's process group among the shell's prompt helpers (KTD13): the group holding a
+/// process named like the command, else one that stayed in front across polls 200 ms apart.
+struct Tracker {
+    name: String,
+    matched: Option<u32>,
+    stable: Option<u32>,
+    candidate: Option<(u32, Instant)>,
+}
+
+impl Tracker {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            matched: None,
+            stable: None,
+            candidate: None,
+        }
+    }
+
+    fn pgid(&self) -> Option<u32> {
+        self.matched.or(self.stable)
+    }
+
+    fn observe(&mut self, info: &PaneProcessInfo, now: Instant) {
+        let front = match (info.shell_pid, info.foreground_process_group_id) {
+            (Some(shell), Some(front)) if front != shell && front != 0 => front,
+            _ => {
+                self.candidate = None;
+                return;
+            }
+        };
+        if self.matched.is_none() && self.names_command(info) {
+            self.matched = Some(front);
+        }
+        match self.candidate {
+            Some((group, since)) if group == front => {
+                if self.stable.is_none() && now.duration_since(since) >= STABLE_FOR {
+                    self.stable = Some(front);
+                }
+            }
+            _ => self.candidate = Some((front, now)),
+        }
+    }
+
+    fn names_command(&self, info: &PaneProcessInfo) -> bool {
+        let base = |text: &str| text.rsplit('/').next().unwrap_or(text).to_string();
+        !self.name.is_empty()
+            && info.foreground_processes.iter().any(|process| {
+                process.name == self.name
+                    || process.argv0.as_deref().map(base).as_deref() == Some(&self.name)
+                    || process
+                        .argv
+                        .as_ref()
+                        .and_then(|argv| argv.first())
+                        .map(|arg| base(arg))
+                        .as_deref()
+                        == Some(&self.name)
+            })
     }
 }
 
-async fn observe_pgid(client: Client, pane_id: String, pgid: Arc<AtomicU32>, window: Duration) {
-    let deadline = tokio::time::Instant::now() + window;
-    while pgid.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
-        record_front(&client, &pane_id, &pgid).await;
+async fn observe_pgid(
+    client: Client,
+    pane_id: String,
+    tracker: Arc<Mutex<Tracker>>,
+    window: Duration,
+) {
+    let deadline = Instant::now() + window;
+    while tracker.lock().unwrap().matched.is_none() && Instant::now() < deadline {
+        if let Ok(info) = client.pane_process_info(Some(&pane_id)).await {
+            tracker.lock().unwrap().observe(&info, Instant::now());
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }

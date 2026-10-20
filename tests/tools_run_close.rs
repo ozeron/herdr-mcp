@@ -175,6 +175,12 @@ fn process_info(pane_id: &str, shell: u32, fg: u32) -> Value {
         "foreground_processes": [{"pid": fg, "name": "node", "cmdline": "node"}]}})
 }
 
+fn process_named(pane_id: &str, shell: u32, fg: u32, name: &str) -> Value {
+    let mut info = process_info(pane_id, shell, fg);
+    info["process_info"]["foreground_processes"] = json!([{"pid": fg, "name": name}]);
+    info
+}
+
 fn read_result(pane_id: &str, text: &str) -> Value {
     json!({"type": "pane_read", "read": {
         "pane_id": pane_id, "workspace_id": "w1", "tab_id": "w1:t1", "source": "recent_unwrapped",
@@ -232,7 +238,7 @@ async fn run_in_a_new_split_matches_the_ready_line_and_reports_the_pgid() {
         "pane.process_info",
         vec![
             process_info("w1:p9", 200, 200),
-            process_info("w1:p9", 200, 777),
+            process_named("w1:p9", 200, 777, "npm"),
         ],
     );
 
@@ -391,8 +397,10 @@ async fn readiness_timeout_reports_the_tail_and_leaves_the_pane_running() {
     let h = start(Opts::default()).await;
     script_split(&h.fake);
     reads(&h.fake, &["$ ", "$ serve\nbuilding...\n"]);
-    h.fake
-        .reply_seq("pane.process_info", vec![process_info("w1:p9", 200, 777)]);
+    h.fake.reply_seq(
+        "pane.process_info",
+        vec![process_named("w1:p9", 200, 777, "serve")],
+    );
 
     let out = ok(
         &h,
@@ -870,4 +878,83 @@ async fn close_does_not_take_a_workspace_and_reports_unknown_targets() {
         count(&h.fake, "pane.close") + count(&h.fake, "tab.close"),
         0
     );
+}
+
+async fn run_observed(command: &str, infos: Vec<Value>) -> Value {
+    let h = start(Opts::default()).await;
+    script_split(&h.fake);
+    reads(&h.fake, &["$ ", "$ x\n"]);
+    h.fake.reply_seq("pane.process_info", infos);
+    ok(
+        &h,
+        "herdr_run",
+        json!({"command": command, "where": {"split": "down"}}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_short_lived_prompt_helper_group_is_not_taken_for_the_command() {
+    let out = run_observed(
+        "sleep 60",
+        vec![
+            process_named("w1:p9", 200, 200, "zsh"),
+            process_named("w1:p9", 200, 300, "gcloud"),
+            process_named("w1:p9", 200, 200, "zsh"),
+            process_named("w1:p9", 200, 777, "sleep"),
+        ],
+    )
+    .await;
+    assert_eq!(out["pgid"], 777);
+    assert!(out.get("note").is_none());
+}
+
+#[tokio::test]
+async fn env_assignments_and_paths_are_skipped_when_naming_the_command() {
+    for command in ["FOO=1 npm run dev", "env A=1 B=2 /usr/bin/npm run dev"] {
+        let out = run_observed(
+            command,
+            vec![
+                process_named("w1:p9", 200, 300, "git"),
+                process_named("w1:p9", 200, 600, "npm"),
+            ],
+        )
+        .await;
+        assert_eq!(out["pgid"], 600, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn a_process_matched_by_argv_zero_names_the_command() {
+    let mut info = process_named("w1:p9", 200, 600, "node");
+    info["process_info"]["foreground_processes"][0]["argv"] = json!(["/opt/bin/npm", "run", "dev"]);
+    let out = run_observed(
+        "npm run dev",
+        vec![process_named("w1:p9", 200, 300, "git"), info],
+    )
+    .await;
+    assert_eq!(out["pgid"], 600);
+}
+
+#[tokio::test]
+async fn without_a_name_match_a_group_that_stays_in_front_is_used() {
+    let out = run_observed(
+        "make dev",
+        vec![
+            process_named("w1:p9", 200, 300, "git"),
+            process_named("w1:p9", 200, 900, "node"),
+        ],
+    )
+    .await;
+    assert_eq!(out["pgid"], 900);
+}
+
+#[tokio::test]
+async fn only_flickering_groups_give_a_null_pgid_and_a_note() {
+    let flicker = (0..60)
+        .map(|n| process_named("w1:p9", 200, 1000 + n, "tmp"))
+        .collect();
+    let out = run_observed("make dev", flicker).await;
+    assert_eq!(out["pgid"], Value::Null);
+    assert!(out["note"].as_str().unwrap().contains("make"));
 }
