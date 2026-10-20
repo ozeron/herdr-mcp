@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -45,6 +45,8 @@ struct State {
     keyed: Vec<(String, Value, Script)>,
     sequences: HashMap<String, (Vec<Script>, usize)>,
     requests: Vec<Value>,
+    times: Vec<Instant>,
+    after: Vec<(String, String, Script)>,
     disconnects: usize,
 }
 
@@ -123,6 +125,20 @@ impl FakeHerdr {
         self.on_params(method, params, Script::Reply(result));
     }
 
+    /// Answers `method` with `script` once any request to `trigger` has been seen. Consulted first.
+    pub fn on_after(&self, method: &str, trigger: &str, script: Script) {
+        self.state
+            .lock()
+            .unwrap()
+            .after
+            .push((method.into(), trigger.into(), script));
+    }
+
+    /// When each request in `requests()` arrived.
+    pub fn request_times(&self) -> Vec<Instant> {
+        self.state.lock().unwrap().times.clone()
+    }
+
     pub fn requests(&self) -> Vec<Value> {
         self.state.lock().unwrap().requests.clone()
     }
@@ -170,13 +186,22 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>, notify: Arc<Notify
     let method = request["method"].as_str().unwrap_or_default().to_string();
     let script = {
         let mut state = state.lock().unwrap();
+        let triggered = state
+            .after
+            .iter()
+            .find(|(m, trigger, _)| {
+                *m == method && state.requests.iter().any(|r| r["method"] == **trigger)
+            })
+            .map(|(_, _, script)| script.clone());
         let keyed = state
             .keyed
             .iter()
             .find(|(m, want, _)| *m == method && params_contain(&request["params"], want))
             .map(|(_, _, script)| script.clone());
         state.requests.push(request);
-        keyed
+        state.times.push(Instant::now());
+        triggered
+            .or(keyed)
             .or_else(|| {
                 state.sequences.get_mut(&method).map(|(scripts, next)| {
                     let script = scripts[(*next).min(scripts.len() - 1)].clone();

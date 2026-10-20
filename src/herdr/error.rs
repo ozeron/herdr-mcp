@@ -64,6 +64,12 @@ pub enum HerdrError {
     Io(#[from] std::io::Error),
     #[error("{message}")]
     Tool { code: &'static str, message: String },
+    #[error("{message}")]
+    Detailed {
+        code: &'static str,
+        message: String,
+        details: serde_json::Value,
+    },
 }
 
 impl HerdrError {
@@ -76,7 +82,27 @@ impl HerdrError {
             Self::LineTooLong { .. } => "herdr_line_too_long",
             Self::Protocol { .. } => "herdr_protocol_error",
             Self::Io(_) => "herdr_io_error",
-            Self::Tool { code, .. } => code,
+            Self::Tool { code, .. } | Self::Detailed { code, .. } => code,
+        }
+    }
+
+    /// Fields to report beside `code` and `message`, such as the step a multi-step tool reached.
+    pub fn details(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Detailed { details, .. } => Some(details),
+            _ => None,
+        }
+    }
+
+    pub fn detailed(
+        code: &'static str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self::Detailed {
+            code,
+            message: message.into(),
+            details,
         }
     }
 

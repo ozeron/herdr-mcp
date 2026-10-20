@@ -208,25 +208,6 @@ async fn control_mode_lists_all_nine_with_annotations() {
 }
 
 #[tokio::test]
-async fn control_mode_stubs_return_not_implemented() {
-    let h = start(Opts {
-        mode: ToolMode::Control,
-        ..Opts::default()
-    })
-    .await;
-    for name in ["herdr_launch", "herdr_send"] {
-        let result = call(&h, name).await;
-        assert_eq!(result.is_error, Some(true), "{name}");
-        assert_eq!(
-            result.structured_content.unwrap()["code"],
-            "not_implemented",
-            "{name}"
-        );
-    }
-    assert!(h.fake.requests().is_empty());
-}
-
-#[tokio::test]
 async fn instructions_are_short_and_lead_with_the_essentials() {
     let h = start(Opts::default()).await;
     let info = h.client.peer_info().unwrap();

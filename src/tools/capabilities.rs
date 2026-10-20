@@ -26,7 +26,7 @@ impl McpStatus {
     }
 }
 
-fn mcp_status(inner: &Inner, kind: &str) -> McpStatus {
+pub(crate) fn mcp_status(inner: &Inner, kind: &str) -> McpStatus {
     match &inner.install_env {
         Some(env) => status::mcp_status(env, kind),
         None => match kind {

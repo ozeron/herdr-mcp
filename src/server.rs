@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, MetaObject, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, Implementation, MetaObject, ProgressNotificationParam, ServerCapabilities,
+    ServerConfig,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
@@ -14,7 +17,8 @@ use crate::herdr::{Client, HerdrError};
 use crate::install::InstallEnv;
 use crate::log::Logger;
 use crate::profile::Profile;
-use crate::tools::{self, NOT_IMPLEMENTED};
+use crate::tools;
+use crate::tools::launch::LaunchTuning;
 use crate::wait::Tuning;
 
 const INSTRUCTIONS: &str = include_str!("instructions.md");
@@ -48,6 +52,7 @@ pub struct Inner {
     pub install_env: Option<InstallEnv>,
     pub wait: Tuning,
     pub interrupt_settle: Duration,
+    pub launch: LaunchTuning,
 }
 
 impl Inner {
@@ -82,6 +87,7 @@ impl HerdrMcp {
                 install_env: config.install_env,
                 wait: Tuning::default(),
                 interrupt_settle: tools::interrupt::SETTLE,
+                launch: LaunchTuning::default(),
             }),
             tool_router,
         }
@@ -103,6 +109,14 @@ impl HerdrMcp {
         self
     }
 
+    /// Replaces the launch and send pacing; call right after `new`.
+    pub fn with_launch_tuning(mut self, tuning: LaunchTuning) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("tuning is set before the server is shared")
+            .launch = tuning;
+        self
+    }
+
     fn finish(
         &self,
         tool: &str,
@@ -111,22 +125,15 @@ impl HerdrMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let (outcome, response) = match &result {
             Ok(value) => ("ok", tools::success(value.clone())),
-            Err(err) => (err.code(), tools::failure(err.code(), &err.to_string())),
+            Err(err) => (
+                err.code(),
+                tools::failure_with(err.code(), &err.to_string(), err.details()),
+            ),
         };
         self.inner
             .logger
             .call(tool, None, outcome, started.elapsed());
         Ok(response)
-    }
-
-    fn not_implemented(&self, tool: &str) -> Result<CallToolResult, ErrorData> {
-        self.inner
-            .logger
-            .call(tool, None, NOT_IMPLEMENTED, std::time::Duration::ZERO);
-        Ok(tools::failure(
-            NOT_IMPLEMENTED,
-            &format!("{tool} is not implemented yet"),
-        ))
     }
 }
 
@@ -195,8 +202,36 @@ impl HerdrMcp {
         description = "Launch an agent or a command in a new pane, tab or workspace.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
-    async fn herdr_launch(&self) -> Result<CallToolResult, ErrorData> {
-        self.not_implemented("herdr_launch")
+    async fn herdr_launch(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<tools::launch::LaunchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let client_info = ctx.client_info();
+        let progress = ctx.meta.get_progress_token().map(|token| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::wait::Progress>();
+            let peer = ctx.peer.clone();
+            tokio::spawn(async move {
+                while let Some(tick) = rx.recv().await {
+                    let note =
+                        ProgressNotificationParam::new(token.clone(), tick.elapsed.as_secs_f64())
+                            .with_total(tick.cap.as_secs_f64())
+                            .with_message("still waiting");
+                    let _ = peer.notify_progress(note).await;
+                }
+            });
+            tx
+        });
+        let result = tools::launch::run(
+            &self.inner,
+            client_info.as_ref().map(|info| info.name.as_str()),
+            ctx.ct.clone(),
+            progress,
+            params,
+        )
+        .await;
+        self.finish("herdr_launch", started, result)
     }
 
     #[tool(
@@ -223,8 +258,20 @@ impl HerdrMcp {
         description = "Send text or keys to a pane or agent. Never targets your own pane unless allow_self is set.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
-    async fn herdr_send(&self) -> Result<CallToolResult, ErrorData> {
-        self.not_implemented("herdr_send")
+    async fn herdr_send(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<tools::send::SendParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let client_info = ctx.client_info();
+        let result = tools::send::run(
+            &self.inner,
+            client_info.as_ref().map(|info| info.name.as_str()),
+            params,
+        )
+        .await;
+        self.finish("herdr_send", started, result)
     }
 
     #[tool(
