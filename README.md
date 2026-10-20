@@ -13,7 +13,7 @@ Install the plugin, then run one of its panes. Nothing is written to your Claude
 The manifest builds with `cargo install --path . --root . --locked`, which puts the binary at `bin/herdr-mcp` in the plugin directory. `herdr plugin install` runs that build. `herdr plugin link` does not, so run it yourself first.
 
 ```sh
-herdr plugin link /path/to/herdr-mcp     # or: herdr plugin install <owner>/herdr-mcp
+herdr plugin install ozeron/herdr-mcp    # or, from a checkout: herdr plugin link /path/to/herdr-mcp
 herdr plugin pane open --plugin herdr-mcp --entrypoint install           # read tools
 herdr plugin pane open --plugin herdr-mcp --entrypoint install-control   # read and control tools
 herdr plugin action invoke herdr-mcp.status                              # what is installed
@@ -61,7 +61,7 @@ Read mode registers the first four.
 | `herdr_list` | Workspace, tab and pane tree, with agents and plain processes | `scope`, `kind`, `status[]`, `label_contains` | tree of panes with status and foreground process |
 | `herdr_read` | Tail of a pane's output | `target`, `source`, `lines` (80, max 1000), `max_chars`, `raw` | `text`, `truncated`, `status`, `note` |
 | `herdr_wait` | Wait for one condition | `target`, then one of `turn`, `until[]`, `output{match, after_command?}`, `process_exit`; `timeout_ms` | `matched`, `timed_out`, `status`, `excerpt`; `process_exit` with nothing running returns `result: no_active_work` |
-| `herdr_launch` | Start an agent in a new or existing pane | `kind` (any Herdr agent kind; MCP only for claude and codex), `name`, `instructions`, `where`, `cwd`, `env`, `label`, `control`, `wait` (none or turn), `start_timeout_ms` | `phase`, `pane`, `turn`, `mcp`, `child_tools`, `note`, and the wait result with `wait: turn` |
+| `herdr_launch` | Start an agent in a new or existing pane | `kind` (any Herdr agent kind; MCP only for claude and codex), `name`, `instructions`, `where`, `cwd`, `env`, `label`, `control`, `wait` (none or turn), `start_timeout_ms`, `dialogs` (skip, surface or trust) | `phase`, `pane`, `turn`, `mcp`, `child_tools`, `dialogs`, `note`, and the wait result with `wait: turn` |
 | `herdr_run` | Type a shell command into a pane | `command`, `where`, `cwd`, `env`, `label`, `ready{match, timeout_ms}` | `pane`, `pgid`, `ready_matched`, `timed_out`, `excerpt`, `rewait` (when ready timed out), `note` |
 | `herdr_send` | Send a prompt, text or keys | `target`, then `prompt` with `mode`, or `text`, or `keys[]`; `answer_blocked` | `result`, `turn` |
 | `herdr_interrupt` | Cancel the current work without closing the pane | `target`, `method` (auto, keys, signal), `signal` | `result`, `status_after` |
@@ -74,6 +74,7 @@ Behaviour worth knowing:
 - A plain `herdr_wait {output}` sees only text added after it starts, so a line printed between two waits is missed. When `herdr_run`'s ready match times out it returns `rewait`; pass it to `herdr_wait` unchanged. `after_command` counts only lines after the last echo of that command, so a line already printed matches at once. If the echo has scrolled out of the pane's recent output, the wait falls back to a fresh baseline and adds a `note`.
 - `herdr_run` finds the command's process group by the command's first word, falls back to a group that stays stable, and otherwise returns `pgid: null` with a note. Do not wait on a process exit then.
 - `herdr_send` modes: `auto` refuses a working agent with `busy`, `after_idle` waits for idle, `steer` types into a working agent and returns no turn, `restart` interrupts first. It never answers a blocked agent unless `answer_blocked` is set and the caller launched it.
+- `herdr_launch` handles startup dialogs that Herdr reports as idle, such as Codex's hook review or a folder trust prompt (checked against the visible screen after readiness, at most 3 per launch). `dialogs: skip` (default) sends the option that grants nothing, usually `esc`; `surface` types nothing and stops with `agent_needs_input`; `trust` sends the permissive keys and only belongs on an explicit user request. The result's `dialogs` lists `{id, action, verified}` for each one handled; `verified: false` means the screen text and keys were not checked against the real agent (codex `directory_trust`, claude `folder_trust`). Skipping Codex's hook review adds a `note`: Herdr resume hooks will not run for that child. `herdr_send` with `answer_blocked` may also answer such a dialog on your own child while Herdr reports it idle.
 - `herdr_launch` retries while a fresh pane reports busy, treats an agent as ready after a 3 s quiet window, and fails fast if the shell is back in front after a 3 s startup grace.
 - `herdr_wait {process_exit}` returns `{result: "no_active_work", matched: false, timed_out: false}` when nothing was running. Do not re-wait.
 - Waits never cancel work. A `timed_out` result means call again. The wait cap is 280 s for Codex, 600 s for Claude and 50 s otherwise.
@@ -82,6 +83,7 @@ Behaviour worth knowing:
 
 Malformed arguments return a JSON-RPC `invalid_params` error. Tool failures return `isError` with a `code` and a `message`. Codes worth knowing:
 - `answer_refused`: `herdr_interrupt` would answer a blocked prompt.
+- `agent_needs_input`: `herdr_launch` found a startup dialog it did not answer (`dialogs: surface`, one that stayed after the answer, or more than 3). The pane is kept; details carry `pane`, `phase` and `dialog{id, excerpt}`.
 - `keys_failed`: `herdr_send` could not send the keys.
 - `cancelled`: the client cancelled a `herdr_send` or `herdr_launch`. Launch keeps the pane and reports `pane`, `phase` and `turn`.
 - `provenance_failed`: `herdr_launch` could not tag the pane as yours.

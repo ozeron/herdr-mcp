@@ -10,6 +10,8 @@ Research and plan first. No implementation, commits, pushes, remote creation, PR
 
 Repository-local Git email must remain ozeron@me.com; do not change global Git identity.
 
+Remote: `git@github-personal:ozeron/herdr-mcp.git`, through the personal SSH alias in ~/.ssh/config. Never switch `gh` accounts to push here.
+
 Distinguish verified source behavior, installed-binary behavior, proposals, and unresolved decisions. Never interpret an idle terminal as proof of task success. Do not record credentials or private terminal output in docs.
 
 ## Agent feedback
