@@ -24,6 +24,8 @@ pub struct Matcher {
     baseline: Vec<String>,
     needle: String,
     echo: Vec<String>,
+    /// Last line of a command; only lines after its last echo count.
+    anchor: Option<String>,
 }
 
 impl Matcher {
@@ -31,13 +33,32 @@ impl Matcher {
         Self {
             baseline: split_lines(baseline),
             needle: needle.to_string(),
-            echo: command
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(String::from)
-                .collect(),
+            echo: echo_lines(command),
+            anchor: None,
         }
+    }
+
+    /// Considers only lines after the last echo of `command`, not the screen at call time.
+    /// A line already printed after that echo matches at once.
+    pub fn after_command(needle: &str, command: &str) -> Self {
+        let echo = echo_lines(command);
+        Self {
+            baseline: Vec::new(),
+            needle: needle.to_string(),
+            anchor: echo.last().cloned(),
+            echo,
+        }
+    }
+
+    /// Whether this matcher is anchored and the echoed command is absent from `current`.
+    pub fn anchor_missing(&self, current: &str) -> bool {
+        self.anchor.is_some() && self.anchored(&split_lines(current)).is_none()
+    }
+
+    fn anchored(&self, current: &[String]) -> Option<Vec<String>> {
+        let anchor = self.anchor.as_deref()?;
+        let at = current.iter().rposition(|line| line.contains(anchor))?;
+        Some(current[at + 1..].to_vec())
     }
 
     /// Lines of `current` that were not in the baseline.
@@ -69,8 +90,11 @@ impl Matcher {
 
     /// The first new line containing the needle, with a few lines of context before it.
     pub fn find(&self, current: &str) -> Option<String> {
-        let fresh: Vec<String> = self
-            .new_lines(current)
+        let lines = match self.anchor {
+            Some(_) => self.anchored(&split_lines(current)).unwrap_or_default(),
+            None => self.new_lines(current),
+        };
+        let fresh: Vec<String> = lines
             .into_iter()
             .filter(|line| !self.is_echo(line))
             .collect();
@@ -84,6 +108,15 @@ impl Matcher {
             .iter()
             .any(|command| line.contains(command.as_str()))
     }
+}
+
+fn echo_lines(command: &str) -> Vec<String> {
+    command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn split_lines(text: &str) -> Vec<String> {

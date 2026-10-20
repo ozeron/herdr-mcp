@@ -121,7 +121,7 @@ impl Workspace {
             cwd.to_str().unwrap(),
             "--no-focus",
         ]);
-        Self {
+        let ws = Self {
             id: result["workspace"]["workspace_id"]
                 .as_str()
                 .expect("workspace id")
@@ -130,6 +130,21 @@ impl Workspace {
                 .as_str()
                 .expect("root pane id")
                 .to_string(),
+        };
+        ws.wait_for_shell();
+        ws
+    }
+
+    /// A fresh pane reports its startup scripts as busy; wait until the shell is in front.
+    fn wait_for_shell(&self) {
+        for _ in 0..50 {
+            let info = &herdr(&["pane", "process-info", "--pane", &self.pane])["process_info"];
+            let (front, shell) = (&info["foreground_process_group_id"], &info["shell_pid"]);
+            if !shell.is_null() && front == shell {
+                std::thread::sleep(Duration::from_millis(500));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 

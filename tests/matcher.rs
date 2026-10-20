@@ -183,3 +183,34 @@ fn tail_skips_blank_lines_and_tui_rules() {
     let screen = "answer line\n\n\n────────────\n❯ \n\n────────────\n  status bar\n";
     assert_eq!(tail(screen), "answer line\n❯\n  status bar");
 }
+
+#[test]
+fn after_command_matches_a_line_already_printed_after_the_echo() {
+    let matcher = Matcher::after_command("listening on", "npm run dev");
+    let screen = "$ npm run dev\nlistening on 4000\n";
+    assert!(matcher.find(screen).is_some());
+    assert!(!matcher.anchor_missing(screen));
+}
+
+#[test]
+fn after_command_counts_only_the_last_echo() {
+    let matcher = Matcher::after_command("listening on", "npm run dev");
+    let screen = "$ npm run dev\nlistening on 3000\n^C\n$ npm run dev\nbuilding\n";
+    assert_eq!(matcher.find(screen), None);
+    let later = format!("{screen}listening on 4000\n");
+    assert!(matcher.find(&later).unwrap().ends_with("listening on 4000"));
+}
+
+#[test]
+fn without_after_command_a_line_printed_before_the_wait_stays_old() {
+    let screen = "$ npm run dev\nlistening on 4000\n";
+    let matcher = Matcher::new(screen, "listening on", "");
+    assert_eq!(matcher.find(screen), None);
+}
+
+#[test]
+fn after_command_reports_a_missing_echo() {
+    let matcher = Matcher::after_command("listening on", "npm run dev");
+    assert!(matcher.anchor_missing("listening on 4000\n$ "));
+    assert!(!Matcher::new("", "x", "npm run dev").anchor_missing("anything"));
+}

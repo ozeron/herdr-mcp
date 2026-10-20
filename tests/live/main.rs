@@ -118,7 +118,7 @@ async fn ae2_ready_timeout_then_wait_matches() {
         .call(
             "herdr_run",
             json!({
-                "command": "sleep 6; echo server listening on 4000; sleep 30",
+                "command": "sleep 8; echo server listening on 4000; sleep 30",
                 "where": {"pane": ws.pane},
                 "ready": {"match": "listening on", "timeout_ms": 3000},
             }),
@@ -128,12 +128,9 @@ async fn ae2_ready_timeout_then_wait_matches() {
     assert_eq!(run["timed_out"], true, "{run}");
     assert_ne!(run["ready_matched"], true, "{run}");
 
-    let matched = wait_until_matched(
-        &bridge,
-        json!({"target": ws.pane, "output": {"match": "listening on"}, "timeout_ms": 5000}),
-        Duration::from_secs(30),
-    )
-    .await;
+    let rewait = run["rewait"].clone();
+    assert!(rewait.is_object(), "no rewait returned: {run}");
+    let matched = wait_until_matched(&bridge, rewait, Duration::from_secs(30)).await;
     assert_eq!(matched["matched"], true);
     bridge.close().await;
 }

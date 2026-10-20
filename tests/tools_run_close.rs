@@ -254,6 +254,7 @@ async fn run_in_a_new_split_matches_the_ready_line_and_reports_the_pgid() {
     assert_eq!(out["pane"], "w1:p9");
     assert_eq!(out["ready_matched"], true);
     assert_eq!(out["timed_out"], false);
+    assert!(out.get("rewait").is_none());
     assert_eq!(out["pgid"], 777);
     assert!(
         out["excerpt"]
@@ -415,6 +416,9 @@ async fn readiness_timeout_reports_the_tail_and_leaves_the_pane_running() {
     assert_eq!(out["ready_matched"], false);
     assert!(out["excerpt"].as_str().unwrap().contains("building..."));
     assert_eq!(out["pgid"], 777);
+    assert_eq!(out["rewait"]["target"], "w1:p9");
+    assert_eq!(out["rewait"]["output"]["match"], "listening on");
+    assert_eq!(out["rewait"]["output"]["after_command"], "serve");
     for method in [
         "pane.close",
         "tab.close",

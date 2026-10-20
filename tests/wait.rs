@@ -596,6 +596,7 @@ async fn output_matches_only_text_added_after_the_baseline() {
         request(
             Condition::Output {
                 needle: "ready".into(),
+                after_command: None,
             },
             5000,
         ),
@@ -623,6 +624,7 @@ async fn output_times_out_with_the_tail() {
         request(
             Condition::Output {
                 needle: "ready".into(),
+                after_command: None,
             },
             150,
         ),
@@ -635,6 +637,55 @@ async fn output_times_out_with_the_tail() {
 }
 
 #[tokio::test]
+async fn output_after_command_matches_a_line_printed_before_the_wait_began() {
+    let fake = FakeHerdr::start().await;
+    always(
+        &fake,
+        "pane.read",
+        read_result("$ serve --port 4000\nserver listening on 4000\n"),
+    );
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(
+            Condition::Output {
+                needle: "listening on".into(),
+                after_command: Some("serve --port 4000".into()),
+            },
+            5000,
+        ),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true);
+    assert!(out.get("note").is_none());
+}
+
+#[tokio::test]
+async fn output_after_command_notes_and_falls_back_when_the_echo_scrolled_out() {
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("listening on 4000\n$ "));
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(
+            Condition::Output {
+                needle: "listening on".into(),
+                after_command: Some("serve --port 4000".into()),
+            },
+            150,
+        ),
+    )
+    .await;
+
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+    assert!(out["note"].as_str().unwrap().contains("echoed command"));
+}
+
+#[tokio::test]
 async fn output_on_a_closed_pane_is_agent_not_running() {
     let fake = FakeHerdr::start().await;
     fake.on("pane.read", Script::error("pane_not_found", "closed"));
@@ -642,7 +693,13 @@ async fn output_on_a_closed_pane_is_agent_not_running() {
     let err = run(
         &fake,
         &fast(),
-        request(Condition::Output { needle: "x".into() }, 5000),
+        request(
+            Condition::Output {
+                needle: "x".into(),
+                after_command: None,
+            },
+            5000,
+        ),
     )
     .await
     .unwrap_err();

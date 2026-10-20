@@ -50,8 +50,13 @@ impl Default for Tuning {
 pub enum Condition {
     Turn(Turn),
     Until(Vec<AgentStatus>),
-    Output { needle: String },
-    ProcessExit { pgid: Option<u32> },
+    Output {
+        needle: String,
+        after_command: Option<String>,
+    },
+    ProcessExit {
+        pgid: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +126,19 @@ async fn dispatch(
         Condition::Until(statuses) => {
             wait_for_status(client, tuning, &request.pane, &statuses, deadline).await
         }
-        Condition::Output { needle } => {
-            wait_for_output(client, tuning, &request.pane, &needle, deadline).await
+        Condition::Output {
+            needle,
+            after_command,
+        } => {
+            wait_for_output(
+                client,
+                tuning,
+                &request.pane,
+                &needle,
+                after_command.as_deref(),
+                deadline,
+            )
+            .await
         }
         Condition::ProcessExit { pgid } => {
             wait_for_process(client, tuning, &request.pane, pgid, deadline).await
@@ -391,23 +407,42 @@ async fn wait_for_output(
     tuning: &Tuning,
     pane: &str,
     needle: &str,
+    after_command: Option<&str>,
     deadline: Instant,
 ) -> Result<Value, HerdrError> {
-    let baseline = read_text(client, pane).await.map_err(closed)?;
-    let matcher = Matcher::new(&baseline, needle, "");
+    let first = read_text(client, pane).await.map_err(closed)?;
+    let mut note = None;
+    let matcher = match after_command {
+        Some(command) => {
+            let anchored = Matcher::after_command(needle, command);
+            if anchored.anchor_missing(&first) {
+                note = Some(
+                    "the echoed command is no longer in the pane's recent output, so only output added from now on can match",
+                );
+                Matcher::new(&first, needle, "")
+            } else {
+                anchored
+            }
+        }
+        None => Matcher::new(&first, needle, ""),
+    };
     let timeout = deadline.saturating_duration_since(Instant::now());
     let outcome = wait_for_match(&matcher, timeout, tuning.pane_interval, || async {
         read_text(client, pane).await.map_err(closed)
     })
     .await?;
-    Ok(match outcome {
+    let mut out = match outcome {
         MatchOutcome::Matched { excerpt } => {
             json!({"matched": true, "timed_out": false, "pane": pane, "excerpt": excerpt})
         }
         MatchOutcome::TimedOut { tail } => {
             json!({"matched": false, "timed_out": true, "pane": pane, "excerpt": tail})
         }
-    })
+    };
+    if let Some(note) = note {
+        out["note"] = json!(note);
+    }
+    Ok(out)
 }
 
 fn shell_in_front(info: &PaneProcessInfo) -> bool {

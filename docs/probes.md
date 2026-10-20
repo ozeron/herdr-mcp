@@ -89,6 +89,6 @@ Ran `tests/live` once against `herdr-mcp-probe`: 9 passed, 0 failed, about 70 s.
 - **AE5a:** passed. Install into temp `HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` showed `ours` for both, and remove left `absent`.
 - **AE5b:** passed. A Codex child launched with an injected bridge reported a verified caller equal to its own pane.
 - **Not run:** restart and resume, because Herdr's integration hooks are not installed.
-- **Finding:** `herdr_wait {output}` only sees text added after the wait began. A line printed between two waits is never matched. In the first runs, an 8 s stand-in failed this way, so the test uses 6 s. Callers should re-wait without a gap, or read the pane.
+- **Finding, fixed:** `herdr_wait {output}` only sees text added after the wait began, so a line printed between two waits was missed (an 8 s stand-in failed this way in two full runs). `herdr_run` now returns `rewait` on a ready timeout, and `output.after_command` counts lines after the last echo of the command. AE2 is back to `sleep 8`.
 - **Finding:** Codex in an untrusted directory blocks on a trust prompt, and `herdr_launch` returns `agent_not_ready` and keeps the pane.
 

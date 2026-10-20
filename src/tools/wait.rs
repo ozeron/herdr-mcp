@@ -23,6 +23,8 @@ pub struct OutputSpec {
     /// Text to look for in output added after the wait began.
     #[serde(rename = "match")]
     pub pattern: String,
+    /// A command already typed into the pane, as sent. Only output after its last echoed line can match, so a line printed before this wait began still matches. Use the `rewait` that `herdr_run` returns.
+    pub after_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -85,6 +87,10 @@ fn condition(params: &WaitParams) -> Result<Condition, HerdrError> {
         }
         return Ok(Condition::Output {
             needle: output.pattern.clone(),
+            after_command: output
+                .after_command
+                .clone()
+                .filter(|c| !c.trim().is_empty()),
         });
     }
     let pgid = params.process_exit.as_ref().and_then(|spec| spec.pgid);

@@ -162,6 +162,12 @@ pub async fn run(
     if let Some(matched) = ready_matched {
         out["ready_matched"] = json!(matched);
     }
+    if timed_out {
+        out["rewait"] = json!({
+            "target": placed.pane_id,
+            "output": {"match": needle, "after_command": params.command},
+        });
+    }
     if let Some(note) = note {
         out["note"] = json!(note);
     }
