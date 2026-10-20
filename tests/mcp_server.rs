@@ -214,8 +214,6 @@ async fn control_mode_stubs_return_not_implemented() {
     })
     .await;
     for name in [
-        "herdr_list",
-        "herdr_read",
         "herdr_wait",
         "herdr_launch",
         "herdr_run",

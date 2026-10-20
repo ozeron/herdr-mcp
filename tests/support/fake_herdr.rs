@@ -12,12 +12,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+#[derive(Clone)]
 pub enum StreamEnd {
     Lost,
     Close,
     Hold,
 }
 
+#[derive(Clone)]
 pub enum Script {
     Reply(Value),
     Error { code: String, message: String },
@@ -25,6 +27,7 @@ pub enum Script {
     Hold,
     Drop,
     Stream { events: Vec<Value>, end: StreamEnd },
+    Delayed(Duration, Box<Script>),
 }
 
 impl Script {
@@ -39,6 +42,7 @@ impl Script {
 #[derive(Default)]
 struct State {
     scripts: HashMap<String, VecDeque<Script>>,
+    keyed: Vec<(String, Value, Script)>,
     requests: Vec<Value>,
     disconnects: usize,
 }
@@ -90,6 +94,19 @@ impl FakeHerdr {
         self.on(method, Script::Reply(result));
     }
 
+    /// Answers every request to `method` whose params contain all fields of `params`, without consuming.
+    pub fn on_params(&self, method: &str, params: Value, script: Script) {
+        self.state
+            .lock()
+            .unwrap()
+            .keyed
+            .push((method.into(), params, script));
+    }
+
+    pub fn reply_params(&self, method: &str, params: Value, result: Value) {
+        self.on_params(method, params, Script::Reply(result));
+    }
+
     pub fn requests(&self) -> Vec<Value> {
         self.state.lock().unwrap().requests.clone()
     }
@@ -137,12 +154,26 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>, notify: Arc<Notify
     let method = request["method"].as_str().unwrap_or_default().to_string();
     let script = {
         let mut state = state.lock().unwrap();
+        let keyed = state
+            .keyed
+            .iter()
+            .find(|(m, want, _)| *m == method && params_contain(&request["params"], want))
+            .map(|(_, _, script)| script.clone());
         state.requests.push(request);
-        state
-            .scripts
-            .get_mut(&method)
-            .and_then(VecDeque::pop_front)
-            .unwrap_or_else(|| Script::error("no_script", &method))
+        keyed.unwrap_or_else(|| {
+            state
+                .scripts
+                .get_mut(&method)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(|| Script::error("no_script", &method))
+        })
+    };
+    let script = match script {
+        Script::Delayed(delay, inner) => {
+            tokio::time::sleep(delay).await;
+            *inner
+        }
+        other => other,
     };
 
     match script {
@@ -160,6 +191,7 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>, notify: Arc<Notify
             let _ = write.write_all(raw.as_bytes()).await;
             let _ = write.write_all(b"\n").await;
         }
+        Script::Delayed(..) => unreachable!("nested delays are not supported"),
         Script::Drop => {}
         Script::Hold => wait_for_eof(&mut reader, &state, &notify).await,
         Script::Stream { events, end } => {
@@ -203,4 +235,15 @@ async fn wait_for_eof(
     while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
     state.lock().unwrap().disconnects += 1;
     notify.notify_waiters();
+}
+
+fn params_contain(actual: &Value, want: &Value) -> bool {
+    match want {
+        Value::Object(fields) => fields.iter().all(|(key, value)| {
+            actual
+                .get(key)
+                .is_some_and(|got| params_contain(got, value))
+        }),
+        other => actual == other,
+    }
 }

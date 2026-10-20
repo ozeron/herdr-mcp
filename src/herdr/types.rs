@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
 pub enum AgentStatus {
     Idle,
     Working,

@@ -62,6 +62,8 @@ pub enum HerdrError {
     Protocol { reason: String },
     #[error("herdr socket i/o error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{message}")]
+    Tool { code: &'static str, message: String },
 }
 
 impl HerdrError {
@@ -74,6 +76,14 @@ impl HerdrError {
             Self::LineTooLong { .. } => "herdr_line_too_long",
             Self::Protocol { .. } => "herdr_protocol_error",
             Self::Io(_) => "herdr_io_error",
+            Self::Tool { code, .. } => code,
+        }
+    }
+
+    pub fn tool(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Tool {
+            code,
+            message: message.into(),
         }
     }
 
