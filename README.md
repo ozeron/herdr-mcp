@@ -41,7 +41,7 @@ Then they differ:
 - **Read** (default) registers discovery, read and wait tools. It cannot type into or change anything.
 - **Control** adds tools that run commands, type into panes and close them. Any connected agent then has shell authority over every pane in the session, with your permissions. Client sandboxes and approval modes do not contain it: Codex runs MCP servers outside its sandbox, and Herdr's shells are unsandboxed.
 
-Agents started by `herdr_launch` get read tools unless the call sets `control: true` and the caller itself runs in control mode.
+Agents started by `herdr_launch` get read tools unless the call sets `control: true` and the caller itself runs in control mode. Codex children get the requested mode. Claude children under a global entry get that entry's mode, because Claude cannot be overridden per launch. The result's `child_tools` reports the mode the child got, and a `note` appears when the global entry's mode differs from the request.
 
 ### Resume after a Herdr restart
 
@@ -60,8 +60,8 @@ Read mode registers the first four.
 | `herdr_capabilities` | Caller, tool mode, wait cap, agent kinds and MCP status | none | `caller`, `tool_mode`, `herdr{version, protocol}`, `agents[]`, `wait_cap_ms` |
 | `herdr_list` | Workspace, tab and pane tree, with agents and plain processes | `scope`, `kind`, `status[]`, `label_contains` | tree of panes with status and foreground process |
 | `herdr_read` | Tail of a pane's output | `target`, `source`, `lines` (80, max 1000), `max_chars`, `raw` | `text`, `truncated`, `status`, `note` |
-| `herdr_wait` | Wait for one condition | `target`, then one of `turn`, `until[]`, `output{match, after_command?}`, `process_exit`; `timeout_ms` | `matched`, `timed_out`, `status`, `excerpt` |
-| `herdr_launch` | Start an agent in a new or existing pane | `kind` (any Herdr agent kind; MCP only for claude and codex), `name`, `instructions`, `where`, `cwd`, `env`, `label`, `control`, `wait` (none or turn), `start_timeout_ms` | `phase`, `pane`, `turn`, `mcp`, and the wait result with `wait: turn` |
+| `herdr_wait` | Wait for one condition | `target`, then one of `turn`, `until[]`, `output{match, after_command?}`, `process_exit`; `timeout_ms` | `matched`, `timed_out`, `status`, `excerpt`; `process_exit` with nothing running returns `result: no_active_work` |
+| `herdr_launch` | Start an agent in a new or existing pane | `kind` (any Herdr agent kind; MCP only for claude and codex), `name`, `instructions`, `where`, `cwd`, `env`, `label`, `control`, `wait` (none or turn), `start_timeout_ms` | `phase`, `pane`, `turn`, `mcp`, `child_tools`, `note`, and the wait result with `wait: turn` |
 | `herdr_run` | Type a shell command into a pane | `command`, `where`, `cwd`, `env`, `label`, `ready{match, timeout_ms}` | `pane`, `pgid`, `ready_matched`, `timed_out`, `excerpt`, `rewait` (when ready timed out), `note` |
 | `herdr_send` | Send a prompt, text or keys | `target`, then `prompt` with `mode`, or `text`, or `keys[]`; `answer_blocked` | `result`, `turn` |
 | `herdr_interrupt` | Cancel the current work without closing the pane | `target`, `method` (auto, keys, signal), `signal` | `result`, `status_after` |
@@ -75,11 +75,17 @@ Behaviour worth knowing:
 - `herdr_run` finds the command's process group by the command's first word, falls back to a group that stays stable, and otherwise returns `pgid: null` with a note. Do not wait on a process exit then.
 - `herdr_send` modes: `auto` refuses a working agent with `busy`, `after_idle` waits for idle, `steer` types into a working agent and returns no turn, `restart` interrupts first. It never answers a blocked agent unless `answer_blocked` is set and the caller launched it.
 - `herdr_launch` retries while a fresh pane reports busy, treats an agent as ready after a 3 s quiet window, and fails fast if the shell is back in front after a 3 s startup grace.
+- `herdr_wait {process_exit}` returns `{result: "no_active_work", matched: false, timed_out: false}` when nothing was running. Do not re-wait.
 - Waits never cancel work. A `timed_out` result means call again. The wait cap is 280 s for Codex, 600 s for Claude and 50 s otherwise.
 - Idle is not success. No tool reports success: read the output and decide.
 - `where` takes at most one of `pane`, `split` (`right` or `down`), `tab`, `workspace` or `worktree{branch, base}`. The default is a new tab.
 
-Failures return `isError` with a `code` and a `message`.
+Malformed arguments return a JSON-RPC `invalid_params` error. Tool failures return `isError` with a `code` and a `message`. Codes worth knowing:
+- `answer_refused`: `herdr_interrupt` would answer a blocked prompt.
+- `keys_failed`: `herdr_send` could not send the keys.
+- `cancelled`: the client cancelled a `herdr_send` or `herdr_launch`. Launch keeps the pane and reports `pane`, `phase` and `turn`.
+- `provenance_failed`: `herdr_launch` could not tag the pane as yours.
+- `herdr_timeout`: Herdr did not reply in time.
 
 ## External clients
 
@@ -94,7 +100,7 @@ It prints `claude mcp add` and `codex mcp add` commands, a Claude `.mcp.json` en
 
 ## Logs
 
-The bridge writes `herdr-mcp.log` in `herdr-mcp/` next to the Herdr socket, with mode 0600. Lines hold the tool name, a target ID, an outcome code and a duration. They never hold pane output, prompts or commands.
+The bridge writes `herdr-mcp.log` in `herdr-mcp/` next to the Herdr socket, with mode 0600. Lines hold the tool name, an outcome code and a duration. They never hold pane output, prompts or commands.
 
 ## Development
 

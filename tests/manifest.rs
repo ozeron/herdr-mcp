@@ -59,7 +59,11 @@ fn manifest_has_required_fields() {
             "{key} is required"
         );
     }
-    assert_eq!(doc["min_herdr_version"].as_str(), Some("0.9.3"));
+    let (major, minor, patch) = herdr_mcp::herdr::MIN_HERDR_VERSION;
+    assert_eq!(
+        doc["min_herdr_version"].as_str(),
+        Some(format!("{major}.{minor}.{patch}").as_str())
+    );
     assert_eq!(doc["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
 }
 
@@ -155,6 +159,23 @@ fn print_config_defaults_to_read_and_names_only_the_shim() {
     assert!(!out.contains("control"), "{out}");
     assert!(out.contains("claude mcp add"), "{out}");
     assert!(out.contains("[mcp_servers.herdr]"), "{out}");
+    let env_vars = herdr_mcp::install::codex::ENV_VARS
+        .map(|name| format!("\"{name}\""))
+        .join(", ");
+    assert!(
+        out.contains(&format!("env_vars = [{env_vars}]")),
+        "the Codex TOML block lists env_vars: {out}"
+    );
+    let add_line = out
+        .lines()
+        .position(|line| line.starts_with("codex mcp add"))
+        .expect("codex mcp add line");
+    let note = out.lines().nth(add_line + 1).unwrap_or_default();
+    assert!(
+        note.starts_with('#') && note.contains("env_vars") && note.contains("tool_timeout_sec"),
+        "the comment after `codex mcp add` names env_vars and tool_timeout_sec: {out}"
+    );
+    assert!(note.contains("herdr-mcp install"), "{out}");
     assert!(
         !out.replace(&shim, "").contains(home_path),
         "a home path other than the shim leaked: {out}"

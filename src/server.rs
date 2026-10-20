@@ -183,7 +183,7 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Wait for a turn token, agent status, output line or process exit, bounded by the wait cap. A timeout never cancels the work: on timed_out, call again. Idle is not success; read the output.",
+        description = "Wait for a turn token, agent status, output line or process exit, bounded by the wait cap. A timeout never cancels the work: on timed_out, call again. process_exit returns result no_active_work (matched false, timed_out false) when nothing was running: do not re-wait. Idle is not success; read the output.",
         annotations(read_only_hint = true)
     )]
     async fn herdr_wait(
@@ -197,7 +197,7 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Launch an agent or a command in a new pane, tab or workspace.",
+        description = "Launch an agent in a new pane, tab or workspace. The name must be unique. The child gets read tools unless control is set. Blocks up to start_timeout_ms and, with wait turn, the rest of the wait cap. Returns a turn token for herdr_wait.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn herdr_launch(

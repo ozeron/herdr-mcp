@@ -146,7 +146,6 @@ fn config(fake: &FakeHerdr, opts: &Opts, log_dir: &TempDir, mode: ToolMode) -> B
             pane_id: opts.env_pane.map(Into::into),
             tab_id: opts.env_pane.map(|_| "w1:t1".into()),
             workspace_id: opts.env_pane.map(|_| "w1".into()),
-            herdr_env_present: opts.env_pane.is_some(),
         },
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
         install_env: opts.install_env.clone(),

@@ -1,6 +1,7 @@
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, Value};
 
@@ -91,13 +92,37 @@ fn write_extras(env: &InstallEnv) -> Result<(), InstallError> {
     table.insert("env_vars", marked(Value::Array(vars)));
     table.insert("tool_timeout_sec", marked(Value::from(TOOL_TIMEOUT_SEC)));
 
-    let tmp = path.with_extension("toml.herdr-mcp.tmp");
-    let fail = |err: io::Error| InstallError::new(format!("{}: {err}", path.display()));
-    fs::write(&tmp, doc.to_string()).map_err(fail)?;
-    if let Ok(meta) = fs::metadata(&path) {
-        fs::set_permissions(&tmp, meta.permissions()).map_err(fail)?;
+    replace_file(&path, &doc.to_string())
+        .map_err(|err| InstallError::new(format!("{}: {err}", path.display())))
+}
+
+/// Replaces `path` with `contents` through a temp file beside it. A symlinked `path` stays a
+/// symlink and its target is replaced.
+pub fn replace_file(path: &Path, contents: &str) -> io::Result<()> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let mut name = target.file_name().unwrap_or_default().to_owned();
+    name.push(".herdr-mcp.tmp");
+    let tmp = target.with_file_name(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let result = (|| {
+        file.write_all(contents.as_bytes())?;
+        if let Ok(meta) = fs::metadata(&target) {
+            file.set_permissions(meta.permissions())?;
+        }
+        drop(file);
+        fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, &path).map_err(fail)
+    result
 }
 
 pub fn add(env: &InstallEnv, mode: ToolMode) -> Result<(), InstallError> {

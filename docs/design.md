@@ -1,6 +1,6 @@
 # Herdr MCP design
 
-Status: implemented through plan unit U10, 2026-10-20. Live acceptance (U11) has not run. Where an earlier draft differed from the shipped code, this doc follows the code.
+Status: implemented through plan unit U11, 2026-10-20. Live acceptance passed 9/9 ([probes.md](probes.md)). Restart and resume, `herdr plugin link` and the install and remove panes in a real Herdr pane are still unverified. Where an earlier draft differed from the shipped code, this doc follows the code.
 
 Evidence labels:
 - **[src]**: verified in the Herdr checkout (143bf5fd, Cargo 0.9.5) or the T3 checkout (b5a0696a).
@@ -223,7 +223,7 @@ Semantics:
 - **Compatibility.** Herdr 0.9.3 or newer, checked from `ping`. The protocol number and the active detection-rule versions are only reported, because Herdr bumps its protocol number for changes outside the socket API. `herdr_incompatible` is returned only when a typed response fails to decode or Herdr rejects a method as unknown.
 - **Modes.** `--tools read` (default) or `--tools control`. A tool outside the mode is not registered at all.
 - **Caller context.** `HERDR_*_ID` env vars are self-asserted. They exist for defaults and guardrails, not security, because the 0600 socket already trusts every process the user runs.
-- **State.** None. The log is `<herdr socket dir>/herdr-mcp/herdr-mcp.log`, mode 0600, rotated at 256 KB. Lines hold the tool name, a target ID, an outcome code and a duration, and nothing else.
+- **State.** None. The log is `<herdr socket dir>/herdr-mcp/herdr-mcp.log`, mode 0600, rotated at 256 KB. Lines hold the tool name, an outcome code and a duration, and nothing else.
 - **Language.** Rust: one static binary, fast startup per agent, and no Node runtime at spawn. Low stakes.
 
 ## 5. Plugin packaging [shipped]
@@ -361,7 +361,7 @@ Herdr knows 24 agent kinds (opencode, gemini, pi, …). `herdr_launch` starts th
 
 The twelve U1 probes ran in a scratch session (`--session herdr-mcp-probe`) with scratch config dirs, against Herdr 0.9.3 with Claude Code 2.1.304 and Codex 0.163. The answers are in [probes.md](probes.md). None invalidated a design decision, and they added the quiet window, the fail-fast check and the resume-hooks caveat.
 
-U11 repeats the acceptance workflows live. It needs the user's go-ahead, and a decision on whether to install Herdr's integration hooks in the scratch setup.
+U11 ran the acceptance workflows live: 9/9 passed ("Live acceptance" in probes.md). Restart and resume was not run, because Herdr's integration hooks are not installed.
 
 ## 10. Unresolved decision
 

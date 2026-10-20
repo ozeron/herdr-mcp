@@ -573,3 +573,98 @@ fn classifier_reports_global_only_for_our_entry() {
     .unwrap();
     assert_eq!(mcp_status(&sb.env, "claude"), McpStatus::Injectable);
 }
+
+mod replace_file {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use herdr_mcp::install::codex::replace_file;
+
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn a_symlinked_config_stays_a_symlink_and_its_target_gets_the_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::create_dir(dir.join("dotfiles")).unwrap();
+        let target = dir.join("dotfiles/config.toml");
+        fs::write(&target, "old").unwrap();
+        let link = dir.join("config.toml");
+        symlink(&target, &link).unwrap();
+
+        replace_file(&link, "new").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert!(leftovers(&dir).is_empty() && leftovers(&dir.join("dotfiles")).is_empty());
+    }
+
+    #[test]
+    fn file_mode_is_preserved_and_the_temp_file_is_private_until_then() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        replace_file(&path, "new").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_new_file_is_created_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        replace_file(&path, "new").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn the_temp_file_is_removed_when_the_rename_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "x").unwrap();
+
+        assert!(replace_file(&path, "new").is_err());
+
+        assert!(
+            leftovers(tmp.path()).is_empty(),
+            "{:?}",
+            leftovers(tmp.path())
+        );
+    }
+
+    #[test]
+    fn a_stale_temp_file_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        symlink(&victim, tmp.path().join("config.toml.herdr-mcp.tmp")).unwrap();
+
+        assert!(replace_file(&path, "new").is_err());
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+    }
+}

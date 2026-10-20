@@ -29,7 +29,6 @@ async fn start(env_pane: Option<&'static str>) -> Harness {
             pane_id: env_pane.map(Into::into),
             tab_id: env_pane.map(|_| "w1:t1".into()),
             workspace_id: env_pane.map(|_| "w1".into()),
-            herdr_env_present: env_pane.is_some(),
         },
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
         install_env: None,

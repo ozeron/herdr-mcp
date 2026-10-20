@@ -185,15 +185,6 @@ impl PaneProcessInfo {
         )
     }
 
-    /// The shell's group is in front, or no foreground group is reported (a missing or zero
-    /// group counts as the shell).
-    pub fn shell_in_front_or_unknown(&self) -> bool {
-        match self.foreground_process_group_id {
-            None | Some(0) => true,
-            Some(front) => Some(front) == self.shell_pid,
-        }
-    }
-
     /// The foreground group when both ids are known and a non-shell group (not 0) is in front.
     pub fn left_shell_group(&self) -> Option<u32> {
         match (self.shell_pid, self.foreground_process_group_id) {

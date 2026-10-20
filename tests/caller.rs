@@ -34,7 +34,6 @@ fn env(pane_id: Option<&str>) -> CallerEnv {
         pane_id: pane_id.map(Into::into),
         tab_id: pane_id.map(|_| "w1:t1".into()),
         workspace_id: pane_id.map(|_| "w1".into()),
-        herdr_env_present: pane_id.is_some(),
     }
 }
 

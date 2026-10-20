@@ -8,6 +8,9 @@ Rules of use:
 
 - Call `herdr_capabilities` first. It shows your caller pane, the tool mode, the wait cap and which agent kinds are supported.
 - Check with `herdr_read` before re-sending anything. A send that looks lost may already have landed.
+- `herdr_wait {process_exit}` returning `result: no_active_work` (`matched: false`, `timed_out: false`) means nothing was running. Do not re-wait.
+- Launch failures that keep the pane (`agent_not_ready`, `agent_prompt_stalled`, `cancelled`) carry `pane`, `phase` and `turn` details. Continue with `herdr_send`, `herdr_wait` or `herdr_close`; never relaunch.
+- Turn tokens come from `herdr_launch` and `herdr_send`. Pass them to `herdr_wait {turn}` unchanged.
 - A `steer` message to a working agent has no turn: there is no completion to wait for, so read the pane to see the effect.
 - One owner per child. Only the pane that launched an agent or command waits on it or answers for it.
 - Never answer a blocked prompt (approval, trust, login) on your own initiative. Surface it to the user unless they told you to answer it.
@@ -15,4 +18,4 @@ Rules of use:
 - Close only what you launched. `herdr_close` refuses other panes unless `force` is set; do not force it without being asked.
 - Read mode exposes only `herdr_capabilities`, `herdr_list`, `herdr_read` and `herdr_wait`. Control tools exist only when the bridge was started with `--tools control`.
 
-Tools return structured JSON. A failed call sets `isError` and carries a `code` and a `message`.
+Tools return structured JSON. Malformed arguments return a JSON-RPC `invalid_params` error. A tool failure sets `isError` and carries a `code` and a `message`.

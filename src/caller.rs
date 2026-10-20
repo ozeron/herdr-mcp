@@ -15,7 +15,6 @@ pub struct CallerEnv {
     pub pane_id: Option<String>,
     pub tab_id: Option<String>,
     pub workspace_id: Option<String>,
-    pub herdr_env_present: bool,
 }
 
 impl CallerEnv {
@@ -24,16 +23,10 @@ impl CallerEnv {
         let pane_id = var("HERDR_PANE_ID");
         let tab_id = var("HERDR_TAB_ID");
         let workspace_id = var("HERDR_WORKSPACE_ID");
-        let herdr_env_present = var("HERDR_ENV").is_some()
-            || pane_id.is_some()
-            || tab_id.is_some()
-            || workspace_id.is_some()
-            || var("HERDR_SOCKET_PATH").is_some();
         Self {
             pane_id,
             tab_id,
             workspace_id,
-            herdr_env_present,
         }
     }
 }
