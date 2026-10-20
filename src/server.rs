@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -43,6 +43,7 @@ pub struct Inner {
     pub caller_env: CallerEnv,
     pub logger: Logger,
     pub wait: Tuning,
+    pub interrupt_settle: Duration,
 }
 
 impl Inner {
@@ -75,6 +76,7 @@ impl HerdrMcp {
                 caller_env: config.caller_env,
                 logger: config.logger,
                 wait: Tuning::default(),
+                interrupt_settle: tools::interrupt::SETTLE,
             }),
             tool_router,
         }
@@ -85,6 +87,14 @@ impl HerdrMcp {
         Arc::get_mut(&mut self.inner)
             .expect("tuning is set before the server is shared")
             .wait = tuning;
+        self
+    }
+
+    /// Replaces how long `herdr_interrupt` waits before reading the status; call right after `new`.
+    pub fn with_interrupt_settle(mut self, settle: Duration) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("settle is set before the server is shared")
+            .interrupt_settle = settle;
         self
     }
 
@@ -213,11 +223,16 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Interrupt the foreground work of a pane or agent.",
+        description = "Interrupt the foreground work of a pane or agent without closing it. auto sends Esc to a working agent, nothing to an idle one, refuses a blocked one (Esc denies its permission prompt), and Ctrl+C to a process pane. method keys or signal overrides. Never targets your own pane unless allow_self is set.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
-    async fn herdr_interrupt(&self) -> Result<CallToolResult, ErrorData> {
-        self.not_implemented("herdr_interrupt")
+    async fn herdr_interrupt(
+        &self,
+        Parameters(params): Parameters<tools::interrupt::InterruptParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let result = tools::interrupt::run(&self.inner, params).await;
+        self.finish("herdr_interrupt", started, result)
     }
 
     #[tool(

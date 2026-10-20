@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod close;
+pub mod interrupt;
 pub mod list;
 pub mod read;
 pub mod run;

@@ -355,6 +355,7 @@ name = "herdr-mcp"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",

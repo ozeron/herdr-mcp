@@ -8,6 +8,7 @@ pub mod output;
 pub mod place;
 pub mod profile;
 pub mod provenance;
+pub mod providers;
 pub mod server;
 pub mod tools;
 pub mod turn;
