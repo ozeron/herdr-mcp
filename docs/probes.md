@@ -77,3 +77,18 @@ Labels:
 - KTD3: confirmed. Each call uses its own connection, and `events.subscribe` streams.
 - R13 and AE5: resume-on-restore needs Herdr's integration hooks installed. U9's `--status` and the README should say so, and U11's restart check must install them in the scratch setup or drop that case.
 - No probe invalidates a load-bearing decision.
+
+## Live acceptance (U11)
+
+Ran `tests/live` once against `herdr-mcp-probe`: 9 passed, 0 failed, about 70 s. Real Codex agents; replies were single words. Each test's workspace was closed afterwards, and `w1` and `w2` were left alone.
+
+- **AE1:** passed. List shows the workspace and pane, and read returns a bounded tail. A bridge on `herdr-mcp-nope` returns `herdr_not_running` twice from `herdr_capabilities`.
+- **AE2:** passed. A ready match with a 3 s timeout returns `timed_out`, and a re-wait on `listening on` matches. An earlier `listening on` in the same pane does not satisfy a new ready match.
+- **AE3:** passed. `herdr_launch` with `wait: turn` returned a turn, the reply was in the pane, and a `herdr_send` follow-up matched with `completion_seq > turn.after`. No result had a `success` field. The blocked-child case is skipped: launch takes no agent args.
+- **AE4:** passed. After an interrupt, the pane count was unchanged, the target was `done`, and no other pane changed status. The self-interrupt is refused with `self_target` for an unverified env-named caller, and for a verified one, with the bridge run under the pane's own shell over FIFOs.
+- **AE5a:** passed. Install into temp `HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` showed `ours` for both, and remove left `absent`.
+- **AE5b:** passed. A Codex child launched with an injected bridge reported a verified caller equal to its own pane.
+- **Not run:** restart and resume, because Herdr's integration hooks are not installed.
+- **Finding:** `herdr_wait {output}` only sees text added after the wait began. A line printed between two waits is never matched. In the first runs, an 8 s stand-in failed this way, so the test uses 6 s. Callers should re-wait without a gap, or read the pane.
+- **Finding:** Codex in an untrusted directory blocks on a trust prompt, and `herdr_launch` returns `agent_not_ready` and keeps the pane.
+

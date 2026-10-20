@@ -28,3 +28,4 @@ toml_edit = "0.25"
 [dev-dependencies]
 rmcp = { version = "=3.5.1", features = ["client"] }
 tempfile = "3.27.0"
+tokio = { version = "1.54.0", features = ["process", "fs"] }
