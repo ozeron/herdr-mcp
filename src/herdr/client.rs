@@ -207,6 +207,14 @@ impl Client {
         .await
     }
 
+    pub async fn agent_manifests(&self) -> Result<Vec<AgentManifestInfo>, HerdrError> {
+        self.call("server.agent_manifests", json!({}), |r| match r {
+            ResponseResult::AgentManifestStatus { manifests } => Some(manifests),
+            _ => None,
+        })
+        .await
+    }
+
     pub async fn agent_get(&self, target: &str) -> Result<AgentInfo, HerdrError> {
         self.call("agent.get", json!({"target": target}), |r| match r {
             ResponseResult::AgentInfo { agent } => Some(agent),

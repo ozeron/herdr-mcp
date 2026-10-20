@@ -753,3 +753,23 @@ async fn read_and_control_methods_send_the_expected_wire_requests() {
     assert_eq!(list.source.repo_name, "r");
     assert_eq!(list.worktrees.len(), 1);
 }
+
+#[tokio::test]
+async fn agent_manifests_report_active_versions() {
+    let fake = FakeHerdr::start().await;
+    fake.reply(
+        "server.agent_manifests",
+        json!({"type": "agent_manifest_status", "last_check_unix": 5, "last_result": "ok",
+        "manifests": [
+            {"agent": "claude", "source": "embedded", "source_kind": "embedded",
+             "active_version": "2.1.0", "warning": null},
+            {"agent": "pi"}
+        ]}),
+    );
+    let manifests = client(&fake).agent_manifests().await.unwrap();
+
+    assert_eq!(fake.last_request()["method"], "server.agent_manifests");
+    assert_eq!(manifests[0].agent, "claude");
+    assert_eq!(manifests[0].active_version.as_deref(), Some("2.1.0"));
+    assert_eq!(manifests[1].active_version, None);
+}

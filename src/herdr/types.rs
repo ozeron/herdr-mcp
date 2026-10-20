@@ -250,6 +250,17 @@ pub struct SessionSnapshot {
     pub agents: Vec<AgentInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AgentManifestInfo {
+    pub agent: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub active_version: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pong {
     pub version: String,
@@ -341,6 +352,9 @@ pub(crate) enum ResponseResult {
     },
     PaneRead {
         read: PaneReadResult,
+    },
+    AgentManifestStatus {
+        manifests: Vec<AgentManifestInfo>,
     },
     SubscriptionStarted {},
     Ok {},
