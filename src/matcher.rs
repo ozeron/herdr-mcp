@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::herdr::{Client, HerdrError, PaneReadParams, ReadSource};
-use crate::output::{strip_ansi, truncate_tail};
+use crate::output::{last_meaningful, strip_ansi, truncate_tail};
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Herdr's cap for `pane.read`; reading all of it keeps a fast scroll from hiding the match.
@@ -61,6 +61,13 @@ impl Matcher {
         }
     }
 
+    /// Sets the screen that `find` diffs against once the echoed command has scrolled out of
+    /// the read window.
+    pub fn with_fallback_baseline(mut self, baseline: &str) -> Self {
+        self.baseline = split_lines(baseline);
+        self
+    }
+
     /// Whether this matcher is anchored and the echoed command is absent from `current`.
     pub fn anchor_missing(&self, current: &str) -> bool {
         self.anchor.is_some() && self.anchored(&split_lines(current)).is_none()
@@ -102,12 +109,15 @@ impl Matcher {
     /// The first new line containing the needle, with a few lines of context before it.
     pub fn find(&self, current: &str) -> Option<String> {
         let lines = match self.anchor {
-            Some(_) => self.anchored(&split_lines(current)).unwrap_or_default(),
+            Some(_) => self
+                .anchored(&split_lines(current))
+                .unwrap_or_else(|| self.new_lines(current)),
             None => self.new_lines(current),
         };
+        // Only the echo at the head of the new lines is skipped; later lines are output.
         let fresh: Vec<String> = lines
             .into_iter()
-            .filter(|line| !self.is_echo(line))
+            .skip_while(|line| self.is_echo(line))
             .collect();
         let hit = fresh.iter().position(|line| line.contains(&self.needle))?;
         let from = hit.saturating_sub(EXCERPT_CONTEXT);
@@ -117,7 +127,7 @@ impl Matcher {
     fn is_echo(&self, line: &str) -> bool {
         self.echo
             .iter()
-            .any(|command| line.contains(command.as_str()))
+            .any(|command| line.trim_end().ends_with(command.as_str()))
     }
 }
 
@@ -172,10 +182,9 @@ where
 
 /// The last meaningful lines of `text`. Blank lines and TUI rules (box-drawing only) are skipped.
 pub fn tail(text: &str) -> String {
-    let lines: Vec<_> = split_lines(text)
-        .into_iter()
-        .filter(|line| crate::output::is_meaningful(line))
-        .collect();
-    let from = lines.len().saturating_sub(TAIL_LINES);
-    truncate_tail(lines[from..].join("\n"), TAIL_MAX_CHARS).0
+    truncate_tail(
+        last_meaningful(&split_lines(text).join("\n"), TAIL_LINES),
+        TAIL_MAX_CHARS,
+    )
+    .0
 }

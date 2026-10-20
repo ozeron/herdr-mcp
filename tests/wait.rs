@@ -178,14 +178,12 @@ async fn a_wait_started_after_completion_matches_at_once() {
     let fake = FakeHerdr::start().await;
     always(&fake, "agent.get", info("done", 43, Some(43)));
 
-    let out = wait::wait_turn(
-        &client(&fake),
+    let out = run_ok(
+        &fake,
         &fast(),
-        token(41, TurnFrom::Working),
-        Duration::from_secs(5),
+        request(Condition::Turn(token(41, TurnFrom::Working)), 5000),
     )
-    .await
-    .unwrap();
+    .await;
 
     assert_eq!(out["matched"], true);
     assert_eq!(out["status"], "done");
@@ -225,6 +223,99 @@ async fn a_missed_settle_reports_superseded() {
     .await;
 
     assert_eq!(out["matched"], true);
+    assert_eq!(out["status"], "working");
+    assert_eq!(out["superseded"], true);
+}
+
+#[tokio::test]
+async fn a_blocked_event_between_lookups_is_reported_as_blocked_not_superseded() {
+    let fake = FakeHerdr::start().await;
+    hold_stream(
+        &fake,
+        vec![
+            status_event("working"),
+            status_event("blocked"),
+            status_event("working"),
+        ],
+    );
+    fake.reply_seq(
+        "agent.get",
+        vec![info("working", 41, None), info("working", 45, None)],
+    );
+    let tuning = Tuning {
+        poll_interval: Duration::from_secs(30),
+        ..fast()
+    };
+
+    let out = run_ok(
+        &fake,
+        &tuning,
+        request(Condition::Turn(token(41, TurnFrom::Working)), 5000),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true, "{out}");
+    assert_eq!(out["status"], "blocked");
+    assert_eq!(out["superseded"], false);
+    assert_eq!(
+        out["turn"],
+        json!({"pane": PANE, "terminal_id": TERMINAL, "shell_pid": null, "after": 45, "from": "blocked"})
+    );
+}
+
+#[tokio::test]
+async fn a_settle_event_between_lookups_is_reported_as_the_settle_not_superseded() {
+    let fake = FakeHerdr::start().await;
+    hold_stream(
+        &fake,
+        vec![
+            status_event("working"),
+            status_event("done"),
+            status_event("working"),
+        ],
+    );
+    fake.reply_seq(
+        "agent.get",
+        vec![info("working", 41, None), info("working", 45, None)],
+    );
+    let tuning = Tuning {
+        poll_interval: Duration::from_secs(30),
+        ..fast()
+    };
+
+    let out = run_ok(
+        &fake,
+        &tuning,
+        request(Condition::Turn(token(41, TurnFrom::Working)), 5000),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true, "{out}");
+    assert_eq!(out["status"], "done");
+    assert_eq!(out["superseded"], false);
+    assert!(out.get("turn").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn without_event_information_a_missed_transition_is_still_superseded() {
+    let fake = FakeHerdr::start().await;
+    hold_stream(&fake, vec![status_event("working")]);
+    fake.reply_seq(
+        "agent.get",
+        vec![info("working", 41, None), info("working", 45, None)],
+    );
+    let tuning = Tuning {
+        poll_interval: Duration::from_secs(30),
+        ..fast()
+    };
+
+    let out = run_ok(
+        &fake,
+        &tuning,
+        request(Condition::Turn(token(41, TurnFrom::Working)), 5000),
+    )
+    .await;
+
     assert_eq!(out["status"], "working");
     assert_eq!(out["superseded"], true);
 }
@@ -672,6 +763,41 @@ async fn output_after_command_notes_and_falls_back_when_the_echo_scrolled_out() 
 }
 
 #[tokio::test]
+async fn output_after_command_falls_back_to_the_baseline_when_the_echo_scrolls_mid_wait() {
+    let fake = FakeHerdr::start().await;
+    fake.reply_seq(
+        "pane.read",
+        vec![
+            read_result("$ serve --port 4000\nbooting\n"),
+            read_result("booting\nstill booting\n"),
+            read_result("booting\nstill booting\nlistening on 4000\n"),
+        ],
+    );
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(
+            Condition::Output {
+                needle: "listening on".into(),
+                after_command: Some("serve --port 4000".into()),
+            },
+            5000,
+        ),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true, "{out}");
+    assert!(
+        out["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("listening on 4000")
+    );
+    assert!(out["note"].as_str().unwrap().contains("echoed command"));
+}
+
+#[tokio::test]
 async fn output_on_a_closed_pane_is_agent_not_running() {
     let fake = FakeHerdr::start().await;
     fake.on("pane.read", Script::error("pane_not_found", "closed"));
@@ -787,6 +913,32 @@ async fn process_exit_that_runs_past_the_cap_times_out() {
 }
 
 #[tokio::test]
+async fn process_exit_with_an_unknown_foreground_group_does_not_match() {
+    let fake = FakeHerdr::start().await;
+    let unknown = json!({"type": "pane_process_info", "process_info": {
+        "pane_id": PANE, "shell_pid": 200, "foreground_process_group_id": null,
+        "tty": "/dev/ttys001", "foreground_processes": []}});
+    always(&fake, "pane.process_info", unknown);
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(Condition::ProcessExit { pgid: Some(777) }, 300),
+    )
+    .await;
+
+    assert_eq!(out["matched"], false, "{out}");
+    assert_eq!(out["timed_out"], true);
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("process info unavailable"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
 async fn process_exit_on_a_closed_pane_is_agent_not_running() {
     let fake = FakeHerdr::start().await;
     fake.on(
@@ -803,6 +955,69 @@ async fn process_exit_on_a_closed_pane_is_agent_not_running() {
     .unwrap_err();
 
     assert_eq!(code(&err), "agent_not_running");
+}
+
+#[tokio::test]
+async fn a_stalled_herdr_cannot_push_an_output_wait_past_its_cap() {
+    let fake = FakeHerdr::start().await;
+    fake.on("pane.read", Script::Hold);
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(
+            &fake,
+            &fast(),
+            request(
+                Condition::Output {
+                    needle: "ready".into(),
+                    after_command: None,
+                },
+                300,
+            ),
+        ),
+    )
+    .await
+    .expect("the wait hung");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    match result {
+        Ok(out) => assert_eq!(out["timed_out"], true, "{out}"),
+        Err(err) => assert_eq!(code(&err), "herdr_timeout"),
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_herdr_cannot_push_a_turn_wait_past_its_cap() {
+    let fake = FakeHerdr::start().await;
+    fake.on("events.subscribe", Script::Hold);
+    fake.on("agent.get", Script::Hold);
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(
+            &fake,
+            &fast(),
+            request(Condition::Turn(token(41, TurnFrom::Working)), 300),
+        ),
+    )
+    .await
+    .expect("the wait hung");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    match result {
+        Ok(out) => assert_eq!(out["timed_out"], true, "{out}"),
+        Err(err) => assert_eq!(code(&err), "herdr_timeout"),
+    }
 }
 
 #[tokio::test]

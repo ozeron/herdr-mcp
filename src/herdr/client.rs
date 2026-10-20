@@ -1,5 +1,7 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -15,6 +17,10 @@ use super::types::*;
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// macOS `sun_path` holds 104 bytes including the terminating NUL.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+/// Bound on connecting, writing a request and reading each reply.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Added to a server-side wait, so Herdr's own timeout reply arrives before ours fires.
+pub const WAIT_MARGIN: Duration = Duration::from_secs(5);
 pub const MIN_HERDR_VERSION: (u64, u64, u64) = (0, 9, 3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +38,7 @@ enum Reply {
 pub struct Client {
     socket_path: PathBuf,
     next_id: AtomicU64,
+    timeout: Duration,
 }
 
 pub(crate) struct LineReader {
@@ -93,20 +100,35 @@ impl Client {
         Ok(Self {
             socket_path: path.into(),
             next_id: AtomicU64::new(1),
+            timeout: DEFAULT_TIMEOUT,
         })
     }
 
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The bound on one socket step: connect, write, or one reply read.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     async fn connect(&self) -> Result<UnixStream, HerdrError> {
-        UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|err| match err.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                    HerdrError::NotRunning {
-                        path: self.socket_path.clone(),
-                    }
+        within(
+            self.timeout,
+            "accept the connection",
+            UnixStream::connect(&self.socket_path),
+        )
+        .await?
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                HerdrError::NotRunning {
+                    path: self.socket_path.clone(),
                 }
-                _ => HerdrError::Io(err),
-            })
+            }
+            _ => HerdrError::Io(err),
+        })
     }
 
     pub(crate) async fn send(
@@ -120,16 +142,31 @@ impl Client {
                 .map_err(|err| HerdrError::protocol(format!("cannot encode {method}: {err}")))?;
         line.push(b'\n');
         let mut stream = self.connect().await?;
-        stream.write_all(&line).await?;
-        stream.flush().await?;
+        within(self.timeout, "accept the request", async {
+            stream.write_all(&line).await?;
+            stream.flush().await
+        })
+        .await??;
         Ok(LineReader::new(stream))
     }
 
-    async fn call_reply(&self, method: &str, params: impl Serialize) -> Result<Reply, HerdrError> {
+    /// The reply bound for a call Herdr holds open for `wait_ms` (or its default).
+    fn wait_bound(&self, wait_ms: Option<u64>) -> Duration {
+        wait_ms.map_or(self.timeout, Duration::from_millis) + WAIT_MARGIN
+    }
+
+    async fn call_reply(
+        &self,
+        method: &str,
+        params: impl Serialize,
+        reply_timeout: Duration,
+    ) -> Result<Reply, HerdrError> {
         let mut reader = self.send(method, params).await?;
-        let line = reader.next_line().await?.ok_or_else(|| {
-            HerdrError::protocol(format!("connection closed without a response to {method}"))
-        })?;
+        let line = within(reply_timeout, "reply", reader.next_line())
+            .await??
+            .ok_or_else(|| {
+                HerdrError::protocol(format!("connection closed without a response to {method}"))
+            })?;
         parse_response(method, &line)
     }
 
@@ -139,7 +176,7 @@ impl Client {
         params: impl Serialize,
         pick: impl FnOnce(ResponseResult) -> Option<T>,
     ) -> Result<T, HerdrError> {
-        match self.call_reply(method, params).await? {
+        match self.call_reply(method, params, self.timeout).await? {
             Reply::Result(result) => pick_result(method, *result, pick),
             Reply::Timeout(message) => Err(HerdrError::Api {
                 code: ApiErrorCode::Timeout,
@@ -152,9 +189,10 @@ impl Client {
         &self,
         method: &str,
         params: impl Serialize,
+        reply_timeout: Duration,
         pick: impl FnOnce(ResponseResult) -> Option<T>,
     ) -> Result<Outcome<T>, HerdrError> {
-        match self.call_reply(method, params).await? {
+        match self.call_reply(method, params, reply_timeout).await? {
             Reply::Result(result) => pick_result(method, *result, pick).map(Outcome::Done),
             Reply::Timeout(message) => Ok(Outcome::TimedOut { message }),
         }
@@ -231,7 +269,8 @@ impl Client {
         &self,
         params: &AgentStartParams,
     ) -> Result<Outcome<AgentStarted>, HerdrError> {
-        self.call_outcome("agent.start", params, |r| match r {
+        let bound = self.wait_bound(params.timeout_ms);
+        self.call_outcome("agent.start", params, bound, |r| match r {
             ResponseResult::AgentStarted(started) => Some(started),
             _ => None,
         })
@@ -242,7 +281,11 @@ impl Client {
         &self,
         params: &AgentPromptParams,
     ) -> Result<Outcome<AgentInfo>, HerdrError> {
-        self.call_outcome("agent.prompt", params, |r| match r {
+        let bound = match &params.wait {
+            Some(wait) => self.wait_bound(wait.timeout_ms),
+            None => self.timeout,
+        };
+        self.call_outcome("agent.prompt", params, bound, |r| match r {
             ResponseResult::AgentPrompted { agent } => Some(agent),
             _ => None,
         })
@@ -395,7 +438,13 @@ impl Client {
         let mut reader = self
             .send(method, json!({"subscriptions": subscriptions}))
             .await?;
-        let line = reader.next_line().await?.ok_or_else(|| {
+        let line = within(
+            self.timeout,
+            "acknowledge the subscription",
+            reader.next_line(),
+        )
+        .await??
+        .ok_or_else(|| {
             HerdrError::protocol("connection closed before the subscription was acknowledged")
         })?;
         match parse_response(method, &line)? {
@@ -411,6 +460,20 @@ impl Client {
             }),
         }
     }
+}
+
+/// Runs `step`, failing with `herdr_timeout` when Herdr takes longer than `limit`.
+async fn within<T>(
+    limit: Duration,
+    what: &str,
+    step: impl Future<Output = T>,
+) -> Result<T, HerdrError> {
+    tokio::time::timeout(limit, step).await.map_err(|_| {
+        HerdrError::tool(
+            "herdr_timeout",
+            format!("herdr did not {what} within {} ms", limit.as_millis()),
+        )
+    })
 }
 
 fn pick_ok(result: ResponseResult) -> Option<()> {

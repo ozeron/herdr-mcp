@@ -214,3 +214,32 @@ fn after_command_reports_a_missing_echo() {
     assert!(matcher.anchor_missing("listening on 4000\n$ "));
     assert!(!Matcher::new("", "x", "npm run dev").anchor_missing("anything"));
 }
+
+#[test]
+fn output_line_that_merely_contains_the_command_is_not_an_echo() {
+    let matcher = Matcher::new("$ ", "Error", "make");
+    assert_eq!(
+        matcher.find("$ make\nmake: *** [all] Error 2\n"),
+        Some("make: *** [all] Error 2".into())
+    );
+}
+
+#[test]
+fn prompt_prefixed_echo_is_still_skipped() {
+    let matcher = Matcher::new("", "make", "make");
+    assert_eq!(matcher.find("❯ make\n"), None);
+}
+
+#[test]
+fn echo_skipping_stops_at_the_first_non_echo_line() {
+    let matcher = Matcher::new("$ ", "dev", "npm run dev");
+    assert!(
+        matcher
+            .find("$ npm run dev\n> dev\n$ npm run dev\n")
+            .is_some()
+    );
+    assert_eq!(
+        matcher.find("$ npm run dev\nbuilding\n$ npm run dev\n"),
+        Some("building\n$ npm run dev".into())
+    );
+}

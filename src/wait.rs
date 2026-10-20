@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -5,7 +7,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 
 use crate::herdr::{
-    AgentInfo, AgentStatus, ApiErrorCode, Client, HerdrError, Subscription, SubscriptionEvent,
+    AgentInfo, AgentStatus, ApiErrorCode, Client, EventEnvelope, HerdrError, Subscription,
+    SubscriptionEvent,
 };
 use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, read_text, tail, wait_for_match};
 use crate::turn::{Turn, TurnFrom, Verdict, evaluate};
@@ -15,6 +18,7 @@ pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 pub const OBSERVE_WINDOW: Duration = Duration::from_secs(2);
 pub const RECHECK_DELAY: Duration = Duration::from_millis(300);
 
+const EXCERPT_TIMEOUT: Duration = Duration::from_secs(2);
 const UNKNOWN_NOTE: &str =
     "status is unknown: read the pane before concluding anything about the turn";
 
@@ -98,21 +102,6 @@ pub async fn wait(
     }
 }
 
-/// Entry point for a caller that just prompted an agent and holds its turn token.
-pub async fn wait_turn(
-    client: &Client,
-    tuning: &Tuning,
-    turn: Turn,
-    cap: Duration,
-) -> Result<Value, HerdrError> {
-    let request = Request {
-        pane: turn.pane.clone(),
-        condition: Condition::Turn(turn),
-        cap,
-    };
-    wait(client, tuning, request, None).await
-}
-
 async fn dispatch(
     client: &Client,
     tuning: &Tuning,
@@ -155,6 +144,24 @@ fn stale() -> HerdrError {
     )
 }
 
+/// Runs one socket step within `min(the client's timeout, the time left before deadline)`, so a
+/// stalled Herdr cannot push a wait past its cap.
+async fn bounded<T>(
+    client: &Client,
+    deadline: Instant,
+    step: impl Future<Output = Result<T, HerdrError>>,
+) -> Result<T, HerdrError> {
+    let limit = client
+        .timeout()
+        .min(deadline.saturating_duration_since(Instant::now()));
+    tokio::time::timeout(limit, step).await.unwrap_or_else(|_| {
+        Err(HerdrError::tool(
+            "herdr_timeout",
+            format!("herdr did not answer within {} ms", limit.as_millis()),
+        ))
+    })
+}
+
 /// A closed pane is `agent_not_running` however the wait found out.
 fn closed(err: HerdrError) -> HerdrError {
     match err {
@@ -166,22 +173,30 @@ fn closed(err: HerdrError) -> HerdrError {
     }
 }
 
-/// Event and poll wake-ups for one pane. Events say "look again"; they never decide anything.
+/// Event and poll wake-ups for one pane. Events say "look again"; a turn wait also keeps the
+/// strongest status they carried, because Herdr resets `completion_seq` on each transition and a
+/// lookup cannot see a `blocked` or settle that came and went between two lookups.
 struct Wakeups<'a> {
     client: &'a Client,
     subscriptions: Vec<Value>,
     sub: Option<Subscription>,
     poll: Duration,
+    seen: Option<AgentStatus>,
 }
 
 impl<'a> Wakeups<'a> {
     /// Subscribes first, so nothing between the subscription and the baseline read is missed.
-    async fn open(client: &'a Client, pane: &str, poll: Duration) -> Result<Self, HerdrError> {
+    async fn open(
+        client: &'a Client,
+        pane: &str,
+        poll: Duration,
+        deadline: Instant,
+    ) -> Result<Self, HerdrError> {
         let subscriptions = vec![
             json!({"type": "pane.agent_status_changed", "pane_id": pane}),
             json!({"type": "pane.closed", "pane_id": pane}),
         ];
-        let sub = match client.subscribe(subscriptions.clone()).await {
+        let sub = match bounded(client, deadline, client.subscribe(subscriptions.clone())).await {
             Ok(sub) => Some(sub),
             Err(err @ HerdrError::NotRunning { .. }) => return Err(err),
             Err(_) => None,
@@ -191,11 +206,13 @@ impl<'a> Wakeups<'a> {
             subscriptions,
             sub,
             poll,
+            seen: None,
         })
     }
 
-    async fn resubscribe(&mut self) {
-        self.sub = self.client.subscribe(self.subscriptions.clone()).await.ok();
+    async fn resubscribe(&mut self, deadline: Instant) {
+        let subscribe = self.client.subscribe(self.subscriptions.clone());
+        self.sub = bounded(self.client, deadline, subscribe).await.ok();
     }
 
     /// Returns when something may have changed, or when `deadline` passes.
@@ -205,7 +222,7 @@ impl<'a> Wakeups<'a> {
             .min(deadline.saturating_duration_since(Instant::now()));
         let Some(sub) = self.sub.as_mut() else {
             sleep(limit).await;
-            self.resubscribe().await;
+            self.resubscribe(deadline).await;
             return;
         };
         let mut event = tokio::select! {
@@ -214,16 +231,34 @@ impl<'a> Wakeups<'a> {
         };
         // Queued events all mean "look again", so they fold into this wake-up instead of costing
         // a lookup each. A lost or closed stream ends the drain and is handled as before.
-        while let Some(SubscriptionEvent::Event(_)) = event {
+        while let Some(SubscriptionEvent::Event(envelope)) = &event {
+            self.seen = stronger(self.seen, event_status(envelope));
             match sub.try_next() {
                 Some(queued) => event = Some(queued),
                 None => return,
             }
         }
         match event {
-            Some(SubscriptionEvent::EventsLost) => self.resubscribe().await,
+            Some(SubscriptionEvent::EventsLost) => self.resubscribe(deadline).await,
             _ => self.sub = None,
         }
+    }
+}
+
+/// The agent status an event reports, if it is a status event.
+fn event_status(event: &EventEnvelope) -> Option<AgentStatus> {
+    serde_json::from_value(event.data.get("agent_status")?.clone()).ok()
+}
+
+/// `blocked` outranks a settle, a settle outranks `working`, and a later settle replaces an
+/// earlier one.
+fn stronger(seen: Option<AgentStatus>, new: Option<AgentStatus>) -> Option<AgentStatus> {
+    match (seen, new) {
+        (_, None) => seen,
+        (None, new) => new,
+        (Some(AgentStatus::Blocked), _) => seen,
+        (Some(_), Some(AgentStatus::Working)) => seen,
+        (Some(_), new) => new,
     }
 }
 
@@ -287,20 +322,27 @@ async fn lookup(
     }
 }
 
-async fn shell_pid(client: &Client, pane: &str) -> Option<u32> {
-    client.pane_process_info(pane).await.ok()?.shell_pid
+async fn shell_pid(client: &Client, pane: &str, deadline: Instant) -> Option<u32> {
+    bounded(client, deadline, client.pane_process_info(pane))
+        .await
+        .ok()?
+        .shell_pid
 }
 
+/// The closing excerpt is a courtesy: it gets a short bound of its own, since the deadline has
+/// usually passed by the time it is read.
 async fn excerpt(client: &Client, pane: &str) -> String {
-    read_text(client, pane)
-        .await
-        .map(|text| tail(&text))
-        .unwrap_or_default()
+    let limit = client.timeout().min(EXCERPT_TIMEOUT);
+    match tokio::time::timeout(limit, read_text(client, pane)).await {
+        Ok(Ok(text)) => tail(&text),
+        _ => String::new(),
+    }
 }
 
 async fn agent_result(
     client: &Client,
     agent: &AgentInfo,
+    status: AgentStatus,
     matched: bool,
     superseded: Option<bool>,
     turn: Option<&Turn>,
@@ -309,7 +351,7 @@ async fn agent_result(
         "matched": matched,
         "timed_out": !matched,
         "pane": agent.pane_id,
-        "status": agent.agent_status,
+        "status": status,
         "state_change_seq": agent.state_change_seq,
         "completion_seq": agent.completion_seq,
         "excerpt": excerpt(client, &agent.pane_id).await,
@@ -320,7 +362,7 @@ async fn agent_result(
     if let Some(turn) = turn {
         out["turn"] = json!(turn);
     }
-    if matched && agent.agent_status == AgentStatus::Unknown {
+    if matched && status == AgentStatus::Unknown {
         out["note"] = json!(UNKNOWN_NOTE);
     }
     out
@@ -333,44 +375,65 @@ async fn wait_for_turn(
     mut turn: Turn,
     deadline: Instant,
 ) -> Result<Value, HerdrError> {
-    let mut wakeups = Wakeups::open(client, &turn.pane, tuning.poll_interval).await?;
+    let mut wakeups = Wakeups::open(client, &turn.pane, tuning.poll_interval, deadline).await?;
     let mut pane = turn.pane.clone();
     let mut terminal_id = Some(turn.terminal_id.clone());
     loop {
         // The shell probe runs beside the lookup, on the pane as last known. If the lookup finds
         // the agent in another pane, the probe is repeated there.
         let probed = pane.clone();
-        let (found, early_shell) =
-            tokio::join!(lookup(client, &mut pane, &mut terminal_id), async {
+        let (found, early_shell) = tokio::join!(
+            bounded(
+                client,
+                deadline,
+                lookup(client, &mut pane, &mut terminal_id)
+            ),
+            async {
                 match turn.shell_pid {
-                    Some(_) => Some(shell_pid(client, &probed).await),
+                    Some(_) => Some(shell_pid(client, &probed, deadline).await),
                     None => None,
                 }
-            });
+            }
+        );
         let agent = found?.map_err(Lost::into_error)?;
         turn.pane.clone_from(&agent.pane_id);
         let shell = match (turn.shell_pid, early_shell) {
             (Some(_), Some(shell)) if agent.pane_id == probed => shell,
-            (Some(_), _) => shell_pid(client, &agent.pane_id).await,
+            (Some(_), _) => shell_pid(client, &agent.pane_id, deadline).await,
             (None, _) => None,
         };
+        let seen = wakeups.seen.take();
         match evaluate(&turn, &agent, shell) {
             Verdict::Stale => return Err(stale()),
             Verdict::Matched { superseded } => {
-                let next = (agent.agent_status == AgentStatus::Blocked).then(|| Turn {
+                // A lookup that finds the agent working again cannot tell a finished turn from one
+                // that was blocked or settled in between; the events can.
+                let (status, superseded) = match seen {
+                    Some(seen) if superseded && seen != AgentStatus::Working => (seen, false),
+                    _ => (agent.agent_status, superseded),
+                };
+                let next = (status == AgentStatus::Blocked).then(|| Turn {
                     after: agent.state_change_seq,
                     from: TurnFrom::Blocked,
                     ..turn.clone()
                 });
-                return Ok(
-                    agent_result(client, &agent, true, Some(superseded), next.as_ref()).await,
-                );
+                return Ok(agent_result(
+                    client,
+                    &agent,
+                    status,
+                    true,
+                    Some(superseded),
+                    next.as_ref(),
+                )
+                .await);
             }
             Verdict::Rebase(rebased) => turn = rebased,
             Verdict::Pending => {}
         }
         if Instant::now() >= deadline {
-            return Ok(agent_result(client, &agent, false, None, Some(&turn)).await);
+            return Ok(
+                agent_result(client, &agent, agent.agent_status, false, None, Some(&turn)).await,
+            );
         }
         wakeups.next(deadline).await;
     }
@@ -383,18 +446,22 @@ async fn wait_for_status(
     statuses: &[AgentStatus],
     deadline: Instant,
 ) -> Result<Value, HerdrError> {
-    let mut wakeups = Wakeups::open(client, pane, tuning.poll_interval).await?;
+    let mut wakeups = Wakeups::open(client, pane, tuning.poll_interval, deadline).await?;
     let mut pane = pane.to_string();
     let mut terminal_id = None;
     loop {
-        let agent = lookup(client, &mut pane, &mut terminal_id)
-            .await?
-            .map_err(|_| not_running())?;
+        let agent = bounded(
+            client,
+            deadline,
+            lookup(client, &mut pane, &mut terminal_id),
+        )
+        .await?
+        .map_err(|_| not_running())?;
         if statuses.contains(&agent.agent_status) {
-            return Ok(agent_result(client, &agent, true, None, None).await);
+            return Ok(agent_result(client, &agent, agent.agent_status, true, None, None).await);
         }
         if Instant::now() >= deadline {
-            return Ok(agent_result(client, &agent, false, None, None).await);
+            return Ok(agent_result(client, &agent, agent.agent_status, false, None, None).await);
         }
         wakeups.next(deadline).await;
     }
@@ -408,27 +475,26 @@ async fn wait_for_output(
     after_command: Option<&str>,
     deadline: Instant,
 ) -> Result<Value, HerdrError> {
-    let first = read_text(client, pane).await.map_err(closed)?;
-    let mut note = None;
+    let first = bounded(client, deadline, read_text(client, pane))
+        .await
+        .map_err(closed)?;
     let matcher = match after_command {
-        Some(command) => {
-            let anchored = Matcher::after_command(needle, command);
-            if anchored.anchor_missing(&first) {
-                note = Some(
-                    "the echoed command is no longer in the pane's recent output, so only output added from now on can match",
-                );
-                Matcher::new(&first, needle, "")
-            } else {
-                anchored
-            }
-        }
+        Some(command) => Matcher::after_command(needle, command).with_fallback_baseline(&first),
         None => Matcher::new(&first, needle, ""),
     };
+    let last = Mutex::new(first.clone());
     let timeout = deadline.saturating_duration_since(Instant::now());
     let outcome = wait_for_match(&matcher, timeout, tuning.pane_interval, || async {
-        read_text(client, pane).await.map_err(closed)
+        let text = bounded(client, deadline, read_text(client, pane))
+            .await
+            .map_err(closed)?;
+        *last.lock().unwrap() = text.clone();
+        Ok::<_, HerdrError>(text)
     })
     .await?;
+    let note = matcher.anchor_missing(&last.lock().unwrap()).then_some(
+        "the echoed command is no longer in the pane's recent output, so only output added from the first read of this wait can match",
+    );
     let mut out = match outcome {
         MatchOutcome::Matched { excerpt } => {
             json!({"matched": true, "timed_out": false, "pane": pane, "excerpt": excerpt})
@@ -454,32 +520,44 @@ async fn wait_for_process(
 ) -> Result<Value, HerdrError> {
     let observe_until = Instant::now() + tuning.observe_window;
     let mut tracked = pgid;
+    let mut unavailable;
     let done = |tracked: Option<u32>, matched: bool, timed_out: bool| json!({"matched": matched, "timed_out": timed_out, "pane": pane, "pgid": tracked});
     loop {
-        let info = client.pane_process_info(pane).await.map_err(closed)?;
+        let info = bounded(client, deadline, client.pane_process_info(pane))
+            .await
+            .map_err(closed)?;
+        // An unreadable foreground group is not the shell in front; it proves nothing either way.
+        unavailable = !info.shell_in_front_strict() && info.left_shell_group().is_none();
         match tracked {
-            None if !info.shell_in_front_or_unknown() => tracked = info.foreground_process_group_id,
             None => {
-                if Instant::now() >= observe_until {
+                if let Some(group) = info.left_shell_group() {
+                    tracked = Some(group);
+                } else if !unavailable && Instant::now() >= observe_until {
                     let mut out = done(None, false, false);
                     out["result"] = json!("no_active_work");
                     return Ok(out);
                 }
             }
             Some(group) => {
-                if info.foreground_process_group_id != Some(group)
-                    && info.shell_in_front_or_unknown()
-                {
+                if info.foreground_process_group_id != Some(group) && info.shell_in_front_strict() {
                     sleep(tuning.recheck_delay).await;
-                    let again = client.pane_process_info(pane).await.map_err(closed)?;
-                    if again.shell_in_front_or_unknown() {
+                    let again = bounded(client, deadline, client.pane_process_info(pane))
+                        .await
+                        .map_err(closed)?;
+                    if again.shell_in_front_strict() {
                         return Ok(done(tracked, true, false));
                     }
                 }
             }
         }
         if Instant::now() >= deadline {
-            return Ok(done(tracked, false, true));
+            let mut out = done(tracked, false, true);
+            if unavailable {
+                out["note"] = json!(
+                    "process info unavailable: the foreground process group could not be read, so the process may still be running"
+                );
+            }
+            return Ok(out);
         }
         sleep(
             tuning

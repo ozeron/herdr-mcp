@@ -773,3 +773,61 @@ async fn agent_manifests_report_active_versions() {
     assert_eq!(manifests[0].active_version.as_deref(), Some("2.1.0"));
     assert_eq!(manifests[1].active_version, None);
 }
+
+#[tokio::test]
+async fn a_herdr_that_never_replies_is_a_herdr_timeout() {
+    let fake = FakeHerdr::start().await;
+    fake.on("ping", Script::Hold);
+    let client = Client::new(fake.path())
+        .unwrap()
+        .with_timeout(Duration::from_millis(200));
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(3), client.ping())
+        .await
+        .expect("the call hung past its own timeout");
+
+    assert_eq!(result.unwrap_err().code(), "herdr_timeout");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn a_server_side_wait_gets_its_own_wait_plus_a_margin() {
+    let fake = FakeHerdr::start().await;
+    fake.on(
+        "agent.prompt",
+        Script::Delayed(
+            Duration::from_millis(600),
+            Box::new(Script::Reply(
+                json!({"type": "agent_prompted", "agent": agent_json()}),
+            )),
+        ),
+    );
+    let client = Client::new(fake.path())
+        .unwrap()
+        .with_timeout(Duration::from_millis(200));
+    let mut params = AgentPromptParams::new("w1:p1", "go");
+    params.wait = Some(herdr_mcp::herdr::PromptWait {
+        until: vec![AgentStatus::Idle],
+        timeout_ms: Some(1000),
+    });
+
+    let out = client.agent_prompt(&params).await.unwrap();
+    assert!(matches!(out, Outcome::Done(_)));
+}
+
+#[tokio::test]
+async fn a_subscribe_ack_that_never_comes_is_a_herdr_timeout() {
+    let fake = FakeHerdr::start().await;
+    fake.on("events.subscribe", Script::Hold);
+    let client = Client::new(fake.path())
+        .unwrap()
+        .with_timeout(Duration::from_millis(200));
+
+    let err = tokio::time::timeout(Duration::from_secs(3), client.subscribe(vec![]))
+        .await
+        .expect("the subscribe hung")
+        .unwrap_err();
+
+    assert_eq!(err.code(), "herdr_timeout");
+}

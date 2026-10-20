@@ -114,7 +114,7 @@ pub async fn run(
             let caller = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref());
             let resolution = match &params.target {
                 Some(target) => {
-                    // Joined, but checked in the old order: caller first, then snapshot.
+                    // Both run at once, but a caller error is reported before a snapshot error.
                     let (resolution, snapshot) = tokio::join!(caller, client.session_snapshot());
                     let (resolution, snapshot) = (resolution?, snapshot?);
                     let named = guard::resolve_target(&client, &snapshot, target).await?;
