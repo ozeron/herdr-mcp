@@ -35,7 +35,7 @@ pub struct Matcher {
     baseline: Vec<String>,
     needle: String,
     echo: Vec<String>,
-    /// Last line of a command; only lines after its last echo count.
+    /// Last line of a command; only its last echo line and the lines after it count.
     anchor: Option<String>,
 }
 
@@ -76,7 +76,7 @@ impl Matcher {
     fn anchored(&self, current: &[String]) -> Option<Vec<String>> {
         let anchor = self.anchor.as_deref()?;
         let at = current.iter().rposition(|line| line.contains(anchor))?;
-        Some(current[at + 1..].to_vec())
+        Some(current[at..].to_vec())
     }
 
     /// Lines of `current` that were not in the baseline.
@@ -114,20 +114,29 @@ impl Matcher {
                 .unwrap_or_else(|| self.new_lines(current)),
             None => self.new_lines(current),
         };
-        // Only the echo at the head of the new lines is skipped; later lines are output.
+        // A line holding the command is the echo unless what is left of it still has the needle;
+        // echoes stay out of the excerpt's context too.
+        let hits = |line: &String| self.without_command(line).contains(&self.needle);
         let fresh: Vec<String> = lines
             .into_iter()
-            .skip_while(|line| self.is_echo(line))
+            .filter(|line| hits(line) || self.without_command(line) == *line)
             .collect();
-        let hit = fresh.iter().position(|line| line.contains(&self.needle))?;
+        let hit = fresh.iter().position(hits)?;
         let from = hit.saturating_sub(EXCERPT_CONTEXT);
         Some(fresh[from..=hit].join("\n"))
     }
 
-    fn is_echo(&self, line: &str) -> bool {
-        self.echo
+    /// `line` without the first occurrence of the command text, so the echoed command (whatever
+    /// prompt surrounds it) cannot match, while output that merely mentions it still can.
+    fn without_command(&self, line: &str) -> String {
+        match self
+            .echo
             .iter()
-            .any(|command| line.trim_end().ends_with(command.as_str()))
+            .find_map(|command| line.find(command.as_str()).map(|at| (at, command.len())))
+        {
+            Some((at, len)) => format!("{}{}", &line[..at], &line[at + len..]),
+            None => line.to_string(),
+        }
     }
 }
 

@@ -231,15 +231,38 @@ fn prompt_prefixed_echo_is_still_skipped() {
 }
 
 #[test]
-fn echo_skipping_stops_at_the_first_non_echo_line() {
-    let matcher = Matcher::new("$ ", "dev", "npm run dev");
+fn right_prompt_echo_is_not_a_match_but_a_later_output_line_is() {
+    let command = "sleep 8; echo server listening on 4000; sleep 30";
+    let echo = format!("❯ {command}                    ☁ mm-sandbox");
+    let matcher = Matcher::new("❯ ", "listening on", command);
+
+    assert_eq!(matcher.find(&format!("{echo}\n")), None);
+    let done = format!("{echo}\nserver listening on 4000\n");
+    let excerpt = matcher.find(&done).expect("the output line matches");
+    assert!(excerpt.ends_with("server listening on 4000"), "{excerpt}");
+}
+
+#[test]
+fn anchored_right_prompt_echo_is_not_a_match() {
+    let command = "sleep 8; echo server listening on 4000; sleep 30";
+    let echo = format!("❯ {command}                    ☁ mm-sandbox");
+    let matcher = Matcher::after_command("listening on", command);
+
+    assert_eq!(matcher.find(&format!("{echo}\n")), None);
     assert!(
         matcher
-            .find("$ npm run dev\n> dev\n$ npm run dev\n")
+            .find(&format!("{echo}\nserver listening on 4000\n"))
             .is_some()
     );
+}
+
+#[test]
+fn anchored_output_line_that_contains_the_command_still_matches() {
+    let matcher = Matcher::after_command("Error", "make");
     assert_eq!(
-        matcher.find("$ npm run dev\nbuilding\n$ npm run dev\n"),
-        Some("building\n$ npm run dev".into())
+        matcher.find("❯ make\nmake: *** Error 2\n"),
+        Some("make: *** Error 2".into())
     );
+    assert!(matcher.find("make: *** Error 2\n").is_some());
+    assert_eq!(matcher.find("❯ make\n"), None);
 }
