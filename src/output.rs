@@ -49,3 +49,15 @@ pub fn truncate_tail(text: String, max_chars: usize) -> (String, bool) {
 pub fn truncate_head(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
+
+/// Whether a terminal line carries content: not blank and not only box-drawing rules.
+pub fn is_meaningful(line: &str) -> bool {
+    line.chars()
+        .any(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257F}').contains(&c))
+}
+
+/// The last `lines` meaningful lines of `text`.
+pub fn last_meaningful(text: &str, lines: usize) -> String {
+    let kept: Vec<&str> = text.lines().filter(|line| is_meaningful(line)).collect();
+    kept[kept.len().saturating_sub(lines)..].join("\n")
+}

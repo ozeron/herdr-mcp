@@ -125,10 +125,7 @@ where
 pub fn tail(text: &str) -> String {
     let lines: Vec<_> = split_lines(text)
         .into_iter()
-        .filter(|line| {
-            line.chars()
-                .any(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257F}').contains(&c))
-        })
+        .filter(|line| crate::output::is_meaningful(line))
         .collect();
     let from = lines.len().saturating_sub(TAIL_LINES);
     truncate_tail(lines[from..].join("\n"), TAIL_MAX_CHARS).0

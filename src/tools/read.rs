@@ -6,7 +6,7 @@ use crate::caller::resolve_caller;
 use crate::herdr::{
     AgentReadParams, ApiErrorCode, Client, HerdrError, PaneReadParams, PaneReadResult, ReadSource,
 };
-use crate::output::{strip_ansi, truncate_tail};
+use crate::output::{last_meaningful, strip_ansi, truncate_tail};
 use crate::server::Inner;
 
 pub const DEFAULT_LINES: u32 = 80;
@@ -38,10 +38,12 @@ pub struct ReadParams {
     pub target: Option<String>,
     /// `recent` is scrollback; `visible` is the current screen. Default `recent`.
     pub source: Option<Source>,
-    /// Lines to read. Default 80, capped at 1000.
+    /// Lines to return. Blank lines and box-drawing rules are skipped unless `raw`. Default 80, capped at 1000.
     pub lines: Option<u32>,
     /// Character cap on the returned text; the oldest output is cut first. Default 32000, capped at 100000.
     pub max_chars: Option<usize>,
+    /// Return the terminal rows as they are, blank lines and UI rules included. Default false.
+    pub raw: Option<bool>,
 }
 
 pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError> {
@@ -68,8 +70,14 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     if requested > lines {
         notes.push(format!("lines capped at {MAX_LINES}"));
     }
+    let raw = params.raw.unwrap_or(false);
+    let rows = if raw {
+        lines
+    } else {
+        lines.saturating_mul(4).min(MAX_LINES)
+    };
 
-    let (first, agent) = tokio::join!(read_agent(&client, &target, source, lines), async {
+    let (first, agent) = tokio::join!(read_agent(&client, &target, source, rows), async {
         match inner.client() {
             Ok(client) => client.agent_get(&target).await.ok(),
             Err(_) => None,
@@ -83,15 +91,21 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
                 "agent is busy in a full-screen UI, so scrollback is unavailable; returned the visible screen"
                     .to_string(),
             );
-            read_agent(&client, &target, source, lines).await?
+            read_agent(&client, &target, source, rows).await?
         }
         Err(err) if is_code(&err, "agent_not_found") => {
-            read_pane(&client, &target, source, lines).await?
+            read_pane(&client, &target, source, rows).await?
         }
         other => other?,
     };
 
-    let (text, cut) = truncate_tail(strip_ansi(&result.text), max_chars);
+    let clean = strip_ansi(&result.text);
+    let clean = if raw {
+        clean
+    } else {
+        last_meaningful(&clean, lines as usize)
+    };
+    let (text, cut) = truncate_tail(clean, max_chars);
     if cut {
         notes.push(format!("text cut to the last {max_chars} characters"));
     }

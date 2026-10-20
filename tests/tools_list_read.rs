@@ -428,7 +428,10 @@ async fn read_defaults_to_the_caller_with_80_lines() {
         .into_iter()
         .find(|r| r["method"] == "agent.read")
         .unwrap();
-    assert_eq!(request["params"]["lines"], 80);
+    assert_eq!(
+        request["params"]["lines"], 320,
+        "fetches extra rows to fill 80 meaningful lines"
+    );
     assert_eq!(request["params"]["source"], "recent");
 }
 
@@ -488,7 +491,35 @@ async fn read_strips_ansi_escapes() {
         read_result("w1:p4", "\u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7}ok\r\n"),
     );
     let read = ok(&h, "herdr_read", json!({"target": "rev"})).await;
-    assert_eq!(read["text"], "red ok\n");
+    assert_eq!(read["text"], "red ok");
+}
+
+#[tokio::test]
+async fn read_skips_blank_lines_and_tui_rules_unless_raw() {
+    let h = start(None).await;
+    let screen = "reply line one\nreply line two\n\n\n\u{2500}\u{2500}\u{2500}\n\u{203a} prompt\n\n  footer\n";
+    h.fake.reply_seq(
+        "agent.read",
+        vec![read_result("w1:p4", screen), read_result("w1:p4", screen)],
+    );
+    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 3})).await;
+    assert_eq!(read["text"], "reply line two\n\u{203a} prompt\n  footer");
+
+    let raw = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "lines": 3, "raw": true}),
+    )
+    .await;
+    assert_eq!(raw["text"], screen);
+    let rows: Vec<_> = h
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|r| r["method"] == "agent.read")
+        .map(|r| r["params"]["lines"].clone())
+        .collect();
+    assert_eq!(rows, vec![json!(12), json!(3)]);
 }
 
 #[tokio::test]
