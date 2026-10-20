@@ -39,6 +39,7 @@ fn launch_tuning() -> LaunchTuning {
         start_retry_window: Duration::from_millis(300),
         ready_poll: Duration::from_millis(5),
         quiet_window: Duration::from_millis(40),
+        dialog_settle: Duration::from_millis(60),
         idle_poll: Duration::from_millis(5),
         startup_grace: Duration::from_millis(200),
     }
@@ -159,6 +160,7 @@ async fn start(opts: Opts) -> Harness {
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
     let tuning = LaunchTuning {
         quiet_window: opts.quiet,
+        dialog_settle: Duration::from_millis(60),
         ..launch_tuning()
     };
     tokio::spawn(async move {
@@ -1358,6 +1360,218 @@ async fn an_agent_that_blocks_on_the_first_prompt_returns_the_blocked_result_wit
     assert_eq!(out["matched"], true);
     assert_eq!(out["turn"]["from"], "blocked");
     assert_eq!(count(&h.fake, "events.subscribe"), 0);
+}
+
+const HOOK_DIALOG: &str = "  Hooks need review\n  1 hook is new or changed.\n  Hooks can run outside the sandbox after you trust them.\n> 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  enter confirm · esc skip\n";
+const DIR_DIALOG: &str =
+    "  Do you trust the contents of this directory?\n> 1. Yes, continue\n  2. No, quit\n";
+const CLEAR_SCREEN: &str = "  OpenAI Codex\n> ";
+
+fn screens(fake: &FakeHerdr, texts: &[&str]) {
+    fake.reply_seq("agent.read", texts.iter().map(|t| read_result(t)).collect());
+}
+
+fn typed_keys(h: &Harness) -> Vec<Value> {
+    requests(&h.fake, "agent.send_keys")
+        .into_iter()
+        .map(|r| r["params"]["keys"].clone())
+        .collect()
+}
+
+fn launch_with_dialog(h: &Harness, texts: &[&str]) {
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake.reply_seq("agent.send_keys", vec![ok_reply()]);
+    screens(&h.fake, texts);
+}
+
+#[tokio::test]
+async fn a_codex_hook_review_dialog_is_skipped_with_esc_before_the_prompt() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[HOOK_DIALOG, CLEAR_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(typed_keys(&h), vec![json!(["esc"])]);
+    assert_eq!(
+        requests(&h.fake, "agent.read")[0]["params"]["source"],
+        "visible"
+    );
+    assert_eq!(out["dialogs"][0]["id"], "hook_review");
+    assert_eq!(out["dialogs"][0]["action"], "skipped");
+    assert_eq!(out["dialogs"][0]["verified"], true);
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("Codex hooks were skipped for this child")
+    );
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+    assert!(index_of(&h.fake, "agent.send_keys") < index_of(&h.fake, "agent.prompt"));
+}
+
+#[tokio::test]
+async fn dialogs_surface_stops_with_agent_needs_input_and_types_nothing() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[HOOK_DIALOG]);
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go", "dialogs": "surface"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_needs_input");
+    assert_eq!(out["phase"], "started");
+    assert_eq!(out["pane"], "w1:p9");
+    assert_eq!(out["name"], "kid");
+    assert_eq!(out["dialog"]["id"], "hook_review");
+    assert!(
+        out["dialog"]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("Hooks need review")
+    );
+    assert!(typed_keys(&h).is_empty());
+    assert_eq!(count(&h.fake, "agent.prompt"), 0);
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn dialogs_trust_sends_the_trust_keys() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[HOOK_DIALOG, CLEAR_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go", "dialogs": "trust"}),
+    )
+    .await;
+
+    assert_eq!(typed_keys(&h), vec![json!(["2", "enter"])]);
+    assert_eq!(out["dialogs"][0]["action"], "trusted");
+    assert!(out.get("note").is_none_or(|n| n.is_null()));
+}
+
+#[tokio::test]
+async fn a_dialog_that_survives_the_skip_is_agent_needs_input() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[HOOK_DIALOG]);
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_needs_input");
+    assert_eq!(out["dialog"]["id"], "hook_review");
+    assert_eq!(typed_keys(&h), vec![json!(["esc"])]);
+    assert_eq!(count(&h.fake, "agent.prompt"), 0);
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn chained_dialogs_are_each_handled() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[HOOK_DIALOG, DIR_DIALOG, CLEAR_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(typed_keys(&h), vec![json!(["esc"]), json!(["esc"])]);
+    assert_eq!(out["dialogs"][0]["id"], "hook_review");
+    assert_eq!(out["dialogs"][1]["id"], "directory_trust");
+    assert_eq!(out["dialogs"][1]["verified"], false);
+}
+
+#[tokio::test]
+async fn a_launch_with_no_dialog_types_nothing_extra() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[CLEAR_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert!(typed_keys(&h).is_empty());
+    assert!(out.get("dialogs").is_none_or(|d| d.is_null()));
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+}
+
+#[tokio::test]
+async fn answer_blocked_on_an_idle_own_child_with_a_dialog_on_screen_sends_the_keys() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+    screens(&h.fake, &[HOOK_DIALOG]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "keys": ["esc"], "answer_blocked": true}),
+    )
+    .await;
+
+    assert_eq!(out["result"], "answered");
+    assert_eq!(typed_keys(&h), vec![json!(["esc"])]);
+}
+
+#[tokio::test]
+async fn answer_blocked_on_an_idle_own_child_with_no_dialog_is_not_blocked() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+    screens(&h.fake, &[CLEAR_SCREEN]);
+
+    let code = err_code(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "keys": ["esc"], "answer_blocked": true}),
+    )
+    .await;
+
+    assert_eq!(code, "not_blocked");
+    assert_nothing_typed(&h.fake);
+}
+
+#[tokio::test]
+async fn answer_blocked_on_an_idle_child_of_another_caller_is_refused_even_with_a_dialog() {
+    let h = start(Opts::default()).await;
+    script_send(
+        &h.fake,
+        Some("w1:p2"),
+        vec![rev_with("idle", 3, Some("w1:p2"))],
+    );
+    screens(&h.fake, &[HOOK_DIALOG]);
+
+    let code = err_code(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "keys": ["esc"], "answer_blocked": true}),
+    )
+    .await;
+
+    assert_eq!(code, "answer_refused");
+    assert_nothing_typed(&h.fake);
 }
 
 fn script_send(fake: &FakeHerdr, rev_tokens: Option<&'static str>, gets: Vec<Value>) {

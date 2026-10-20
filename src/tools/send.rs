@@ -15,6 +15,7 @@ use crate::herdr::{
 use crate::provenance;
 use crate::server::Inner;
 use crate::tools::interrupt;
+use crate::tools::launch::visible_dialog;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::Turn;
 
@@ -43,7 +44,7 @@ pub struct SendParams {
     pub keys: Option<Vec<String>>,
     /// For a prompt. auto (default) refuses a working agent with busy; after_idle waits for idle, then sends; steer types into a working agent and returns no turn; restart interrupts, waits for idle, then sends.
     pub mode: Option<SendMode>,
-    /// Answer a blocked agent's prompt with text or keys. Only for an agent you launched; refused otherwise.
+    /// Answer a blocked agent's prompt, or a startup dialog on screen, with text or keys. Only for an agent you launched; refused otherwise.
     pub answer_blocked: Option<bool>,
     /// How long after_idle and restart wait for idle, in milliseconds. Default 30000, capped at the wait cap.
     pub timeout_ms: Option<u64>,
@@ -359,12 +360,6 @@ async fn send_raw(
                 format!("{pane} has no agent to answer"),
             ));
         };
-        if !is_blocked {
-            return Err(HerdrError::tool(
-                "not_blocked",
-                format!("{pane} is not blocked, so there is nothing to answer; nothing was typed"),
-            ));
-        }
         let caller = resolution.caller.as_ref().map(|c| c.pane_id.as_str());
         let own_child = resolution.caller_verified
             && caller.is_some()
@@ -372,6 +367,17 @@ async fn send_raw(
         if !own_child {
             return Err(refused(
                 "only a verified caller may answer an agent it launched itself",
+            ));
+        }
+        // Herdr reports some startup dialogs as idle, so a known dialog on screen counts too.
+        if !is_blocked
+            && visible_dialog(client, pane, agent.agent.as_deref().unwrap_or_default())
+                .await
+                .is_none()
+        {
+            return Err(HerdrError::tool(
+                "not_blocked",
+                format!("{pane} is not blocked, so there is nothing to answer; nothing was typed"),
             ));
         }
     } else if is_blocked {

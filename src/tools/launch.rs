@@ -11,13 +11,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::caller::resolve_caller;
 use crate::cli::ToolMode;
-use crate::herdr::{AgentInfo, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError};
+use crate::herdr::{
+    AgentInfo, AgentReadParams, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError,
+    ReadSource,
+};
 use crate::install::shim_path_in;
 use crate::install::status::{McpStatus, global_mode, mcp_status_for};
 use crate::matcher::{read_text, tail};
 use crate::place::{self, Options, Placed, Where};
 use crate::provenance;
-use crate::providers::{is_ready, mcp_args, mode_args};
+use crate::providers::{Dialog, is_ready, match_dialog, mcp_args, mode_args};
 use crate::server::Inner;
 use crate::tools::send::{gated_prompt, prompt_error, turn_for};
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
@@ -28,6 +31,7 @@ pub const START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 pub const START_RETRY_WINDOW: Duration = Duration::from_secs(2);
 pub const READY_POLL: Duration = Duration::from_millis(250);
 pub const QUIET_WINDOW: Duration = Duration::from_secs(3);
+pub const DIALOG_SETTLE: Duration = Duration::from_secs(1);
 pub const STARTUP_GRACE: Duration = Duration::from_secs(3);
 pub const IDLE_POLL: Duration = Duration::from_millis(250);
 
@@ -41,6 +45,8 @@ pub struct LaunchTuning {
     pub ready_poll: Duration,
     /// How long the agent must show no state change after first ready.
     pub quiet_window: Duration,
+    /// How long a startup dialog may take to disappear after it is answered.
+    pub dialog_settle: Duration,
     /// Poll while `herdr_send` waits for an idle agent.
     pub idle_poll: Duration,
     /// How long the shell may stay in front after `agent.start` before the launch counts as exited.
@@ -54,6 +60,7 @@ impl Default for LaunchTuning {
             start_retry_window: START_RETRY_WINDOW,
             ready_poll: READY_POLL,
             quiet_window: QUIET_WINDOW,
+            dialog_settle: DIALOG_SETTLE,
             idle_poll: IDLE_POLL,
             startup_grace: STARTUP_GRACE,
         }
@@ -69,6 +76,23 @@ pub enum LaunchWait {
     /// Return once the prompt has started a turn.
     None,
 }
+
+/// What to do with a startup dialog, such as Codex's hook review or a folder trust prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "snake_case")]
+pub enum Dialogs {
+    /// Take the option that grants nothing. Default.
+    #[default]
+    Skip,
+    /// Stop with agent_needs_input and type nothing.
+    Surface,
+    /// Take the permissive option. Only when the user asked for it.
+    Trust,
+}
+
+/// Most dialogs handled in one launch.
+const MAX_DIALOGS: usize = 3;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -94,6 +118,8 @@ pub struct LaunchParams {
     pub wait: Option<LaunchWait>,
     /// How long the agent may take to become ready, in milliseconds. Default 30000.
     pub start_timeout_ms: Option<u64>,
+    /// Startup dialogs (hook review, folder trust) the agent shows before its prompt. skip (default) takes the option that grants nothing; surface stops with agent_needs_input; trust takes the permissive option, only when the user asked.
+    pub dialogs: Option<Dialogs>,
 }
 
 /// What this call made, reported with every phase so a timeout or cancel never leads to a repeat.
@@ -237,7 +263,37 @@ pub async fn run(
         return Err(failure.err);
     }
 
+    let handled = handle_dialogs(
+        &client,
+        &inner.launch,
+        &placed,
+        &params.kind,
+        &params.name,
+        params.dialogs.unwrap_or_default(),
+    )
+    .await?;
+
     let mut out = progress(&placed, &params.name, "started");
+    if !handled.is_empty() {
+        out["dialogs"] = json!(
+            handled
+                .iter()
+                .map(|(dialog, action)| json!({
+                    "id": dialog.id, "action": action, "verified": dialog.verified,
+                }))
+                .collect::<Vec<_>>()
+        );
+        if params.kind == "codex"
+            && handled
+                .iter()
+                .any(|(dialog, action)| dialog.id == "hook_review" && *action == "skipped")
+        {
+            add_note(
+                &mut out,
+                "Codex hooks were skipped for this child, so Herdr resume hooks will not run for it. Trust the hooks once in Codex to stop this dialog.",
+            );
+        }
+    }
     out["kind"] = json!(params.kind);
     out["mcp"] = json!(injected.mcp);
     out["child_tools"] = json!(injected.child_tools.as_str());
@@ -337,6 +393,101 @@ pub async fn run(
         Ok(other) => Ok(other),
         Err(err) => Err(detailed(err, details)),
     }
+}
+
+/// The dialog of `kind` on the pane's visible screen and the screen's tail, or `None` when the
+/// screen shows none or cannot be read.
+pub(crate) async fn visible_dialog(
+    client: &Client,
+    pane: &str,
+    kind: &str,
+) -> Option<(&'static Dialog, String)> {
+    let mut params = AgentReadParams::new(pane);
+    params.source = ReadSource::Visible;
+    let read = client.agent_read(&params).await.ok()?;
+    match_dialog(Some(kind), &read.text).map(|dialog| (dialog, tail(&read.text)))
+}
+
+fn needs_input(
+    placed: &Placed,
+    name: &str,
+    dialog: &Dialog,
+    excerpt: &str,
+    why: &str,
+) -> HerdrError {
+    let mut details = progress(placed, name, "started");
+    details["dialog"] = json!({"id": dialog.id, "excerpt": excerpt});
+    HerdrError::detailed(
+        "agent_needs_input",
+        format!(
+            "{name} shows a startup dialog ({}) {why}. The pane is kept: read it, then answer with herdr_send and answer_blocked, or ask the user",
+            dialog.id
+        ),
+        details,
+    )
+}
+
+/// Answers the startup dialogs on the visible screen, at most `MAX_DIALOGS`, waiting after each
+/// answer for the screen to move on. Returns each dialog with the action taken.
+async fn handle_dialogs(
+    client: &Client,
+    tuning: &LaunchTuning,
+    placed: &Placed,
+    kind: &str,
+    name: &str,
+    mode: Dialogs,
+) -> Result<Vec<(&'static Dialog, &'static str)>, HerdrError> {
+    let pane = placed.pane_id.as_str();
+    let mut handled = Vec::new();
+    let mut current = visible_dialog(client, pane, kind).await;
+    while let Some((dialog, excerpt)) = current {
+        if mode == Dialogs::Surface {
+            return Err(needs_input(
+                placed,
+                name,
+                dialog,
+                &excerpt,
+                "and dialogs is surface",
+            ));
+        }
+        if handled.len() >= MAX_DIALOGS {
+            return Err(needs_input(
+                placed,
+                name,
+                dialog,
+                &excerpt,
+                "after too many dialogs",
+            ));
+        }
+        let (keys, action) = match mode {
+            Dialogs::Trust => (dialog.trust_keys, "trusted"),
+            _ => (dialog.skip_keys, "skipped"),
+        };
+        let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        client.agent_send_keys(pane, &keys).await?;
+        handled.push((dialog, action));
+
+        let deadline = Instant::now() + tuning.dialog_settle;
+        loop {
+            sleep(tuning.ready_poll).await;
+            current = visible_dialog(client, pane, kind).await;
+            match &current {
+                Some((same, _)) if same.id == dialog.id => {}
+                _ => break,
+            }
+            if Instant::now() >= deadline {
+                let excerpt = current.map(|(_, excerpt)| excerpt).unwrap_or_default();
+                return Err(needs_input(
+                    placed,
+                    name,
+                    dialog,
+                    &excerpt,
+                    "that is still on screen after it was answered",
+                ));
+            }
+        }
+    }
+    Ok(handled)
 }
 
 /// What the child is handed: extra start args, how it reaches the bridge, and its tool mode.

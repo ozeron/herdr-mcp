@@ -15,6 +15,67 @@ pub struct Provider {
     /// Per-launch arguments that change only the tool mode of an existing user-scope entry,
     /// for kinds whose overrides merge over it.
     pub mode_args: Option<fn(mode: ToolMode) -> Vec<String>>,
+    /// Startup dialogs that Herdr does not report as `blocked`.
+    pub dialogs: &'static [Dialog],
+}
+
+/// A startup dialog identified from the visible screen.
+#[derive(Debug)]
+pub struct Dialog {
+    pub id: &'static str,
+    /// Every one must appear on screen, compared case-insensitively.
+    pub all: &'static [&'static str],
+    /// At least one must appear when non-empty.
+    pub any: &'static [&'static str],
+    /// The conservative choice: grants nothing.
+    pub skip_keys: &'static [&'static str],
+    /// The permissive choice. Only on explicit request.
+    pub trust_keys: &'static [&'static str],
+    /// Whether the screen text and keys were checked against the real agent.
+    pub verified: bool,
+}
+
+impl Dialog {
+    fn matches(&self, screen: &str) -> bool {
+        let screen = screen.to_lowercase();
+        self.all.iter().all(|needle| screen.contains(needle))
+            && (self.any.is_empty() || self.any.iter().any(|needle| screen.contains(needle)))
+    }
+}
+
+const CODEX_DIALOGS: &[Dialog] = &[
+    Dialog {
+        id: "hook_review",
+        all: &["hooks need review", "continue without trusting"],
+        any: &[],
+        skip_keys: &["esc"],
+        // The digit may only move the highlight, so Enter confirms it.
+        trust_keys: &["2", "enter"],
+        verified: true,
+    },
+    Dialog {
+        id: "directory_trust",
+        all: &["trust"],
+        any: &["this folder", "this directory"],
+        skip_keys: &["esc"],
+        trust_keys: &["1", "enter"],
+        verified: false,
+    },
+];
+
+const CLAUDE_DIALOGS: &[Dialog] = &[Dialog {
+    id: "folder_trust",
+    all: &["do you trust the files in this folder"],
+    any: &[],
+    skip_keys: &["esc"],
+    // "Yes, proceed" is the default choice.
+    trust_keys: &["enter"],
+    verified: false,
+}];
+
+/// The first dialog of `kind` that `screen` shows.
+pub fn match_dialog(kind: Option<&str>, screen: &str) -> Option<&'static Dialog> {
+    provider(kind).dialogs.iter().find(|d| d.matches(screen))
 }
 
 pub const PROCESS_INTERRUPT_KEY: &str = "ctrl+c";
@@ -29,6 +90,7 @@ const FALLBACK: Provider = Provider {
     ready_at_unknown: false,
     mcp_args: None,
     mode_args: None,
+    dialogs: &[],
 };
 
 const PROVIDERS: &[Provider] = &[
@@ -39,6 +101,7 @@ const PROVIDERS: &[Provider] = &[
         ready_at_unknown: false,
         mcp_args: Some(claude_mcp_args),
         mode_args: None,
+        dialogs: CLAUDE_DIALOGS,
     },
     Provider {
         kind: "codex",
@@ -47,6 +110,7 @@ const PROVIDERS: &[Provider] = &[
         ready_at_unknown: true,
         mcp_args: Some(codex_mcp_args),
         mode_args: Some(codex_mode_args),
+        dialogs: CODEX_DIALOGS,
     },
 ];
 

@@ -423,7 +423,11 @@ async fn ae5b_launched_child_sees_verified_caller_through_injected_bridge() {
         )
         .await
         .ok("herdr_launch");
-    assert_eq!(launched["mcp"], "injected", "{launched}");
+    // "global" once the user has run `herdr-mcp install`; "injected" on a clean machine.
+    assert!(
+        launched["mcp"] == "injected" || launched["mcp"] == "global",
+        "{launched}"
+    );
     if launched["matched"] != true {
         wait_until_matched(&bridge, json!({"turn": launched["turn"]}), REPLY_BUDGET).await;
     }
