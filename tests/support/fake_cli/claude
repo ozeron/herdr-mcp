@@ -1,0 +1,27 @@
+#!/bin/sh
+printf 'claude %s\n' "$*" >> "$HOME/.fake_cli.log"
+cfg="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+mkdir -p "$(dirname "$cfg")"
+case "$1 $2" in
+"mcp add")
+  if grep -q '"herdr"' "$cfg" 2>/dev/null; then
+    echo "MCP server herdr already exists in user config" >&2
+    exit 1
+  fi
+  shift 2
+  while [ "$1" != "--" ]; do shift; done
+  shift
+  cmd=$1
+  shift
+  args=""
+  for a in "$@"; do args="$args${args:+,}\"$a\""; done
+  printf '{"mcpServers":{"herdr":{"type":"stdio","command":"%s","args":[%s],"env":{}}}}\n' "$cmd" "$args" > "$cfg"
+  ;;
+"mcp remove")
+  printf '{"mcpServers":{}}\n' > "$cfg"
+  ;;
+*)
+  echo "fake claude: unsupported: $*" >&2
+  exit 64
+  ;;
+esac

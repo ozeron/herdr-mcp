@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
 use crate::profile::ClientKind;
 
@@ -24,6 +24,8 @@ impl ToolMode {
     about = "MCP bridge over Herdr's socket API"
 )]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
     /// Herdr session name; overrides HERDR_SOCKET_PATH and HERDR_SESSION
     #[arg(long)]
     pub session: Option<String>,
@@ -36,4 +38,26 @@ pub struct Args {
     /// Tools to register
     #[arg(long, value_enum, default_value = "read")]
     pub tools: ToolMode,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Add or remove the global Claude and Codex entries behind a stable shim
+    Install(InstallArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct InstallArgs {
+    /// Register the control tools; they hold shell authority over every pane
+    #[arg(long, conflicts_with_all = ["status", "remove"])]
+    pub control: bool,
+    /// Report the install state and write nothing
+    #[arg(long, conflicts_with = "remove")]
+    pub status: bool,
+    /// Remove the entries and shim that point at this bridge
+    #[arg(long)]
+    pub remove: bool,
+    /// Apply without prompting
+    #[arg(long)]
+    pub yes: bool,
 }

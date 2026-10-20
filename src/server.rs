@@ -11,6 +11,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router
 use crate::caller::{Ancestry, CallerEnv};
 use crate::cli::ToolMode;
 use crate::herdr::{Client, HerdrError};
+use crate::install::InstallEnv;
 use crate::log::Logger;
 use crate::profile::Profile;
 use crate::tools::{self, NOT_IMPLEMENTED};
@@ -33,6 +34,8 @@ pub struct BridgeConfig {
     pub ancestry: Arc<dyn Ancestry>,
     pub caller_env: CallerEnv,
     pub logger: Logger,
+    /// `None` reports every agent kind as injectable instead of reading user config.
+    pub install_env: Option<InstallEnv>,
 }
 
 pub struct Inner {
@@ -42,6 +45,7 @@ pub struct Inner {
     pub ancestry: Arc<dyn Ancestry>,
     pub caller_env: CallerEnv,
     pub logger: Logger,
+    pub install_env: Option<InstallEnv>,
     pub wait: Tuning,
     pub interrupt_settle: Duration,
 }
@@ -75,6 +79,7 @@ impl HerdrMcp {
                 ancestry: config.ancestry,
                 caller_env: config.caller_env,
                 logger: config.logger,
+                install_env: config.install_env,
                 wait: Tuning::default(),
                 interrupt_settle: tools::interrupt::SETTLE,
             }),

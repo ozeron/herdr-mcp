@@ -1,0 +1,28 @@
+#!/bin/sh
+printf 'codex %s\n' "$*" >> "$HOME/.fake_cli.log"
+cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+mkdir -p "$(dirname "$cfg")"
+touch "$cfg"
+strip() {
+  awk '/^\[/{skip=($0=="[mcp_servers.herdr]")} !skip{print}' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+}
+case "$1 $2" in
+"mcp add")
+  shift 2
+  while [ "$1" != "--" ]; do shift; done
+  shift
+  cmd=$1
+  shift
+  args=""
+  for a in "$@"; do args="$args${args:+, }\"$a\""; done
+  strip
+  printf '[mcp_servers.herdr]\ncommand = "%s"\nargs = [%s]\n' "$cmd" "$args" >> "$cfg"
+  ;;
+"mcp remove")
+  strip
+  ;;
+*)
+  echo "fake codex: unsupported: $*" >&2
+  exit 64
+  ;;
+esac

@@ -1,0 +1,13 @@
+#!/bin/sh
+printf 'herdr %s\n' "$*" >> "$HOME/.fake_cli.log"
+if [ "$1 $2" = "integration status" ]; then
+  if [ -f "$HOME/.fake_herdr_status" ]; then
+    cat "$HOME/.fake_herdr_status"
+  else
+    echo "claude: not installed (/fake/claude-hook.sh)"
+    echo "codex: not installed (/fake/codex-hook.sh)"
+  fi
+  exit 0
+fi
+echo "fake herdr: unsupported: $*" >&2
+exit 64

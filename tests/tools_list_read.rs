@@ -39,6 +39,7 @@ async fn start(env_pane: Option<&'static str>) -> Harness {
             herdr_env_present: env_pane.is_some(),
         },
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
+        install_env: None,
     };
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
     tokio::spawn(async move {

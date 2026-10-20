@@ -2,6 +2,7 @@ pub mod caller;
 pub mod cli;
 pub mod guard;
 pub mod herdr;
+pub mod install;
 pub mod log;
 pub mod matcher;
 pub mod output;

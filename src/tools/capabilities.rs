@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 use crate::caller::resolve_caller;
 use crate::herdr::HerdrError;
+use crate::install::status;
 use crate::server::Inner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,11 +26,13 @@ impl McpStatus {
     }
 }
 
-/// Placeholder until the installer's classifier (U9) reports real global/injected state.
-pub fn mcp_status(kind: &str) -> McpStatus {
-    match kind {
-        "claude" | "codex" => McpStatus::Injectable,
-        _ => McpStatus::Unsupported,
+fn mcp_status(inner: &Inner, kind: &str) -> McpStatus {
+    match &inner.install_env {
+        Some(env) => status::mcp_status(env, kind),
+        None => match kind {
+            "claude" | "codex" => McpStatus::Injectable,
+            _ => McpStatus::Unsupported,
+        },
     }
 }
 
@@ -44,7 +47,7 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
         .map(|manifest| {
             json!({
                 "kind": manifest.agent,
-                "mcp": mcp_status(&manifest.agent).as_str(),
+                "mcp": mcp_status(inner, &manifest.agent).as_str(),
                 "active_version": manifest.active_version,
             })
         })
