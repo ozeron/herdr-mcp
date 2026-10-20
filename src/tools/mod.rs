@@ -1,6 +1,8 @@
 pub mod capabilities;
+pub mod close;
 pub mod list;
 pub mod read;
+pub mod run;
 
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};

@@ -168,11 +168,23 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Run a shell command in a pane and track it to completion.",
+        description = "Type a shell command into a pane (new tab by default) and optionally wait for a readiness line in its new output. Returns ready_matched or timed_out, an excerpt and the process group; never success.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
-    async fn herdr_run(&self) -> Result<CallToolResult, ErrorData> {
-        self.not_implemented("herdr_run")
+    async fn herdr_run(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<tools::run::RunParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let client_info = ctx.client_info();
+        let result = tools::run::run(
+            &self.inner,
+            client_info.as_ref().map(|info| info.name.as_str()),
+            params,
+        )
+        .await;
+        self.finish("herdr_run", started, result)
     }
 
     #[tool(
@@ -192,11 +204,16 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Close a pane, tab or workspace you launched. Refuses others unless force is set.",
+        description = "Close a pane or tab you launched. Refuses your own pane or tab unless allow_self is set, and panes no bridge launched unless force is set.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
-    async fn herdr_close(&self) -> Result<CallToolResult, ErrorData> {
-        self.not_implemented("herdr_close")
+    async fn herdr_close(
+        &self,
+        Parameters(params): Parameters<tools::close::CloseParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let result = tools::close::run(&self.inner, params).await;
+        self.finish("herdr_close", started, result)
     }
 }
 

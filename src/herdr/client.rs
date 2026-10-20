@@ -328,6 +328,24 @@ impl Client {
             .await
     }
 
+    pub async fn pane_report_metadata(
+        &self,
+        pane_id: &str,
+        source: &str,
+        tokens: &[(&str, &str)],
+    ) -> Result<(), HerdrError> {
+        let tokens: serde_json::Map<String, Value> = tokens
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), json!(value)))
+            .collect();
+        self.call(
+            "pane.report_metadata",
+            json!({"pane_id": pane_id, "source": source, "tokens": tokens}),
+            pick_ok,
+        )
+        .await
+    }
+
     pub async fn tab_create(&self, params: &TabCreateParams) -> Result<TabCreated, HerdrError> {
         self.call("tab.create", params, |r| match r {
             ResponseResult::TabCreated(created) => Some(created),
@@ -339,6 +357,15 @@ impl Client {
     pub async fn tab_close(&self, tab_id: &str) -> Result<(), HerdrError> {
         self.call("tab.close", json!({"tab_id": tab_id}), pick_ok)
             .await
+    }
+
+    pub async fn workspace_close(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        self.call(
+            "workspace.close",
+            json!({"workspace_id": workspace_id}),
+            pick_ok,
+        )
+        .await
     }
 
     pub async fn workspace_create(

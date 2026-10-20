@@ -148,7 +148,12 @@ fn process_info(pane_id: &str, shell: u32, fg: u32, name: &str, cmdline: &str) -
 }
 
 fn script_tree(fake: &FakeHerdr) {
-    let (snapshot, agents) = fixture();
+    let (snapshot, _) = fixture();
+    script_tree_with(fake, snapshot);
+}
+
+fn script_tree_with(fake: &FakeHerdr, snapshot: Value) {
+    let agents = snapshot["agents"].clone();
     fake.reply(
         "session.snapshot",
         json!({"type": "session_snapshot", "snapshot": snapshot}),
@@ -339,6 +344,16 @@ async fn list_surfaces_provenance_as_launched_by() {
     let list = ok(&h, "herdr_list", json!({})).await;
     assert_eq!(find(&list, "w1:p4")["launched_by"], "w1:p1");
     assert!(find(&list, "w1:p1").get("launched_by").is_none());
+}
+
+#[tokio::test]
+async fn list_surfaces_provenance_on_a_non_agent_pane() {
+    let h = start(Some("w1:p1")).await;
+    let (mut snapshot, _) = fixture();
+    snapshot["panes"][2]["tokens"] = json!({"herdr_mcp_parent": "external"});
+    script_tree_with(&h.fake, snapshot);
+    let list = ok(&h, "herdr_list", json!({})).await;
+    assert_eq!(find(&list, "w1:p3")["launched_by"], "external");
 }
 
 #[tokio::test]

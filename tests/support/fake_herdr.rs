@@ -43,6 +43,7 @@ impl Script {
 struct State {
     scripts: HashMap<String, VecDeque<Script>>,
     keyed: Vec<(String, Value, Script)>,
+    sequences: HashMap<String, (Vec<Script>, usize)>,
     requests: Vec<Value>,
     disconnects: usize,
 }
@@ -103,6 +104,21 @@ impl FakeHerdr {
             .push((method.into(), params, script));
     }
 
+    /// Answers successive requests to `method` in order, repeating the last script forever.
+    /// Consulted after keyed scripts and before the one-shot queue.
+    pub fn on_seq(&self, method: &str, scripts: Vec<Script>) {
+        assert!(!scripts.is_empty());
+        self.state
+            .lock()
+            .unwrap()
+            .sequences
+            .insert(method.into(), (scripts, 0));
+    }
+
+    pub fn reply_seq(&self, method: &str, results: Vec<Value>) {
+        self.on_seq(method, results.into_iter().map(Script::Reply).collect());
+    }
+
     pub fn reply_params(&self, method: &str, params: Value, result: Value) {
         self.on_params(method, params, Script::Reply(result));
     }
@@ -160,13 +176,21 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>, notify: Arc<Notify
             .find(|(m, want, _)| *m == method && params_contain(&request["params"], want))
             .map(|(_, _, script)| script.clone());
         state.requests.push(request);
-        keyed.unwrap_or_else(|| {
-            state
-                .scripts
-                .get_mut(&method)
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| Script::error("no_script", &method))
-        })
+        keyed
+            .or_else(|| {
+                state.sequences.get_mut(&method).map(|(scripts, next)| {
+                    let script = scripts[(*next).min(scripts.len() - 1)].clone();
+                    *next += 1;
+                    script
+                })
+            })
+            .unwrap_or_else(|| {
+                state
+                    .scripts
+                    .get_mut(&method)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or_else(|| Script::error("no_script", &method))
+            })
     };
     let script = match script {
         Script::Delayed(delay, inner) => {

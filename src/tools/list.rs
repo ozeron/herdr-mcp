@@ -12,9 +12,9 @@ use crate::herdr::{
     WorktreeList, WorktreeListParams,
 };
 use crate::output::truncate_head;
+use crate::provenance;
 use crate::server::Inner;
 
-const PARENT_TOKEN: &str = "herdr_mcp_parent";
 const MAX_CMDLINE_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -310,9 +310,10 @@ fn pane_json(
         if let Some(name) = &agent.name {
             out.insert("name".into(), json!(name));
         }
-        if let Some(parent) = agent.tokens.get(PARENT_TOKEN) {
-            out.insert("launched_by".into(), json!(parent));
-        }
+    }
+    let tokens = agent.map_or(&pane.tokens, |agent| &agent.tokens);
+    if let Some(parent) = provenance::parent_of(tokens) {
+        out.insert("launched_by".into(), json!(parent));
     }
     if let Some(reason) = explain.and_then(blocked_reason) {
         out.insert("blocked_reason".into(), json!(reason));

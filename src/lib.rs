@@ -1,8 +1,12 @@
 pub mod caller;
 pub mod cli;
+pub mod guard;
 pub mod herdr;
 pub mod log;
+pub mod matcher;
 pub mod output;
+pub mod place;
 pub mod profile;
+pub mod provenance;
 pub mod server;
 pub mod tools;
