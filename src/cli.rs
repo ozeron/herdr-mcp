@@ -44,6 +44,15 @@ pub struct Args {
 pub enum Command {
     /// Add or remove the global Claude and Codex entries behind a stable shim
     Install(InstallArgs),
+    /// Print MCP client setup snippets for external Claude and Codex
+    PrintConfig(PrintConfigArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PrintConfigArgs {
+    /// Tools the printed entries register
+    #[arg(long, value_enum, default_value = "read")]
+    pub tools: ToolMode,
 }
 
 #[derive(Debug, ClapArgs)]

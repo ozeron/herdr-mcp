@@ -1,0 +1,38 @@
+id = "herdr-mcp"
+name = "Herdr MCP"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "MCP bridge over Herdr's socket API, with an opt-in installer for Claude and Codex"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "install", "--path", ".", "--root", ".", "--locked"]
+
+[[actions]]
+id = "status"
+title = "Herdr MCP: install status"
+description = "Show whether Claude and Codex have the herdr entry. Writes nothing."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "install", "--status"]
+
+# Plugin actions run without a terminal, so the interactive installer runs in a pane.
+[[panes]]
+id = "install"
+title = "Herdr MCP: install (read tools)"
+description = "Add the herdr MCP server to Claude and Codex with read tools. Shows the plan and asks first."
+placement = "split"
+command = ["sh", "-c", "bin/herdr-mcp install; printf '\\nPress Enter to close. '; read _"]
+
+[[panes]]
+id = "install-control"
+title = "Herdr MCP: install (control tools)"
+description = "Add the herdr MCP server with control tools, which hold shell authority over every pane. Shows the plan and asks first."
+placement = "split"
+command = ["sh", "-c", "bin/herdr-mcp install --control; printf '\\nPress Enter to close. '; read _"]
+
+[[panes]]
+id = "remove"
+title = "Herdr MCP: remove"
+description = "Remove the herdr entries and shim that point at this plugin. Shows the plan and asks first."
+placement = "split"
+command = ["sh", "-c", "bin/herdr-mcp install --remove; printf '\\nPress Enter to close. '; read _"]

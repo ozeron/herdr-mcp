@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use herdr_mcp::caller::{CallerEnv, ProcessAncestry};
-use herdr_mcp::cli::{Args, Command, InstallArgs};
+use herdr_mcp::cli::{Args, Command, InstallArgs, PrintConfigArgs};
 use herdr_mcp::herdr::{SessionEnv, resolve_socket_path};
 use herdr_mcp::install::{self, Action, InstallEnv, Io, Options};
 use herdr_mcp::log::Logger;
+use herdr_mcp::print_config;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
 use rmcp::ServiceExt;
@@ -17,8 +18,10 @@ use rmcp::transport::stdio;
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    if let Some(Command::Install(install_args)) = &args.command {
-        return run_install(install_args);
+    match &args.command {
+        Some(Command::Install(install_args)) => return run_install(install_args),
+        Some(Command::PrintConfig(print_args)) => return run_print_config(print_args),
+        None => {}
     }
     let socket_path =
         match resolve_socket_path(args.session.as_deref(), &SessionEnv::from_process()) {
@@ -49,6 +52,19 @@ async fn main() -> ExitCode {
         }
         Err(err) => {
             eprintln!("herdr-mcp: cannot start MCP server: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_print_config(args: &PrintConfigArgs) -> ExitCode {
+    match InstallEnv::from_process() {
+        Ok(env) => {
+            print!("{}", print_config::render(&env.shim_path(), args.tools));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
             ExitCode::FAILURE
         }
     }

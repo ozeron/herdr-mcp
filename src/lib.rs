@@ -7,6 +7,7 @@ pub mod log;
 pub mod matcher;
 pub mod output;
 pub mod place;
+pub mod print_config;
 pub mod profile;
 pub mod provenance;
 pub mod providers;

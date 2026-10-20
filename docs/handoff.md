@@ -20,8 +20,11 @@ Preserve existing product scope; choose reasonable technical defaults and explai
 
 ## Status (2026-10-20)
 
-- First task done. The draft is in [design.md](design.md).
-- Decided: agents that the bridge did not launch get Herdr MCP through an opt-in global install (design §6.1).
+- Plan units U1 to U10 are done. The code, README and design.md describe the same behaviour.
+- U1 probe answers are in [probes.md](probes.md).
+- Shipped: the nine tools, read and control modes, the opt-in installer, the plugin manifest and `print-config`.
+- Decided: agents the bridge did not launch get Herdr MCP through an opt-in global install, read-only unless `--control` (design §6.1).
 - Open: whether a delegating agent is woken when its child finishes, or polls (design §10).
-- The implementation plan is [plans/2026-10-20-001-feat-herdr-mcp-v1-bridge-plan.md](plans/2026-10-20-001-feat-herdr-mcp-v1-bridge-plan.md), and it supersedes design.md where they differ. Its review findings are applied: read-only install by default with control opt-in, version-based compatibility, Herdr's prompt activity gate, and bridge-side output matching.
-- Next: plan U1, the probes in a scratch Herdr session with scratch `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, once the user asks for that step.
+- The implementation plan is [plans/2026-10-20-001-feat-herdr-mcp-v1-bridge-plan.md](plans/2026-10-20-001-feat-herdr-mcp-v1-bridge-plan.md). It supersedes design.md where they differ, and U10 synced the two.
+- Next: U11, the live acceptance suite in a scratch Herdr session. It needs the user's go-ahead first, and a decision on whether to install Herdr's Claude and Codex integration hooks in the scratch setup. Without the hooks, the restart check in AE5 cannot resume agents.
+- Not yet verified: `herdr plugin link` accepting the manifest, and the install and remove panes in a real Herdr pane. U11 covers both. Nothing has run `herdr plugin` commands or the installer against real config.
