@@ -73,12 +73,7 @@ pub async fn run(inner: &Inner, params: InterruptParams) -> Result<Value, HerdrE
     )
     .allow_self(params.allow_self.unwrap_or(false));
     let scoped = scope.target(request).await?;
-    let pane = scoped
-        .target
-        .as_ref()
-        .expect("target is required")
-        .id
-        .as_str();
+    let pane = scoped.required().id.as_str();
     let agent = scoped.agent();
     let action = Action {
         method: params.method,

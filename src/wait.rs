@@ -577,24 +577,23 @@ async fn wait_for_output(
         Ok::<_, HerdrError>(text)
     })
     .await?;
-    let notes = matcher
-        .anchor_missing(&last.lock().unwrap())
-        .then_some(
-            "the echoed command is no longer in the pane's recent output, so only output added from the first read of this wait can match".to_string(),
-        )
-        .into_iter()
-        .collect();
     let (matched, excerpt) = match outcome {
         MatchOutcome::Matched { excerpt } => (true, excerpt),
         MatchOutcome::TimedOut { tail } => (false, tail),
     };
-    Ok(Outcome {
+    let mut out = Outcome {
         matched,
         timed_out: !matched,
         pane: pane.to_string(),
-        notes,
+        notes: Vec::new(),
         detail: Detail::Output { excerpt },
-    })
+    };
+    if matcher.anchor_missing(&last.lock().unwrap()) {
+        out.add_note(
+            "the echoed command is no longer in the pane's recent output, so only output added from the first read of this wait can match",
+        );
+    }
+    Ok(out)
 }
 
 /// Matches when the tracked process group has left the foreground and a recheck still

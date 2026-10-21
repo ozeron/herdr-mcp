@@ -106,12 +106,7 @@ pub async fn run(
     let scoped = scope.target(request).await?;
     let client = scope.client();
     let resolution = &scoped.resolution;
-    let pane = scoped
-        .target
-        .as_ref()
-        .expect("target is required")
-        .id
-        .as_str();
+    let pane = scoped.required().id.as_str();
     let agent = scoped.agent();
     let is_agent = agent.is_some();
 

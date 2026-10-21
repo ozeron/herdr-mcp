@@ -229,12 +229,14 @@ pub async fn run(
             ),
         ));
     }
+    let mut mail_injection = None;
     let mail_plan = match reply {
         Reply::Screen => None,
         Reply::Mail => {
             require_verified_caller(&resolution)?;
-            let child_has_mail_tool =
-                injection(inner, &params.kind, control)?.mcp != McpStatus::Unsupported.as_str();
+            let found = injection(inner, &params.kind, control)?;
+            let child_has_mail_tool = found.mcp != McpStatus::Unsupported.as_str();
+            mail_injection = Some(found);
             Some(mail_plan(
                 &params.kind,
                 child_has_mail_tool,
@@ -259,9 +261,12 @@ pub async fn run(
     let placed = place::place(client, &resolution, params.placement.as_ref(), &options).await?;
     let mut session = LaunchSession::new(client, placed, &params.name);
 
-    let injected = match injection(inner, &params.kind, control) {
-        Ok(found) => found,
-        Err(err) => return Err(session.fail_and_clean_up(err).await),
+    let injected = match mail_injection {
+        Some(found) => found,
+        None => match injection(inner, &params.kind, control) {
+            Ok(found) => found,
+            Err(err) => return Err(session.fail_and_clean_up(err).await),
+        },
     };
     let mut start = AgentStartParams::new(&params.name, &params.kind, &session.placed().pane_id);
     start.args = mode_args.into_iter().chain(injected.args).collect();
@@ -368,7 +373,7 @@ pub async fn run(
         .map_err(|err| session.fail_prompt(err))?;
     let turn = turn_for(client, &agent).await;
     session.advance(Phase::Prompted);
-    out["phase"] = json!("prompted");
+    out["phase"] = json!(Phase::Prompted.as_str());
     out["status"] = json!(agent.agent_status);
     out["turn"] = json!(turn);
 
@@ -396,7 +401,7 @@ pub async fn run(
         return Ok(out);
     }
     session.advance(Phase::Waiting);
-    out["phase"] = json!("waiting");
+    out["phase"] = json!(Phase::Waiting.as_str());
     if turn.from == TurnFrom::Blocked {
         out["matched"] = json!(true);
         out["timed_out"] = json!(false);
@@ -424,25 +429,27 @@ pub async fn run(
         return Ok(out);
     }
     session.attach_turn(json!(turn));
-    let details = session.details();
     let result = match &mail_plan {
-        Some(plan) => await_reply(ReplyWait {
-            client,
-            mailbox: &mailbox,
-            wait: &inner.wait,
-            mail_poll: inner.launch.mail_poll,
-            reply_grace: inner.launch.reply_grace,
-            plan,
-            filter: &filter,
-            turn: turn.clone(),
-            name: &params.name,
-            remaining,
-            ticks,
-            cancel: &cancel,
-            details: &details,
-        })
-        .await
-        .map(|outcome| outcome.to_json()),
+        Some(plan) => {
+            let details = session.details();
+            await_reply(ReplyWait {
+                client,
+                mailbox: &mailbox,
+                wait: &inner.wait,
+                mail_poll: inner.launch.mail_poll,
+                reply_grace: inner.launch.reply_grace,
+                plan,
+                filter: &filter,
+                turn: turn.clone(),
+                name: &params.name,
+                remaining,
+                ticks,
+                cancel: &cancel,
+                details: &details,
+            })
+            .await
+            .map(|outcome| outcome.to_json())
+        }
         None => session
             .race(
                 &cancel,
@@ -461,19 +468,10 @@ pub async fn run(
             .map(|outcome| outcome.to_json()),
     };
     match result {
-        Ok(Value::Object(fields)) => {
-            for (key, value) in fields {
-                if key == "note" {
-                    if let Some(note) = value.as_str() {
-                        add_note(&mut out, note);
-                    }
-                } else {
-                    out[key] = value;
-                }
-            }
+        Ok(fields) => {
+            merge_fields(&mut out, fields);
             Ok(out)
         }
-        Ok(other) => Ok(other),
         Err(err) => Err(session.fail_keep(err)),
     }
 }
@@ -587,6 +585,21 @@ fn add_note(out: &mut Value, note: &str) {
         Some(existing) => json!(format!("{existing}; {note}")),
         None => json!(note),
     };
+}
+
+fn merge_fields(out: &mut Value, fields: Value) {
+    let Value::Object(fields) = fields else {
+        return;
+    };
+    for (key, value) in fields {
+        if key == "note" {
+            if let Some(note) = value.as_str() {
+                add_note(out, note);
+            }
+        } else {
+            out[key] = value;
+        }
+    }
 }
 
 /// With no user-scope entry of ours, the child gets per-launch MCP args carrying `--tools read`

@@ -127,7 +127,7 @@ pub async fn run(
             .allow_self(allow_self)
             .self_guard_first();
             let scoped = scope.target(request).await?;
-            scoped.target.expect("target is required").id
+            scoped.required().id.clone()
         }
     };
 

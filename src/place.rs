@@ -11,7 +11,7 @@ use crate::herdr::{
     WorktreeCreateParams,
 };
 use crate::provenance;
-use crate::scope::{Scope, Scoped, TargetRequest};
+use crate::scope::{Scope, TargetRequest};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -287,12 +287,9 @@ async fn existing(
         "where.pane takes a pane ID or an agent name",
     )
     .refusal_code("invalid_params");
-    let Scoped {
-        snapshot,
-        target: resolved,
-        ..
-    } = scope.target(request).await?;
-    let resolved = resolved.expect("target is required");
+    let scoped = scope.target(request).await?;
+    let resolved = scoped.required();
+    let snapshot = &scoped.snapshot;
     let info = client.pane_process_info(&resolved.id).await?;
     if !info.shell_in_front_strict() {
         return Err(HerdrError::tool(

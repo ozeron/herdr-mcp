@@ -91,7 +91,7 @@ impl<'a> LaunchSession<'a> {
         details
     }
 
-    pub fn details_at(&self, phase: Phase) -> Value {
+    fn details_at(&self, phase: Phase) -> Value {
         json!({
             "phase": phase.as_str(), "name": self.name, "pane": self.placed.pane_id,
             "tab": self.placed.tab_id, "workspace": self.placed.workspace_id,

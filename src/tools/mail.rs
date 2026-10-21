@@ -9,7 +9,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::caller::resolve_caller;
 use crate::guard::TargetKind;
 use crate::herdr::{AgentPromptParams, AgentStatus, Client, HerdrError};
 use crate::mailbox::{self, Inbox, Mailbox, Message, Party, SenderFilter};
@@ -220,13 +219,13 @@ async fn nudge(
 /// The verified caller's pane, with the inbox it reads: its pane inbox plus its name inbox when
 /// `agent.get` says the pane holds a named agent.
 async fn caller_inbox(inner: &Inner, tool: &str) -> Result<Inbox, HerdrError> {
-    let client = inner.client()?;
-    let resolution = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()).await?;
-    let pane = match resolution.caller {
-        Some(caller) if resolution.caller_verified => caller.pane_id,
+    let mut scope = Scope::open(inner)?;
+    let resolution = scope.caller().await?;
+    let pane = match &resolution.caller {
+        Some(caller) if resolution.caller_verified => caller.pane_id.clone(),
         _ => return Err(no_caller(tool)),
     };
-    let name = match client.agent_get(&pane).await {
+    let name = match scope.client().agent_get(&pane).await {
         Ok(agent) => agent.name,
         Err(err) if err.is_target_gone() => None,
         Err(err) => return Err(err),

@@ -115,6 +115,11 @@ pub struct Scoped {
 }
 
 impl Scoped {
+    /// The target of a request that is not tolerant, which always resolves one.
+    pub fn required(&self) -> &Resolved {
+        self.target.as_ref().expect("target is required")
+    }
+
     /// The agent in the target pane, when the target is a pane with one.
     pub fn agent(&self) -> Option<&AgentInfo> {
         let target = self.target.as_ref()?;
@@ -172,15 +177,17 @@ impl<'a> Scope<'a> {
     pub async fn snapshot_and_caller(
         &mut self,
     ) -> Result<(SessionSnapshot, Resolution), HerdrError> {
-        let (snapshot, resolution) = match self.resolution.clone() {
-            Some(resolution) => (self.client.session_snapshot().await?, resolution),
-            None => tokio::try_join!(
-                self.client.session_snapshot(),
-                resolve_caller(&self.client, &self.env, self.ancestry.as_ref()),
-            )?,
-        };
-        self.resolution = Some(resolution.clone());
-        Ok((snapshot, resolution))
+        match self.resolution.clone() {
+            Some(resolution) => Ok((self.client.session_snapshot().await?, resolution)),
+            None => {
+                let (snapshot, resolution) = tokio::try_join!(
+                    self.client.session_snapshot(),
+                    resolve_caller(&self.client, &self.env, self.ancestry.as_ref()),
+                )?;
+                self.resolution = Some(resolution.clone());
+                Ok((snapshot, resolution))
+            }
+        }
     }
 
     /// Fetches the snapshot and the caller together (the first error wins), then resolves and
@@ -274,7 +281,7 @@ fn tolerated(err: &HerdrError, name: &str) -> bool {
 
 /// Whether `raw` has the shape of a Herdr pane, tab or workspace ID (`w1:p2`, `w1:t2`, `w1`), so
 /// a miss is a wrong ID, not an agent name that is not running.
-pub(crate) fn looks_like_herdr_id(raw: &str) -> bool {
+fn looks_like_herdr_id(raw: &str) -> bool {
     let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
     match raw.split_once(':') {
         Some((scope, rest)) => {

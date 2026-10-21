@@ -9,7 +9,7 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::caller::{Caller, Resolution};
-use crate::herdr::{AgentStatus, Client, HerdrError, SessionSnapshot};
+use crate::herdr::{AgentInfo, AgentStatus, Client, HerdrError, SessionSnapshot};
 use crate::mailbox::{Inbox, Mailbox, Message, SenderFilter};
 use crate::turn::Turn;
 use crate::wait::{self, Condition, Detail, Outcome, Progress, Request};
@@ -105,19 +105,11 @@ pub struct ReplyWait<'a> {
     pub details: &'a Value,
 }
 
-/// The child's status when mail arrived while it was still running.
-#[derive(Debug, Clone)]
-pub struct RunningStatus {
-    pub status: AgentStatus,
-    pub state_change_seq: u64,
-    pub completion_seq: Option<u64>,
-}
-
 /// What the status fields of a received reply come from.
 #[derive(Debug, Clone)]
 pub enum Basis {
     /// Mail mid-turn: the current status, or nothing when `agent.get` failed.
-    Running(Option<RunningStatus>),
+    Running(Option<Box<AgentInfo>>),
     /// Mail inside the grace after the turn settled.
     Settled(Outcome),
     /// Mail found after the turn wait timed out; the outcome keeps its `turn`.
@@ -144,21 +136,28 @@ pub enum ReplyOutcome {
 impl ReplyOutcome {
     /// The fields to merge into the launch result.
     pub fn to_json(&self) -> Value {
+        fn without_reply(wait: &Outcome) -> Value {
+            let mut out = wait.to_json();
+            out["reply"] = Value::Null;
+            out
+        }
         match self {
             Self::Received { reply, basis } => {
                 let mut out = match basis {
                     Basis::Running(status) => {
                         let mut out = json!({"matched": true, "timed_out": false});
-                        if let Some(status) = status {
-                            out["status"] = json!(status.status);
-                            out["state_change_seq"] = json!(status.state_change_seq);
-                            out["completion_seq"] = json!(status.completion_seq);
+                        if let Some(agent) = status {
+                            out["status"] = json!(agent.agent_status);
+                            out["state_change_seq"] = json!(agent.state_change_seq);
+                            out["completion_seq"] = json!(agent.completion_seq);
                         }
                         out
                     }
                     Basis::Settled(wait) | Basis::TimedOut(wait) => {
                         let mut out = wait.to_json();
-                        out.as_object_mut().map(|fields| fields.remove("excerpt"));
+                        if let Some(fields) = out.as_object_mut() {
+                            fields.remove("excerpt");
+                        }
                         out
                     }
                 };
@@ -168,21 +167,14 @@ impl ReplyOutcome {
             Self::SettledNoMail(wait) => {
                 let mut wait = wait.clone();
                 wait.notes = vec![NO_MAIL_NOTE.into()];
-                let mut out = wait.to_json();
-                out["reply"] = Value::Null;
-                out
+                without_reply(&wait)
             }
             Self::TimedOut { wait, child } => {
-                let mut out = wait.to_json();
-                out["reply"] = Value::Null;
+                let mut out = without_reply(wait);
                 out["rewait"] = rewait(child);
                 out
             }
-            Self::Ended(wait) => {
-                let mut out = wait.to_json();
-                out["reply"] = Value::Null;
-                out
-            }
+            Self::Ended(wait) => without_reply(wait),
         }
     }
 }
@@ -217,13 +209,8 @@ fn is_settled(outcome: &Outcome) -> bool {
 }
 
 /// The child's current status, for a reply that arrived while it was still running.
-async fn running_status(client: &Client, pane: &str) -> Option<RunningStatus> {
-    let agent = client.agent_get(pane).await.ok()?;
-    Some(RunningStatus {
-        status: agent.agent_status,
-        state_change_seq: agent.state_change_seq,
-        completion_seq: agent.completion_seq,
-    })
+async fn running_status(client: &Client, pane: &str) -> Option<Box<AgentInfo>> {
+    client.agent_get(pane).await.ok().map(Box::new)
 }
 
 /// Waits for the child's mail and its turn together. Mail ends the wait at once. A turn that
