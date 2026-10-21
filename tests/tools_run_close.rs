@@ -418,6 +418,7 @@ async fn running_in_the_callers_own_pane_is_refused() {
 async fn default_placement_is_a_new_tab_in_the_callers_workspace() {
     let h = start(Opts::default()).await;
     script_caller(&h.fake);
+    h.fake.reply("session.snapshot", snapshot(None));
     h.fake
         .reply("tab.create", tab_created("w1:t9", "w1", "w1:p9"));
     h.fake.reply("pane.report_metadata", ok_reply());
@@ -442,33 +443,179 @@ async fn default_placement_is_a_new_tab_in_the_callers_workspace() {
     assert_eq!(out["pane"], "w1:p9");
 }
 
-#[tokio::test]
-async fn an_external_caller_gets_the_focused_workspace_and_external_provenance() {
-    let h = start(Opts {
+/// A snapshot whose w2 is a worktree at /repo/w2, focused on w1, answered on every call.
+fn script_workspaces(fake: &FakeHerdr) {
+    let mut snap = snapshot(None);
+    snap["snapshot"]["workspaces"][1]["label"] = json!("kenwoo");
+    snap["snapshot"]["workspaces"][1]["worktree"] = json!({
+        "repo_key": "k", "repo_name": "repo", "repo_root": "/repo",
+        "checkout_path": "/repo/w2", "is_linked_worktree": true,
+    });
+    fake.on_params("session.snapshot", json!({}), Script::Reply(snap));
+}
+
+fn script_external_tab(fake: &FakeHerdr, ws: &str) {
+    script_workspaces(fake);
+    fake.reply_seq(
+        "pane.process_info",
+        vec![process_info(&format!("{ws}:p9"), 31337, 31337)],
+    );
+    fake.reply(
+        "tab.create",
+        tab_created(&format!("{ws}:t9"), ws, &format!("{ws}:p9")),
+    );
+    fake.reply("pane.report_metadata", ok_reply());
+    fake.reply("pane.send_input", ok_reply());
+    reads(fake, &["$ "]);
+}
+
+fn external() -> Opts {
+    Opts {
         env_pane: None,
         ..Opts::default()
-    })
+    }
+}
+
+#[tokio::test]
+async fn an_external_caller_without_a_workspace_is_refused_and_nothing_is_created() {
+    let h = start(external()).await;
+    script_external_tab(&h.fake, "w2");
+
+    let out = err(&h, "herdr_run", json!({"command": "ls"})).await;
+
+    assert_eq!(out["code"], "destination_required");
+    assert_eq!(out["workspaces"][1]["label"], "kenwoo");
+    assert_eq!(count(&h.fake, "tab.create"), 0);
+}
+
+#[tokio::test]
+async fn an_explicit_workspace_wins_over_focus_and_keeps_external_provenance() {
+    let h = start(external()).await;
+    script_external_tab(&h.fake, "w2");
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"workspace_id": "w2"}}),
+    )
     .await;
-    h.fake.reply("session.snapshot", snapshot(None));
-    h.fake.reply_seq(
-        "pane.process_info",
-        vec![process_info("w1:p9", 31337, 31337)],
-    );
-    h.fake
-        .reply("tab.create", tab_created("w1:t9", "w1", "w1:p9"));
-    h.fake.reply("pane.report_metadata", ok_reply());
-    h.fake.reply("pane.send_input", ok_reply());
-    reads(&h.fake, &["$ "]);
 
-    ok(&h, "herdr_run", json!({"command": "ls"})).await;
-
-    assert!(
-        requests(&h.fake, "tab.create")[0]["params"]
-            .get("workspace_id")
-            .is_none()
+    assert_eq!(
+        requests(&h.fake, "tab.create")[0]["params"]["workspace_id"],
+        "w2"
     );
+    assert_eq!(out["workspace"], "w2");
+    assert!(out.get("warning").is_none(), "{out}");
     let meta = &requests(&h.fake, "pane.report_metadata")[0]["params"];
     assert_eq!(meta["tokens"][PARENT], "external");
+}
+
+#[tokio::test]
+async fn a_workspace_label_resolves_to_its_id() {
+    let h = start(external()).await;
+    script_external_tab(&h.fake, "w2");
+
+    ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"workspace_id": "KenWoo"}}),
+    )
+    .await;
+
+    assert_eq!(
+        requests(&h.fake, "tab.create")[0]["params"]["workspace_id"],
+        "w2"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_workspace_wins_over_the_callers_own() {
+    let h = start(Opts::default()).await;
+    script_caller(&h.fake);
+    script_external_tab(&h.fake, "w2");
+
+    ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"tab": true, "workspace_id": "w2"}}),
+    )
+    .await;
+
+    assert_eq!(
+        requests(&h.fake, "tab.create")[0]["params"]["workspace_id"],
+        "w2"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_workspace_is_refused_before_anything_is_created() {
+    let h = start(external()).await;
+    script_external_tab(&h.fake, "w2");
+
+    let out = err(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"workspace_id": "w99"}}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "target_not_found");
+    assert_eq!(count(&h.fake, "tab.create"), 0);
+}
+
+#[tokio::test]
+async fn a_cwd_outside_the_destination_worktree_opens_with_a_warning() {
+    let h = start(external()).await;
+    script_external_tab(&h.fake, "w2");
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "cwd": "/elsewhere", "where": {"workspace_id": "w2"}}),
+    )
+    .await;
+
+    assert_eq!(
+        requests(&h.fake, "tab.create")[0]["params"]["cwd"],
+        "/elsewhere"
+    );
+    let warning = out["warning"].as_str().unwrap();
+    assert!(warning.contains("/repo/w2"), "{warning}");
+}
+
+#[tokio::test]
+async fn a_cwd_inside_the_destination_worktree_has_no_warning() {
+    let h = start(external()).await;
+    script_external_tab(&h.fake, "w2");
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "cwd": "/repo/w2/src", "where": {"workspace_id": "w2"}}),
+    )
+    .await;
+
+    assert!(out.get("warning").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn workspace_id_with_split_or_a_new_workspace_is_invalid() {
+    let h = start(Opts::default()).await;
+    for placement in [
+        json!({"split": "right", "of": "w1:p2", "workspace_id": "w2"}),
+        json!({"workspace": true, "workspace_id": "w2"}),
+    ] {
+        let out = err(
+            &h,
+            "herdr_run",
+            json!({"command": "ls", "where": placement}),
+        )
+        .await;
+        assert!(
+            out.to_string().contains("workspace_id places a new tab"),
+            "{out}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1096,4 +1243,92 @@ async fn a_failed_send_into_an_existing_pane_closes_nothing() {
     for method in ["pane.close", "tab.close", "workspace.close"] {
         assert_eq!(count(&h.fake, method), 0, "{method}");
     }
+}
+
+fn move_result(from: &str, to_ws: &str, to_pane: &str) -> Value {
+    json!({"type": "pane_move", "move_result": {
+        "changed": true,
+        "previous_pane_id": from, "previous_workspace_id": "w1", "previous_tab_id": "w1:t2",
+        "pane": pane(to_pane, &format!("{to_ws}:t9"), to_ws, Some("w1:p1")),
+        "target_layout": {},
+    }})
+}
+
+#[tokio::test]
+async fn move_puts_a_launched_pane_in_a_new_tab_of_the_named_workspace() {
+    let h = start(Opts::default()).await;
+    script_close(&h.fake, Some("w1:p1"));
+    h.fake
+        .reply("pane.move", move_result("w1:p3", "w2", "w2:p9"));
+
+    let out = ok(
+        &h,
+        "herdr_move",
+        json!({"target": "w1:p3", "workspace_id": "w2", "label": "kenwoo"}),
+    )
+    .await;
+
+    let params = &requests(&h.fake, "pane.move")[0]["params"];
+    assert_eq!(params["pane_id"], "w1:p3");
+    assert_eq!(
+        params["destination"],
+        json!({"type": "new_tab", "workspace_id": "w2", "label": "kenwoo"})
+    );
+    assert_eq!(params["focus"], false);
+    assert_eq!(out["moved"], true);
+    assert_eq!(out["previous"]["pane"], "w1:p3");
+    assert_eq!(out["pane"], "w2:p9");
+    assert_eq!(out["workspace"], "w2");
+    assert!(
+        out["note"].as_str().unwrap().contains("pane ID changed"),
+        "{out}"
+    );
+    assert_eq!(count(&h.fake, "pane.close"), 0);
+}
+
+#[tokio::test]
+async fn move_refuses_a_pane_without_bridge_provenance_unless_forced() {
+    let h = start(Opts::default()).await;
+    script_close(&h.fake, None);
+    h.fake
+        .reply("pane.move", move_result("w1:p2", "w2", "w2:p9"));
+
+    let code = err_code(
+        &h,
+        "herdr_move",
+        json!({"target": "w1:p2", "workspace_id": "w2"}),
+    )
+    .await;
+    assert_eq!(code, "not_launched_by_bridge");
+    assert_eq!(count(&h.fake, "pane.move"), 0);
+
+    let out = ok(
+        &h,
+        "herdr_move",
+        json!({"target": "w1:p2", "workspace_id": "w2", "force": true}),
+    )
+    .await;
+    assert_eq!(out["moved"], true);
+}
+
+#[tokio::test]
+async fn move_refuses_the_callers_own_pane_and_an_unknown_workspace() {
+    let h = start(Opts::default()).await;
+    script_close(&h.fake, Some("w1:p1"));
+
+    let own = err_code(
+        &h,
+        "herdr_move",
+        json!({"target": "w1:p1", "workspace_id": "w2"}),
+    )
+    .await;
+    assert_eq!(own, "self_target");
+    let unknown = err_code(
+        &h,
+        "herdr_move",
+        json!({"target": "w1:p3", "workspace_id": "w99"}),
+    )
+    .await;
+    assert_eq!(unknown, "target_not_found");
+    assert_eq!(count(&h.fake, "pane.move"), 0);
 }

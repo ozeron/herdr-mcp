@@ -35,12 +35,13 @@ const TUNNEL_TOOL: &str = "herdr_tunnel_stop";
 /// How long `herdr_tunnel_stop` waits so its reply reaches the client before the service goes.
 const STOP_DELAY: Duration = Duration::from_millis(300);
 
-const CONTROL_TOOLS: [&str; 5] = [
+const CONTROL_TOOLS: [&str; 6] = [
     "herdr_launch",
     "herdr_run",
     "herdr_send",
     "herdr_interrupt",
     "herdr_close",
+    "herdr_move",
 ];
 
 /// Who is calling, for the audit log: set around each tool call.
@@ -531,6 +532,20 @@ impl HerdrMcp {
         let note = Note::close(&params);
         let result = tools::close::run(&self.inner, params).await;
         self.finish("herdr_close", started, note, result)
+    }
+
+    #[tool(
+        description = "Move a pane you launched, running process and all, into a new tab of another workspace: the fix for a tab opened in the wrong workspace, with no restart. The pane ID changes with its workspace; the result gives the new one. Refuses your own pane unless allow_self is set, and panes no bridge launched unless force is set.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn herdr_move(
+        &self,
+        Parameters(params): Parameters<tools::move_pane::MoveParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let note = Note::move_pane(&params);
+        let result = tools::move_pane::run(&self.inner, params).await;
+        self.finish("herdr_move", started, note, result)
     }
 
     #[tool(

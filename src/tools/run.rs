@@ -139,6 +139,7 @@ pub async fn run(
         "pane": placed.pane_id,
         "tab": placed.tab_id,
         "workspace": placed.workspace_id,
+        "cwd": placed.cwd,
         "created": placed.created_json(),
         "pgid": pgid,
         "timed_out": timed_out,
@@ -146,6 +147,9 @@ pub async fn run(
     });
     if let Some(matched) = ready_matched {
         out["ready_matched"] = json!(matched);
+    }
+    if let Some(warning) = &placed.warning {
+        out["warning"] = json!(warning);
     }
     if timed_out {
         out["rewait"] = json!({

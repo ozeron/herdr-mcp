@@ -178,14 +178,14 @@ async fn read_mode_rejects_control_tool_calls() {
 }
 
 #[tokio::test]
-async fn control_mode_lists_all_fourteen_with_annotations() {
+async fn control_mode_lists_all_fifteen_with_annotations() {
     let h = start(Opts {
         mode: ToolMode::Control,
         ..Opts::default()
     })
     .await;
     let tools = h.client.list_all_tools().await.unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
     let read_only = [
         "herdr_capabilities",
         "herdr_list",
@@ -205,7 +205,7 @@ async fn control_mode_lists_all_fourteen_with_annotations() {
     for tool in &tools {
         let name = tool.name.as_ref();
         let ann = tool.annotations.as_ref().expect(name);
-        if name == "herdr_mail_send" || name == "herdr_use_session" {
+        if ["herdr_mail_send", "herdr_use_session", "herdr_move"].contains(&name) {
             assert_eq!(ann.destructive_hint, Some(false), "{name}");
             assert_ne!(ann.read_only_hint, Some(true), "{name}");
         } else if read_only.contains(&name) {

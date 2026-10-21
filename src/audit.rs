@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::tools::{close, interrupt, launch, mail, read, run, send, sessions, wait};
+use crate::tools::{close, interrupt, launch, mail, move_pane, read, run, send, sessions, wait};
 
 pub const LOG_NAME: &str = "tunnel-audit.log";
 
@@ -77,6 +77,14 @@ impl Note {
 
     pub fn launch(params: &launch::LaunchParams) -> Self {
         Self::none()
+            .with(
+                "workspace_id",
+                params
+                    .placement
+                    .as_ref()
+                    .and_then(|w| w.workspace_id.as_ref())
+                    .map(|w| json!(w)),
+            )
             .with("kind", Some(json!(params.kind)))
             .with("name", Some(json!(params.name)))
             .with(
@@ -90,6 +98,13 @@ impl Note {
         Self::none()
             .target(Some(&params.target))
             .with("method", params.method.as_ref().map(value))
+    }
+
+    pub fn move_pane(params: &move_pane::MoveParams) -> Self {
+        Self::none()
+            .target(Some(&params.target))
+            .with("workspace_id", Some(json!(params.workspace_id)))
+            .with("force", params.force.map(Value::from))
     }
 
     pub fn close(params: &close::CloseParams) -> Self {

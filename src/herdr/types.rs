@@ -316,6 +316,20 @@ pub struct TabCreated {
     pub root_pane: PaneInfo,
 }
 
+/// What `pane.move` did. The pane keeps its process; its ID changes with its workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PaneMoveResult {
+    pub changed: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub previous_pane_id: String,
+    pub previous_workspace_id: String,
+    pub previous_tab_id: String,
+    pub pane: PaneInfo,
+    #[serde(default)]
+    pub closed_workspace_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WorkspaceCreated {
     pub workspace: WorkspaceInfo,
@@ -360,6 +374,9 @@ pub(crate) enum ResponseResult {
     WorktreeList(WorktreeList),
     WorktreeCreated(WorktreeCreated),
     TabCreated(TabCreated),
+    PaneMove {
+        move_result: PaneMoveResult,
+    },
     AgentInfo {
         agent: AgentInfo,
     },

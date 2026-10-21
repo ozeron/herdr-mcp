@@ -4,6 +4,7 @@ Herdr MCP: observe and drive Herdr panes, agents and shell processes on the user
 - Find an agent with `herdr_list` and `label_contains`, using a word from its name or title. Do not read panes to search.
 - Read one pane with `herdr_read` and leave `lines` unset; the default covers an agent's latest turn. Pass `source: screen` to see exactly what is on screen.
 - You have no caller pane. Give every target explicitly, and refer to an agent by name when it has one.
+- `herdr_launch` and `herdr_run` need `where.workspace_id` (an ID or label from `herdr_list`) for a new tab: focus is not yours and can change between calls. Check `workspace` and any `warning` in the result. If a pane landed in the wrong workspace, fix it with `herdr_move`; never relaunch.
 - To get an agent's answer, call `herdr_send` with `wait: turn`: it returns the excerpt when the turn ends. On `timed_out`, pass its `turn` to `herdr_wait`. Do not poll with `herdr_read`.
 - A working agent is not an error: `herdr_send` queues the prompt (`delivery: queued`) or waits for idle. `queued` has no turn yet; pass `send_now` only if the user wants it handled immediately.
 - Idle is not success. A quiet agent may have finished, stalled or be waiting on you; read its output before you report a result.

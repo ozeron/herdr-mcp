@@ -326,7 +326,7 @@ async fn without_tunnel_there_is_no_audit_file_and_no_stop_tool() {
 
 #[tokio::test]
 async fn tunnel_mode_registers_the_stop_tool_in_both_modes() {
-    for (mode, expected) in [(ToolMode::Read, 10), (ToolMode::Control, 15)] {
+    for (mode, expected) in [(ToolMode::Read, 10), (ToolMode::Control, 16)] {
         let r = serve(mode, true, None, None).await;
         let names = tool_names(&r).await;
         assert!(

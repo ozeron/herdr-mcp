@@ -17,6 +17,8 @@ fn placed(created: Option<Created>) -> Placed {
         tab_id: "w1:t9".into(),
         workspace_id: "w1".into(),
         created,
+        cwd: None,
+        warning: None,
     }
 }
 

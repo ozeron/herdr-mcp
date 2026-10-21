@@ -386,6 +386,28 @@ impl Client {
         .await
     }
 
+    /// Moves a pane, process and all, into a new tab of `workspace_id`, without focusing it.
+    pub async fn pane_move_to_new_tab(
+        &self,
+        pane_id: &str,
+        workspace_id: &str,
+        label: Option<&str>,
+    ) -> Result<PaneMoveResult, HerdrError> {
+        let mut destination = json!({"type": "new_tab", "workspace_id": workspace_id});
+        if let Some(label) = label {
+            destination["label"] = json!(label);
+        }
+        self.call(
+            "pane.move",
+            json!({"pane_id": pane_id, "destination": destination, "focus": false}),
+            |r| match r {
+                ResponseResult::PaneMove { move_result } => Some(move_result),
+                _ => None,
+            },
+        )
+        .await
+    }
+
     pub async fn tab_close(&self, tab_id: &str) -> Result<(), HerdrError> {
         self.call("tab.close", json!({"tab_id": tab_id}), pick_ok)
             .await

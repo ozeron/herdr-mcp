@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
@@ -35,8 +36,10 @@ pub struct Where {
     pub split: Option<SplitDirection>,
     /// Pane to split (pane ID or agent name). Defaults to the calling pane; external callers must give it.
     pub of: Option<String>,
-    /// A new tab in the calling pane's workspace (or the focused workspace). This is the default.
+    /// A new tab. This is the default. It goes into `workspace_id` when given, else the calling pane's workspace; a caller with no verified pane (a remote client) must give `workspace_id`.
     pub tab: Option<bool>,
+    /// Workspace ID or exact label for a new tab or worktree, from herdr_list. Wins over the calling pane's workspace. Required for callers with no verified pane. A cwd outside this workspace's worktree is allowed and returns a warning.
+    pub workspace_id: Option<String>,
     /// A new workspace.
     pub workspace: Option<bool>,
     /// A new Herdr worktree and workspace; its root pane is used.
@@ -65,6 +68,10 @@ pub struct Placed {
     pub tab_id: String,
     pub workspace_id: String,
     pub created: Option<Created>,
+    /// The new pane's working directory, as Herdr reports it, else the one asked for.
+    pub cwd: Option<String>,
+    /// Set when the cwd lies outside the destination workspace's worktree.
+    pub warning: Option<String>,
 }
 
 impl Placed {
@@ -128,6 +135,11 @@ fn plan<'a>(where_: Option<&'a Where>, options: &Options) -> Result<Plan<'a>, He
             ));
         }
     };
+    if where_.workspace_id.is_some() && !matches!(plan, Plan::Tab | Plan::Worktree(_)) {
+        return Err(HerdrError::invalid_params(
+            "workspace_id places a new tab or worktree; it does not apply to pane, split or a new workspace",
+        ));
+    }
     match plan {
         Plan::Existing(_) if options.cwd.is_some() || !options.env.is_empty() => Err(
             HerdrError::invalid_params("cwd and env cannot be applied to an existing pane"),
@@ -161,6 +173,7 @@ pub async fn place(
         .as_ref()
         .filter(|_| resolution.caller_verified);
     let caller_workspace = verified.and_then(|caller| caller.workspace_id.clone());
+    let requested = where_.and_then(|w| w.workspace_id.as_deref());
     let placed = match plan {
         Plan::Existing(target) => return existing(client, resolution, target).await,
         Plan::Split(direction) => {
@@ -184,14 +197,23 @@ pub async fn place(
             let pane = client.pane_split(&params).await?;
             Placed {
                 created: Some(Created::Pane(pane.pane_id.clone())),
+                cwd: pane.cwd.or_else(|| options.cwd.clone()),
                 pane_id: pane.pane_id,
                 tab_id: pane.tab_id,
                 workspace_id: pane.workspace_id,
+                warning: None,
             }
         }
         Plan::Tab => {
+            let dest = destination(
+                client,
+                requested,
+                caller_workspace.as_deref(),
+                options.cwd.as_deref(),
+            )
+            .await?;
             let params = TabCreateParams {
-                workspace_id: caller_workspace,
+                workspace_id: Some(dest.workspace_id.clone()),
                 cwd: options.cwd.clone(),
                 label: options.label.clone(),
                 env: options.env.clone(),
@@ -200,9 +222,11 @@ pub async fn place(
             let created = client.tab_create(&params).await?;
             Placed {
                 created: Some(Created::Tab(created.tab.tab_id.clone())),
+                cwd: created.root_pane.cwd.or_else(|| options.cwd.clone()),
                 pane_id: created.root_pane.pane_id,
                 tab_id: created.tab.tab_id,
                 workspace_id: created.tab.workspace_id,
+                warning: dest.cwd_warning(options.cwd.as_deref()),
             }
         }
         Plan::Workspace => {
@@ -215,14 +239,23 @@ pub async fn place(
             let created = client.workspace_create(&params).await?;
             Placed {
                 created: Some(Created::Workspace(created.workspace.workspace_id.clone())),
+                cwd: created.root_pane.cwd.or_else(|| options.cwd.clone()),
                 pane_id: created.root_pane.pane_id,
                 tab_id: created.tab.tab_id,
                 workspace_id: created.workspace.workspace_id,
+                warning: None,
             }
         }
         Plan::Worktree(worktree) => {
+            let dest = destination(
+                client,
+                requested,
+                caller_workspace.as_deref(),
+                options.cwd.as_deref(),
+            )
+            .await?;
             let params = WorktreeCreateParams {
-                workspace_id: caller_workspace,
+                workspace_id: Some(dest.workspace_id),
                 cwd: options.cwd.clone(),
                 branch: Some(worktree.branch.clone()),
                 base: worktree.base.clone(),
@@ -232,9 +265,11 @@ pub async fn place(
             let created = client.worktree_create(&params).await?;
             Placed {
                 created: Some(Created::Workspace(created.workspace.workspace_id.clone())),
+                cwd: created.root_pane.cwd.or_else(|| options.cwd.clone()),
                 pane_id: created.root_pane.pane_id,
                 tab_id: created.tab.tab_id,
                 workspace_id: created.workspace.workspace_id,
+                warning: None,
             }
         }
     };
@@ -310,5 +345,103 @@ async fn existing(
         tab_id: pane.tab_id.clone(),
         workspace_id: pane.workspace_id.clone(),
         created: None,
+        cwd: pane.cwd.clone(),
+        warning: None,
+    })
+}
+
+/// The workspace a new tab or worktree goes into, with its worktree path for the cwd check.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    pub workspace_id: String,
+    pub worktree_path: Option<String>,
+}
+
+impl Destination {
+    /// A warning when `cwd` lies outside this workspace's worktree. The tab still opens.
+    pub fn cwd_warning(&self, cwd: Option<&str>) -> Option<String> {
+        let (cwd, root) = (cwd?, self.worktree_path.as_deref()?);
+        (!Path::new(cwd).starts_with(root)).then(|| {
+            format!(
+                "cwd {cwd} is outside workspace {}'s worktree {root}; the tab opened there anyway",
+                self.workspace_id
+            )
+        })
+    }
+}
+
+/// Resolves where a new tab or worktree goes: `requested` (a workspace ID or exact label), else
+/// the verified caller's workspace. With neither, a remote caller is refused rather than sent to
+/// whatever workspace has focus, which can change between calls.
+pub async fn destination(
+    client: &Client,
+    requested: Option<&str>,
+    caller_workspace: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Destination, HerdrError> {
+    // The caller's own workspace needs no lookup unless a cwd is to be checked against it.
+    if let (None, Some(own), None) = (requested, caller_workspace, cwd) {
+        return Ok(Destination {
+            workspace_id: own.to_string(),
+            worktree_path: None,
+        });
+    }
+    let snapshot = client.session_snapshot().await?;
+    let workspaces = &snapshot.workspaces;
+    let listing = || {
+        json!(
+            workspaces
+                .iter()
+                .map(|w| json!({"id": w.workspace_id, "label": w.label, "focused": w.focused}))
+                .collect::<Vec<_>>()
+        )
+    };
+    let found = match (requested, caller_workspace) {
+        (Some(wanted), _) => {
+            let by_label: Vec<_> = workspaces
+                .iter()
+                .filter(|w| w.label.eq_ignore_ascii_case(wanted))
+                .collect();
+            match workspaces.iter().find(|w| w.workspace_id == wanted) {
+                Some(found) => Some(found),
+                None if by_label.len() == 1 => Some(by_label[0]),
+                None if by_label.len() > 1 => {
+                    return Err(HerdrError::detailed(
+                        "invalid_params",
+                        format!(
+                            "{wanted:?} matches {} workspace labels; give its ID",
+                            by_label.len()
+                        ),
+                        json!({"workspaces": listing()}),
+                    ));
+                }
+                None => {
+                    return Err(HerdrError::detailed(
+                        "target_not_found",
+                        format!("no workspace has the ID or label {wanted:?}; nothing was created"),
+                        json!({"workspaces": listing()}),
+                    ));
+                }
+            }
+        }
+        (None, Some(own)) => workspaces.iter().find(|w| w.workspace_id == own),
+        (None, None) => {
+            return Err(HerdrError::detailed(
+                "destination_required",
+                "you have no caller pane, so give where.workspace_id (an ID or label from herdr_list); nothing was created",
+                json!({"workspaces": listing()}),
+            ));
+        }
+    };
+    Ok(match found {
+        Some(workspace) => Destination {
+            workspace_id: workspace.workspace_id.clone(),
+            worktree_path: workspace.worktree.as_ref().map(|w| w.checkout_path.clone()),
+        },
+        // The caller's workspace is missing from the snapshot; let Herdr place it there anyway.
+        None => Destination {
+            workspace_id: caller_workspace.unwrap_or_default().to_string(),
+            worktree_path: None,
+        },
     })
 }

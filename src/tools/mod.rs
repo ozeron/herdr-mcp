@@ -5,6 +5,7 @@ pub mod launch;
 pub mod launch_session;
 pub mod list;
 pub mod mail;
+pub mod move_pane;
 pub mod read;
 pub mod run;
 pub mod send;

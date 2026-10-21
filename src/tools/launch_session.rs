@@ -93,11 +93,15 @@ impl<'a> LaunchSession<'a> {
     }
 
     fn details_at(&self, phase: Phase) -> Value {
-        json!({
+        let mut out = json!({
             "phase": phase.as_str(), "name": self.name, "pane": self.placed.pane_id,
             "tab": self.placed.tab_id, "workspace": self.placed.workspace_id,
-            "created": self.placed.created_json(),
-        })
+            "cwd": self.placed.cwd, "created": self.placed.created_json(),
+        });
+        if let Some(warning) = &self.placed.warning {
+            out["warning"] = json!(warning);
+        }
+        out
     }
 
     /// Closes what this call created and returns `err` as it is.
