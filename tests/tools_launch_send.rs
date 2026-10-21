@@ -1709,6 +1709,26 @@ async fn a_wait_that_fails_after_delivery_keeps_the_turn_and_says_not_to_resend(
 }
 
 #[tokio::test]
+async fn the_waits_own_note_survives_wait_turn() {
+    let h = start(Opts::default()).await;
+    script_send(
+        &h.fake,
+        Some("w1:p1"),
+        vec![rev("idle", 3), rev("unknown", 6)],
+    );
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "wait": "turn"}),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true, "{out}");
+    assert!(out["note"].as_str().unwrap().contains("unknown"), "{out}");
+}
+
+#[tokio::test]
 async fn wait_turn_on_a_queued_prompt_returns_at_once() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);

@@ -246,7 +246,13 @@ async fn send_prompt(
                 if out["delivery"] == "steered" {
                     // The kind queues, but its queue marker never showed: say so, never guess.
                     out["delivery"] = json!("unconfirmed");
-                    out["note"] = json!(UNCONFIRMED_NOTE);
+                    let mut note = UNCONFIRMED_NOTE.to_owned();
+                    if send_now {
+                        note.push_str(
+                            " send_now was not pressed, since no queued prompt was seen.",
+                        );
+                    }
+                    out["note"] = json!(note);
                 }
                 out["result"] = out["delivery"].clone();
                 return Ok(out);
@@ -330,7 +336,7 @@ async fn await_turn(
     let Some(turn) = serde_json::from_value::<Turn>(out["turn"].clone()).ok() else {
         add_note(
             out,
-            "no turn started, so there was nothing to wait on; read the pane",
+            "there is no turn to wait on (the prompt was queued, steered or unconfirmed); read the pane",
         );
         return;
     };
@@ -356,14 +362,16 @@ async fn await_turn(
     };
     match outcome {
         Ok(outcome) => {
-            if let (Some(fields), Some(target)) =
-                (outcome.to_json().as_object(), out.as_object_mut())
-            {
+            let fields = outcome.to_json();
+            if let (Some(fields), Some(target)) = (fields.as_object(), out.as_object_mut()) {
                 for (key, value) in fields {
                     if key != "pane" && key != "note" {
                         target.insert(key.clone(), value.clone());
                     }
                 }
+            }
+            if let Some(note) = fields["note"].as_str() {
+                add_note(out, note);
             }
         }
         Err(err) => {

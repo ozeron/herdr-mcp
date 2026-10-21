@@ -24,12 +24,14 @@ use tempfile::TempDir;
 
 const SECRET: &str = "PANE-OUTPUT-SECRET-42";
 
+/// Counts stops; when `.1` is set, the stop fails.
 #[derive(Default)]
-struct CountingStopper(AtomicUsize);
+struct CountingStopper(AtomicUsize, std::sync::atomic::AtomicBool);
 
 impl Stopper for CountingStopper {
-    fn stop(&self) {
+    fn stop(&self) -> bool {
         self.0.fetch_add(1, Ordering::SeqCst);
+        !self.1.load(Ordering::SeqCst)
     }
 }
 
@@ -538,13 +540,13 @@ async fn the_default_inbox_comes_from_the_client() {
     ok(
         &r.h,
         "herdr_mail_send",
-        json!({"to": "test-client", "body": "hi"}),
+        json!({"to": "remote-test-client", "body": "hi"}),
     )
     .await;
     let read = ok(&r.h, "herdr_mail_read", json!({})).await;
 
     assert_eq!(read["messages"][0]["body"], "hi", "{read}");
-    assert_eq!(read["messages"][0]["from"]["name"], "test-client");
+    assert_eq!(read["messages"][0]["from"]["name"], "remote-test-client");
 }
 
 #[tokio::test]
@@ -576,14 +578,17 @@ async fn a_bad_inbox_slug_is_invalid() {
 #[test]
 fn remote_inbox_names_come_from_the_client_product() {
     use herdr_mcp::tools::mail::remote_inbox;
-    assert_eq!(remote_inbox(Some("openai-mcp"), None).unwrap(), "chatgpt");
+    assert_eq!(
+        remote_inbox(Some("openai-mcp"), None).unwrap(),
+        "remote-chatgpt"
+    );
     assert_eq!(
         remote_inbox(Some("Anthropic/ClaudeAI"), None).unwrap(),
-        "claude"
+        "remote-claude"
     );
     assert_eq!(
         remote_inbox(Some("Cursor IDE 2.0"), None).unwrap(),
-        "cursor-ide-2-0"
+        "remote-cursor-ide-2-0"
     );
     assert_eq!(remote_inbox(None, None).unwrap(), "remote");
     assert_eq!(
@@ -627,4 +632,29 @@ async fn the_audit_keeps_every_argument_but_redacts_env_values_and_mail_bodies()
         !raw.contains("s3cret") && !raw.contains("private words"),
         "{raw}"
     );
+}
+
+#[tokio::test]
+async fn a_failed_stop_lets_the_bridge_take_calls_again() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    r.stopper.1.store(true, Ordering::SeqCst);
+    ok(&r.h, "herdr_tunnel_stop", json!({})).await;
+    eventually("the stop attempt", || {
+        r.stopper.0.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    eventually_ok(&r).await;
+}
+
+/// The stop runs on a short delay; calls work again once it has failed.
+async fn eventually_ok(r: &Rig) {
+    for _ in 0..50 {
+        let result = call(&r.h, "herdr_sessions", json!({})).await;
+        if result.is_error != Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the bridge still refuses calls after a failed stop");
 }

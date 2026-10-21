@@ -261,6 +261,8 @@ pub async fn place(
                 options.remote,
             )
             .await?;
+            let dest_note = dest.note.clone();
+            let worktree_warning = dest.cwd_warning(options.cwd.as_deref());
             let params = WorktreeCreateParams {
                 workspace_id: Some(dest.workspace_id),
                 cwd: options.cwd.clone(),
@@ -276,7 +278,7 @@ pub async fn place(
                 pane_id: created.root_pane.pane_id,
                 tab_id: created.tab.tab_id,
                 workspace_id: created.workspace.workspace_id,
-                warning: None,
+                warning: dest_note.or(worktree_warning),
             }
         }
     };
@@ -379,9 +381,8 @@ impl Destination {
     }
 }
 
-/// `path` as the file system sees it: `~` expanded, symlinks such as `/tmp` resolved, and `..`
-/// folded, so the cwd check compares real locations. A path that does not exist is only
-/// expanded and folded.
+/// `path` as the file system sees it: `~` expanded, `..` folded, and symlinks such as `/tmp`
+/// resolved in the longest part that exists, so the cwd check compares real locations.
 fn real_path(path: &str) -> PathBuf {
     let expanded = match (path.strip_prefix('~'), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
@@ -389,9 +390,6 @@ fn real_path(path: &str) -> PathBuf {
         }
         _ => PathBuf::from(path),
     };
-    if let Ok(real) = std::fs::canonicalize(&expanded) {
-        return real;
-    }
     let mut folded = PathBuf::new();
     for part in expanded.components() {
         match part {
@@ -402,7 +400,21 @@ fn real_path(path: &str) -> PathBuf {
             other => folded.push(other),
         }
     }
-    folded
+    // Resolve the longest part that exists, so /tmp/new matches /private/tmp/new.
+    let mut rest = Vec::new();
+    let mut base = folded.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            return rest.iter().rev().fold(real, |path, part| path.join(part));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                base = parent;
+            }
+            _ => return folded,
+        }
+    }
 }
 
 /// Resolves where a new tab or worktree goes: `requested` (a workspace ID or label, matched

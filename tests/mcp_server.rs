@@ -249,39 +249,25 @@ async fn instructions_are_short_and_lead_with_the_essentials() {
 }
 
 #[tokio::test]
-async fn a_bridge_without_a_caller_pane_serves_the_remote_instructions() {
-    let local = start(Opts::default()).await;
-    let local_text = local
-        .client
-        .peer_info()
-        .unwrap()
-        .instructions
-        .clone()
-        .expect("instructions");
-    let remote = start(Opts {
+async fn a_local_bridge_serves_the_local_instructions_with_or_without_a_pane() {
+    let text = |h: &Harness| {
+        h.client
+            .peer_info()
+            .unwrap()
+            .instructions
+            .clone()
+            .expect("instructions")
+    };
+    let with_pane = start(Opts::default()).await;
+    let without = start(Opts {
         env_pane: None,
         ..Opts::default()
     })
     .await;
-    let remote_text = remote
-        .client
-        .peer_info()
-        .unwrap()
-        .instructions
-        .clone()
-        .expect("instructions");
 
-    assert_ne!(local_text, remote_text);
-    assert!(!local_text.contains("label_contains"));
-    for needle in [
-        "herdr_capabilities",
-        "tail",
-        "label_contains",
-        "wait: turn",
-        "queued",
-    ] {
-        assert!(remote_text.contains(needle), "missing {needle}");
-    }
+    // Only a tunnel bridge is remote; tests/tunnel_bridge.rs covers its instructions.
+    assert_eq!(text(&with_pane), text(&without));
+    assert!(!text(&without).contains("You have no caller pane"));
 }
 
 #[tokio::test]

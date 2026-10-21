@@ -42,7 +42,9 @@ impl TokenCheck for FixedToken {
 struct NoStop;
 
 impl Stopper for NoStop {
-    fn stop(&self) {}
+    fn stop(&self) -> bool {
+        true
+    }
 }
 
 struct Rig {

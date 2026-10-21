@@ -33,7 +33,7 @@ pub struct SendParams {
     pub notify: Option<bool>,
     /// Allow mailing your own pane. Only when the user asked for it.
     pub allow_self: Option<bool>,
-    /// Remote callers only: the inbox replies should go to, a slug of lowercase letters, digits and dashes. Default: one per client (`chatgpt`, `claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
+    /// Remote callers only: the inbox replies should go to, a slug of lowercase letters, digits and dashes. Default: one per client (`remote-chatgpt`, `remote-claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
     pub inbox: Option<String>,
 }
 
@@ -46,7 +46,7 @@ pub struct ReadParams {
     pub mark_read: Option<bool>,
     /// At most this many messages, oldest first (default 50).
     pub limit: Option<u32>,
-    /// Remote callers only: the inbox to use, a slug of lowercase letters, digits and dashes. Default: one per client (`chatgpt`, `claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
+    /// Remote callers only: the inbox to use, a slug of lowercase letters, digits and dashes. Default: one per client (`remote-chatgpt`, `remote-claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
     pub inbox: Option<String>,
 }
 
@@ -57,7 +57,7 @@ pub struct WaitParams {
     pub from: Option<String>,
     /// How long to wait, in milliseconds. Default 30000, capped at the wait cap.
     pub timeout_ms: Option<u64>,
-    /// Remote callers only: the inbox to use, a slug of lowercase letters, digits and dashes. Default: one per client (`chatgpt`, `claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
+    /// Remote callers only: the inbox to use, a slug of lowercase letters, digits and dashes. Default: one per client (`remote-chatgpt`, `remote-claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
     pub inbox: Option<String>,
 }
 
@@ -90,23 +90,21 @@ pub fn remote_inbox(client: Option<&str>, requested: Option<&str>) -> Result<Str
         };
     }
     let client = client.unwrap_or_default().to_lowercase();
+    // `remote-` keeps a default inbox apart from a local agent's name inbox, such as an agent
+    // named claude.
     if client.contains("openai") || client.contains("chatgpt") {
-        return Ok("chatgpt".into());
+        return Ok("remote-chatgpt".into());
     }
     if client.contains("claude") || client.contains("anthropic") {
-        return Ok("claude".into());
+        return Ok("remote-claude".into());
     }
     let slug: String = client
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let slug: String = slug.chars().take(MAX_SLUG).collect();
-    Ok(if slug.is_empty() {
-        "remote".into()
-    } else {
-        slug
-    })
+    let slug: String = format!("remote-{slug}").chars().take(MAX_SLUG).collect();
+    Ok(slug.trim_end_matches('-').to_owned())
 }
 
 /// The remote inbox for this call, refused when a live local agent already has that name: its

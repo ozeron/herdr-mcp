@@ -93,7 +93,8 @@ def main(binary):
             try:
                 caps, _ = bridge.tool("herdr_capabilities", {})
                 check("remote caller has no pane", caps.get("caller") is None, str(caps.get("caller")))
-                check("remote inbox is chatgpt", caps.get("inbox") == "chatgpt", str(caps.get("inbox")))
+                check("remote inbox is remote-chatgpt", caps.get("inbox") == "remote-chatgpt",
+                      str(caps.get("inbox")))
 
                 out, err = bridge.tool("herdr_run", {"command": "sleep 120"})
                 check("no workspace is refused", err and out.get("code") == "destination_required",

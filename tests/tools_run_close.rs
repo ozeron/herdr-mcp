@@ -39,7 +39,9 @@ impl Default for Opts {
 struct NoStop;
 
 impl herdr_mcp::tunnel::Stopper for NoStop {
-    fn stop(&self) {}
+    fn stop(&self) -> bool {
+        true
+    }
 }
 
 async fn start(opts: Opts) -> Harness {
@@ -1441,4 +1443,44 @@ async fn a_failed_lookup_only_skips_the_cwd_warning_for_the_callers_own_workspac
         "w1"
     );
     assert!(out.get("warning").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn a_local_worktree_with_no_verified_pane_says_it_used_the_focused_workspace() {
+    let h = start(external()).await;
+    script_workspaces(&h.fake);
+    h.fake.reply(
+        "worktree.create",
+        json!({"type": "worktree_created",
+               "workspace": workspace("w3", 3, "w3:t1"),
+               "tab": tab("w3:t1", "w3", 1),
+               "root_pane": pane("w3:p1", "w3:t1", "w3", None),
+               "worktree": {"path": "/wt/feat", "branch": "feat", "is_bare": false,
+                            "is_detached": false, "is_prunable": false,
+                            "is_linked_worktree": true, "label": "feat"}}),
+    );
+    h.fake.reply("pane.report_metadata", ok_reply());
+    h.fake.reply("pane.send_input", ok_reply());
+    reads(&h.fake, &["$ "]);
+    h.fake
+        .reply_seq("pane.process_info", vec![process_info("w3:p1", 200, 200)]);
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "make", "where": {"worktree": {"branch": "feat"}}}),
+    )
+    .await;
+
+    assert_eq!(
+        requests(&h.fake, "worktree.create")[0]["params"]["workspace_id"],
+        "w1"
+    );
+    assert!(
+        out["warning"]
+            .as_str()
+            .unwrap()
+            .contains("focused workspace w1"),
+        "{out}"
+    );
 }

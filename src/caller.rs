@@ -123,7 +123,7 @@ pub async fn resolve_caller(
                     tab_id: env.tab_id.clone(),
                     workspace_id: env.workspace_id.clone(),
                 };
-                // A shell started outside Herdr's env, or a moved pane, may lack these; Herdr knows.
+                // A shell started outside Herdr's env may lack these; Herdr knows.
                 if (caller.workspace_id.is_none() || caller.tab_id.is_none())
                     && let Ok(snapshot) = client.session_snapshot().await
                     && let Some(pane) = snapshot.panes.iter().find(|p| p.pane_id == *pane_id)

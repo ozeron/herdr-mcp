@@ -175,7 +175,8 @@ pub fn parse_job_state(print: &str) -> JobState {
 
 /// Stops the tunnel service from inside the bridge.
 pub trait Stopper: Send + Sync {
-    fn stop(&self);
+    /// Stops the bridge; false when it could not, so it keeps serving.
+    fn stop(&self) -> bool;
 }
 
 /// Boots the LaunchAgent out when it is loaded, and cancels `cancel` so a foreground `run`
@@ -204,13 +205,19 @@ impl ServiceStopper {
 }
 
 impl Stopper for ServiceStopper {
-    fn stop(&self) {
-        if let Err(err) = stop_service_for(&self.env, &self.service, self.runner.as_ref()) {
-            eprintln!("herdr-mcp: cannot stop the tunnel: {err}");
-        }
+    fn stop(&self) -> bool {
+        let stopped = match stop_service_for(&self.env, &self.service, self.runner.as_ref()) {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!("herdr-mcp: cannot stop the tunnel: {err}");
+                false
+            }
+        };
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
+            return true;
         }
+        stopped
     }
 }
 

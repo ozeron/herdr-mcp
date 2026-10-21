@@ -284,7 +284,7 @@ impl HerdrMcp {
     /// Whether the bridge has no caller pane in its environment: an external client, such as
     /// ChatGPT through a tunnel.
     pub fn is_remote(&self) -> bool {
-        self.inner.is_remote() || self.inner.caller_env.pane_id.is_none()
+        self.inner.is_remote()
     }
 
     /// The text served at init: the remote variant when there is no caller pane.
@@ -411,9 +411,14 @@ impl HerdrMcp {
         self.draining.store(true, Ordering::SeqCst);
         if let Some(tunnel) = &self.inner.tunnel {
             let stopper = tunnel.stopper.clone();
+            let draining = Arc::clone(&self.draining);
             tokio::spawn(async move {
                 tokio::time::sleep(STOP_DELAY).await;
-                let _ = tokio::task::spawn_blocking(move || stopper.stop()).await;
+                let stopped = tokio::task::spawn_blocking(move || stopper.stop()).await;
+                // A failed stop leaves the bridge up, so it must take calls again.
+                if !matches!(stopped, Ok(true)) {
+                    draining.store(false, Ordering::SeqCst);
+                }
             });
         }
         self.finish(
