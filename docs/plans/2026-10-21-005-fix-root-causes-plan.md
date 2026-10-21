@@ -103,8 +103,8 @@ execution: code
 ### U8. Live check before release (process)
 
 - **Goal:** what fakes cannot show is checked against real Herdr before a push.
-- **Design:** `probes/live_check.sh` makes two throwaway workspaces, runs the bridge as an external caller with an empty ancestry, and checks placement, `destination_required`, list `tail`, read `screen` and `herdr_move`; it closes what it made.
-- **Files:** `probes/live_check.sh`.
+- **Design:** `probes/live_check.py` makes two throwaway workspaces, runs the bridge as an external caller with an empty ancestry, and checks placement, `destination_required`, list `tail`, read `screen` and `herdr_move`; it closes what it made.
+- **Files:** `probes/live_check.py`.
 
 ## Verification Contract
 
@@ -113,7 +113,7 @@ execution: code
 | Format | `cargo fmt --check` |
 | Lint | `cargo clippy -j 4 --all-targets -- -D warnings` |
 | Tests | targeted per unit with `-j 4 -- --test-threads 4`; the full suite once at the end, if `memory_pressure` shows at least 25% free |
-| Live | `probes/live_check.sh` |
+| Live | `probes/live_check.py` |
 | Review | an independent review of the whole diff before the push |
 
 ## Deferred
