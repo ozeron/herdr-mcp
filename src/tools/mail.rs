@@ -62,6 +62,10 @@ pub enum WaitEnd {
     Cancelled,
 }
 
+/// The name inbox a remote client reads, and the sender name its mail carries. Workers reply
+/// with `herdr_mail_send {to: "remote"}`.
+pub const REMOTE_INBOX: &str = "remote";
+
 fn no_caller(tool: &str) -> HerdrError {
     HerdrError::tool(
         "no_caller",
@@ -122,7 +126,14 @@ pub async fn send(
         },
         None => Party {
             pane: None,
-            name: Some("external".into()),
+            name: Some(
+                if inner.is_remote() {
+                    REMOTE_INBOX
+                } else {
+                    "external"
+                }
+                .into(),
+            ),
         },
     };
     let sender_label = label(
@@ -218,6 +229,9 @@ async fn nudge(
 /// The verified caller's pane, with the inbox it reads: its pane inbox plus its name inbox when
 /// `agent.get` says the pane holds a named agent.
 async fn caller_inbox(inner: &Inner, tool: &str) -> Result<Inbox, HerdrError> {
+    if inner.is_remote() {
+        return Ok(Inbox::named(REMOTE_INBOX));
+    }
     let mut scope = Scope::open(inner)?;
     let resolution = scope.caller().await?;
     let pane = match &resolution.caller {

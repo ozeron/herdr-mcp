@@ -68,6 +68,9 @@ Labels:
 11. **Codex MCP servers run outside its sandbox.** [probed] A Codex started with `-s read-only` launched an MCP server that wrote a file outside the workspace. KTD17's read-only default is justified.
 
 12. **Fresh panes report busy.** [probed] `agent.start` on a just-created pane returned `agent_pane_busy` 1–3 times before succeeding about 100–300 ms later. KTD7's pre-start retry is needed.
+13. **Codex 0.163 queue key is unconfirmed.** [probed, 2026-10-21] The `?` shortcut overlay lists compose keys but no queue key in a default-size pane, and the binary carries a "Queued message" label without a visible key hint. Codex's own prompt treats a message sent mid-turn as steering. A live mid-turn test was skipped to save the user's weekly Codex quota. Until it is probed, herdr-mcp treats Codex as having no queue: auto on a working Codex returns `busy` at once.
+14. **`launchctl kickstart -k` sends SIGTERM.** [probed, 2026-10-21] A throwaway job that traps TERM logged it, and launchd started the job again even after it exited 0. A restart therefore runs the drain.
+15. **Process ancestry finds a pane even without env.** [probed, 2026-10-21] A bridge started with the `HERDR_*` pane variables removed, from a shell inside a pane, still resolved that pane as a verified caller.
 
 ## Plan impact
 

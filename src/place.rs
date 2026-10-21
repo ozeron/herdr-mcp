@@ -48,6 +48,8 @@ pub struct Where {
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
+    /// The caller is a remote client: a new tab needs an explicit or caller workspace.
+    pub remote: bool,
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
     /// Names a new tab, workspace or worktree.
@@ -210,6 +212,7 @@ pub async fn place(
                 requested,
                 caller_workspace.as_deref(),
                 options.cwd.as_deref(),
+                options.remote,
             )
             .await?;
             let params = TabCreateParams {
@@ -226,7 +229,10 @@ pub async fn place(
                 pane_id: created.root_pane.pane_id,
                 tab_id: created.tab.tab_id,
                 workspace_id: created.tab.workspace_id,
-                warning: dest.cwd_warning(options.cwd.as_deref()),
+                warning: dest
+                    .note
+                    .clone()
+                    .or_else(|| dest.cwd_warning(options.cwd.as_deref())),
             }
         }
         Plan::Workspace => {
@@ -252,6 +258,7 @@ pub async fn place(
                 requested,
                 caller_workspace.as_deref(),
                 options.cwd.as_deref(),
+                options.remote,
             )
             .await?;
             let params = WorktreeCreateParams {
@@ -355,6 +362,8 @@ async fn existing(
 pub struct Destination {
     pub workspace_id: String,
     pub worktree_path: Option<String>,
+    /// Set when a local caller with no verified pane fell back to the focused workspace.
+    pub note: Option<String>,
 }
 
 impl Destination {
@@ -370,20 +379,23 @@ impl Destination {
     }
 }
 
-/// Resolves where a new tab or worktree goes: `requested` (a workspace ID or exact label), else
-/// the verified caller's workspace. With neither, a remote caller is refused rather than sent to
-/// whatever workspace has focus, which can change between calls.
+/// Resolves where a new tab or worktree goes: `requested` (a workspace ID or label, matched
+/// case-insensitively), else the verified caller's workspace. With neither, a remote caller is
+/// refused rather than sent to whatever workspace has focus, which can change between calls; a
+/// local caller with no verified pane keeps the focused workspace, with a note.
 pub async fn destination(
     client: &Client,
     requested: Option<&str>,
     caller_workspace: Option<&str>,
     cwd: Option<&str>,
+    remote: bool,
 ) -> Result<Destination, HerdrError> {
     // The caller's own workspace needs no lookup unless a cwd is to be checked against it.
     if let (None, Some(own), None) = (requested, caller_workspace, cwd) {
         return Ok(Destination {
             workspace_id: own.to_string(),
             worktree_path: None,
+            note: None,
         });
     }
     let snapshot = client.session_snapshot().await?;
@@ -425,23 +437,42 @@ pub async fn destination(
             }
         }
         (None, Some(own)) => workspaces.iter().find(|w| w.workspace_id == own),
-        (None, None) => {
+        (None, None) if remote => {
             return Err(HerdrError::detailed(
                 "destination_required",
-                "you have no caller pane, so give where.workspace_id (an ID or label from herdr_list); nothing was created",
+                "a remote caller must give where.workspace_id (an ID or label from herdr_list); nothing was created",
                 json!({"workspaces": listing()}),
             ));
+        }
+        (None, None) => {
+            let focused = workspaces.iter().find(|w| w.focused).ok_or_else(|| {
+                HerdrError::detailed(
+                    "destination_required",
+                    "no caller pane and no focused workspace; give where.workspace_id",
+                    json!({"workspaces": listing()}),
+                )
+            })?;
+            return Ok(Destination {
+                workspace_id: focused.workspace_id.clone(),
+                worktree_path: focused.worktree.as_ref().map(|w| w.checkout_path.clone()),
+                note: Some(format!(
+                    "no verified caller pane, so this went to the focused workspace {}; pass where.workspace_id to choose",
+                    focused.workspace_id
+                )),
+            });
         }
     };
     Ok(match found {
         Some(workspace) => Destination {
             workspace_id: workspace.workspace_id.clone(),
             worktree_path: workspace.worktree.as_ref().map(|w| w.checkout_path.clone()),
+            note: None,
         },
         // The caller's workspace is missing from the snapshot; let Herdr place it there anyway.
         None => Destination {
             workspace_id: caller_workspace.unwrap_or_default().to_string(),
             worktree_path: None,
+            note: None,
         },
     })
 }

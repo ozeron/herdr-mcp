@@ -109,6 +109,13 @@ pub struct Inbox {
 }
 
 impl Inbox {
+    /// The inbox of a name alone, for a caller with no pane.
+    pub fn named(name: &str) -> Self {
+        Self {
+            keys: vec![name_key(name)],
+        }
+    }
+
     pub fn new(pane: &str, name: Option<&str>) -> Self {
         let mut keys = vec![recipient_key(pane)];
         if let Some(name) = name.filter(|n| !n.is_empty()) {

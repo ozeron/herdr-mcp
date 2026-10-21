@@ -125,10 +125,17 @@ impl Inner {
         client: &Client,
         active: &ActiveSession,
     ) -> Result<Resolution, HerdrError> {
-        if !active.home {
+        // A remote caller never has a pane, wherever the bridge process happens to run.
+        if !active.home || self.is_remote() {
             return Ok(Resolution::external());
         }
         resolve_caller(client, &self.caller_env, self.ancestry.as_ref()).await
+    }
+
+    /// Whether calls come from a remote client (a tunnel or HTTP bridge). Decided once, when
+    /// the bridge starts; it drives caller resolution, placement, mail and the instructions.
+    pub fn is_remote(&self) -> bool {
+        self.tunnel.is_some()
     }
 }
 
@@ -267,7 +274,7 @@ impl HerdrMcp {
     /// Whether the bridge has no caller pane in its environment: an external client, such as
     /// ChatGPT through a tunnel.
     pub fn is_remote(&self) -> bool {
-        self.inner.caller_env.pane_id.is_none()
+        self.inner.is_remote() || self.inner.caller_env.pane_id.is_none()
     }
 
     /// The text served at init: the remote variant when there is no caller pane.

@@ -22,6 +22,8 @@ use serde_json::{Value, json};
 struct Opts {
     env_pane: Option<&'static str>,
     max_wait: Option<Duration>,
+    /// Serve as a tunnel bridge: a remote caller with no pane.
+    remote: bool,
 }
 
 impl Default for Opts {
@@ -29,8 +31,15 @@ impl Default for Opts {
         Self {
             env_pane: Some("w1:p1"),
             max_wait: None,
+            remote: false,
         }
     }
+}
+
+struct NoStop;
+
+impl herdr_mcp::tunnel::Stopper for NoStop {
+    fn stop(&self) {}
 }
 
 async fn start(opts: Opts) -> Harness {
@@ -49,9 +58,19 @@ async fn start(opts: Opts) -> Harness {
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
         install_env: None,
     };
+    let tunnel = opts.remote.then(|| herdr_mcp::tunnel::TunnelConfig {
+        state_home: log_dir.path().join("state"),
+        expires_at: None,
+        stopper: Arc::new(NoStop),
+        start_command: "herdr-mcp tunnel start",
+    });
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
     tokio::spawn(async move {
-        let running = HerdrMcp::new(config).serve(server_io).await.unwrap();
+        let mut server = HerdrMcp::new(config);
+        if let Some(tunnel) = tunnel {
+            server = server.with_tunnel(tunnel);
+        }
+        let running = server.serve(server_io).await.unwrap();
         let _ = running.waiting().await;
     });
     let client = ClientConfig::new(
@@ -476,21 +495,63 @@ fn external() -> Opts {
     }
 }
 
+fn remote() -> Opts {
+    Opts {
+        env_pane: None,
+        remote: true,
+        ..Opts::default()
+    }
+}
+
 #[tokio::test]
-async fn an_external_caller_without_a_workspace_is_refused_and_nothing_is_created() {
-    let h = start(external()).await;
+async fn a_remote_caller_without_a_workspace_is_refused_and_nothing_is_created() {
+    let h = start(remote()).await;
     script_external_tab(&h.fake, "w2");
 
     let out = err(&h, "herdr_run", json!({"command": "ls"})).await;
 
     assert_eq!(out["code"], "destination_required");
+    assert!(out["message"].as_str().unwrap().contains("remote"), "{out}");
     assert_eq!(out["workspaces"][1]["label"], "kenwoo");
     assert_eq!(count(&h.fake, "tab.create"), 0);
 }
 
 #[tokio::test]
-async fn an_explicit_workspace_wins_over_focus_and_keeps_external_provenance() {
+async fn a_remote_caller_is_never_a_pane_even_with_a_pane_in_its_ancestry() {
+    // The ancestry (4242) matches w1:p1's shell, and the env names it: a local bridge would
+    // verify it. A tunnel bridge must not.
+    let h = start(Opts {
+        remote: true,
+        ..Opts::default()
+    })
+    .await;
+    script_caller(&h.fake);
+    script_external_tab(&h.fake, "w2");
+
+    let out = err(&h, "herdr_run", json!({"command": "ls"})).await;
+
+    assert_eq!(out["code"], "destination_required");
+    assert_eq!(count(&h.fake, "tab.create"), 0);
+}
+
+#[tokio::test]
+async fn a_local_caller_with_no_verified_pane_keeps_the_focused_workspace_with_a_note() {
     let h = start(external()).await;
+    script_external_tab(&h.fake, "w1");
+
+    let out = ok(&h, "herdr_run", json!({"command": "ls"})).await;
+
+    assert_eq!(
+        requests(&h.fake, "tab.create")[0]["params"]["workspace_id"],
+        "w1"
+    );
+    let note = out["warning"].as_str().unwrap();
+    assert!(note.contains("focused workspace w1"), "{note}");
+}
+
+#[tokio::test]
+async fn an_explicit_workspace_wins_over_focus_and_keeps_external_provenance() {
+    let h = start(remote()).await;
     script_external_tab(&h.fake, "w2");
 
     let out = ok(

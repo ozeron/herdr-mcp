@@ -35,7 +35,7 @@ pub async fn run(inner: &Inner, params: MoveParams) -> Result<Value, HerdrError>
     let scoped = scope.target(request).await?;
     let client = scope.client();
     let pane = scoped.target.id.clone();
-    let dest = place::destination(client, Some(&params.workspace_id), None, None).await?;
+    let dest = place::destination(client, Some(&params.workspace_id), None, None, true).await?;
 
     let moved = client
         .pane_move_to_new_tab(&pane, &dest.workspace_id, params.label.as_deref())

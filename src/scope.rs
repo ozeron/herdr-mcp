@@ -153,7 +153,8 @@ impl<'a> Scope<'a> {
             client: client.into(),
             env: inner.caller_env.clone(),
             ancestry: Arc::clone(&inner.ancestry),
-            home: active.home,
+            // A remote bridge's caller is never a pane, so it resolves as external.
+            home: active.home && !inner.is_remote(),
             resolution: None,
         })
     }

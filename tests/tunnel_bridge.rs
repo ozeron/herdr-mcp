@@ -469,3 +469,32 @@ fn a_tunnel_bridge_ignores_an_inherited_caller_pane() {
     );
     assert!(!text(&local).contains("You have no caller pane"), "{local}");
 }
+
+#[tokio::test]
+async fn a_remote_caller_reads_mail_sent_to_the_remote_inbox() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    r.h.fake.on_params(
+        "session.snapshot",
+        json!({}),
+        Script::Reply(harness::snapshot(None)),
+    );
+    r.h.fake.on_params(
+        "agent.get",
+        json!({}),
+        Script::error("agent_not_found", "no agent named remote"),
+    );
+
+    let sent = ok(
+        &r.h,
+        "herdr_mail_send",
+        json!({"to": "remote", "body": "result: 42"}),
+    )
+    .await;
+    assert_eq!(sent["to"]["name"], "remote", "{sent}");
+
+    let read = ok(&r.h, "herdr_mail_read", json!({})).await;
+    let messages = read["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "{read}");
+    assert_eq!(messages[0]["body"], "result: 42");
+    assert_eq!(messages[0]["from"]["name"], "remote");
+}

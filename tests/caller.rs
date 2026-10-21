@@ -157,3 +157,25 @@ fn real_ancestry_contains_the_parent_process() {
     assert!(ancestors.contains(&std::os::unix::process::parent_id()));
     assert!(!ancestors.contains(&0));
 }
+
+#[tokio::test]
+async fn a_verified_pane_without_workspace_env_gets_it_from_herdr() {
+    let fake = FakeHerdr::start().await;
+    fake.reply("pane.process_info", process_info("w1:p1", 4242));
+    fake.reply("session.snapshot", snapshot(&["w1:p1"]));
+    let ancestry = StaticAncestry(vec![9000, 4242, 1]);
+    let bare = CallerEnv {
+        pane_id: Some("w1:p1".into()),
+        tab_id: None,
+        workspace_id: None,
+    };
+
+    let resolution = resolve_caller(&client(&fake), &bare, &ancestry)
+        .await
+        .unwrap();
+
+    let caller = resolution.caller.unwrap();
+    assert!(resolution.caller_verified);
+    assert_eq!(caller.workspace_id.as_deref(), Some("w1"));
+    assert_eq!(caller.tab_id.as_deref(), Some("w1:t1"));
+}

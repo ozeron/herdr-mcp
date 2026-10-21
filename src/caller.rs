@@ -118,11 +118,22 @@ pub async fn resolve_caller(
     if let Some(pane_id) = &env.pane_id {
         match client.pane_process_info(pane_id).await {
             Ok(info) if is_ancestor(info.shell_pid) => {
-                return Ok(verified(Caller {
+                let mut caller = Caller {
                     pane_id: pane_id.clone(),
                     tab_id: env.tab_id.clone(),
                     workspace_id: env.workspace_id.clone(),
-                }));
+                };
+                // A shell started outside Herdr's env, or a moved pane, may lack these; Herdr knows.
+                if (caller.workspace_id.is_none() || caller.tab_id.is_none())
+                    && let Ok(snapshot) = client.session_snapshot().await
+                    && let Some(pane) = snapshot.panes.iter().find(|p| p.pane_id == *pane_id)
+                {
+                    caller
+                        .workspace_id
+                        .get_or_insert_with(|| pane.workspace_id.clone());
+                    caller.tab_id.get_or_insert_with(|| pane.tab_id.clone());
+                }
+                return Ok(verified(caller));
             }
             Ok(_) => {}
             Err(err @ HerdrError::NotRunning { .. }) => return Err(err),

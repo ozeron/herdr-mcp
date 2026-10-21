@@ -207,6 +207,7 @@ pub async fn run(
         })?,
     };
     let options = Options {
+        remote: inner.is_remote(),
         cwd: params.cwd,
         env: params.env.unwrap_or_default(),
         label: params.label,

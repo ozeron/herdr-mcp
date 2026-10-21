@@ -64,6 +64,7 @@ pub async fn run(
         return Err(HerdrError::invalid_params("ready.match must not be empty"));
     }
     let options = Options {
+        remote: inner.is_remote(),
         cwd: params.cwd,
         env: params.env.unwrap_or_default(),
         label: params.label,
