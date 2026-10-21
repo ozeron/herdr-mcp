@@ -33,9 +33,14 @@ async fn start(env_pane: Option<&'static str>) -> Harness {
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
         install_env: None,
     };
+    let state = log_dir.path().join("state");
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
     tokio::spawn(async move {
-        let running = HerdrMcp::new(config).serve(server_io).await.unwrap();
+        let running = HerdrMcp::new(config)
+            .with_mailbox_state_dir(state)
+            .serve(server_io)
+            .await
+            .unwrap();
         let _ = running.waiting().await;
     });
     let client = ClientConfig::new(
@@ -276,6 +281,64 @@ async fn list_filters_by_label() {
     let h = start(Some("w1:p1")).await;
     script_tree(&h.fake);
     let list = ok(&h, "herdr_list", json!({"label_contains": "REV"})).await;
+    assert_eq!(pane_ids(&list), ["w1:p4"]);
+}
+
+/// w1:p1 has a title, w1:p4 only a terminal title (padded), w2:p1 a very long title.
+fn script_titles(fake: &FakeHerdr) {
+    let (mut snapshot, _) = fixture();
+    let agents = snapshot["agents"].as_array_mut().unwrap();
+    agents[0]["title"] = json!("Fix the flaky login test");
+    agents[1]["title"] = json!("  ");
+    agents[1]["terminal_title_stripped"] = json!("  Review billing migration  ");
+    agents[2]["title"] = json!("x".repeat(500));
+    script_tree_with(fake, snapshot);
+}
+
+#[tokio::test]
+async fn an_agent_shows_its_title() {
+    let h = start(Some("w1:p1")).await;
+    script_titles(&h.fake);
+    let list = ok(&h, "herdr_list", json!({})).await;
+    assert_eq!(find(&list, "w1:p1")["title"], "Fix the flaky login test");
+}
+
+#[tokio::test]
+async fn the_title_falls_back_to_the_stripped_terminal_title() {
+    let h = start(Some("w1:p1")).await;
+    script_titles(&h.fake);
+    let list = ok(&h, "herdr_list", json!({})).await;
+    assert_eq!(find(&list, "w1:p4")["title"], "Review billing migration");
+}
+
+#[tokio::test]
+async fn a_long_title_is_capped() {
+    let h = start(Some("w1:p1")).await;
+    script_titles(&h.fake);
+    let list = ok(&h, "herdr_list", json!({})).await;
+    assert_eq!(find(&list, "w2:p1")["title"], "x".repeat(120));
+}
+
+#[tokio::test]
+async fn an_agent_without_a_title_and_plain_panes_have_no_title_key() {
+    let h = start(Some("w1:p1")).await;
+    script_tree(&h.fake);
+    let list = ok(&h, "herdr_list", json!({})).await;
+    for id in ["w1:p1", "w1:p2", "w1:p3", "w1:p4", "w2:p1"] {
+        assert!(find(&list, id).get("title").is_none(), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn label_contains_finds_an_agent_by_a_word_in_its_title() {
+    let h = start(Some("w1:p1")).await;
+    script_titles(&h.fake);
+    let list = ok(&h, "herdr_list", json!({"label_contains": "FLAKY"})).await;
+    assert_eq!(pane_ids(&list), ["w1:p1"]);
+
+    let h = start(Some("w1:p1")).await;
+    script_titles(&h.fake);
+    let list = ok(&h, "herdr_list", json!({"label_contains": "billing"})).await;
     assert_eq!(pane_ids(&list), ["w1:p4"]);
 }
 

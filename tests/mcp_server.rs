@@ -70,9 +70,14 @@ async fn start(opts: Opts) -> Harness {
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
         install_env: None,
     };
+    let state = log_dir.path().join("state");
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move {
-        let running = HerdrMcp::new(config).serve(server_io).await.unwrap();
+        let running = HerdrMcp::new(config)
+            .with_mailbox_state_dir(state)
+            .serve(server_io)
+            .await
+            .unwrap();
         let _ = running.waiting().await;
     });
     let client = ClientConfig::new(
@@ -239,6 +244,36 @@ async fn instructions_are_short_and_lead_with_the_essentials() {
         "peer",
     ] {
         assert!(all.contains(needle), "missing {needle}");
+    }
+}
+
+#[tokio::test]
+async fn a_bridge_without_a_caller_pane_serves_the_remote_instructions() {
+    let local = start(Opts::default()).await;
+    let local_text = local
+        .client
+        .peer_info()
+        .unwrap()
+        .instructions
+        .clone()
+        .expect("instructions");
+    let remote = start(Opts {
+        env_pane: None,
+        ..Opts::default()
+    })
+    .await;
+    let remote_text = remote
+        .client
+        .peer_info()
+        .unwrap()
+        .instructions
+        .clone()
+        .expect("instructions");
+
+    assert_ne!(local_text, remote_text);
+    assert!(!local_text.contains("label_contains"));
+    for needle in ["herdr_sessions", "label_contains", "delivery", "queued"] {
+        assert!(remote_text.contains(needle), "missing {needle}");
     }
 }
 

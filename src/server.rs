@@ -27,6 +27,7 @@ use crate::tunnel::{Stopper, TunnelConfig};
 use crate::wait::Tuning;
 
 const INSTRUCTIONS: &str = include_str!("instructions.md");
+const INSTRUCTIONS_REMOTE: &str = include_str!("instructions_remote.md");
 
 const TUNNEL_TOOL: &str = "herdr_tunnel_stop";
 
@@ -217,6 +218,21 @@ impl HerdrMcp {
         self.inner.mailbox()
     }
 
+    /// Whether the bridge has no caller pane in its environment: an external client, such as
+    /// ChatGPT through a tunnel.
+    pub fn is_remote(&self) -> bool {
+        self.inner.caller_env.pane_id.is_none()
+    }
+
+    /// The text served at init: the remote variant when there is no caller pane.
+    pub fn instructions(&self) -> &'static str {
+        if self.is_remote() {
+            INSTRUCTIONS_REMOTE
+        } else {
+            INSTRUCTIONS
+        }
+    }
+
     fn finish(
         &self,
         tool: &str,
@@ -329,7 +345,7 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "List workspaces, tabs, panes, agents and shell processes with their status. Idle is not success.",
+        description = "List workspaces, tabs, panes, agents and shell processes with their status; agents carry their name and title (what they are working on). label_contains matches workspace, tab and pane labels and agent names and titles: use it to find an agent before reading any pane. Idle is not success.",
         annotations(read_only_hint = true)
     )]
     async fn herdr_list(
@@ -533,6 +549,6 @@ impl ServerHandler for HerdrMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("herdr-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(self.instructions())
     }
 }

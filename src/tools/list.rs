@@ -17,6 +17,7 @@ use crate::provenance;
 use crate::server::Inner;
 
 const MAX_CMDLINE_CHARS: usize = 200;
+const MAX_TITLE_CHARS: usize = 120;
 /// Most Herdr calls one listing keeps in flight at a time.
 const FAN_OUT_LIMIT: usize = 16;
 
@@ -50,7 +51,7 @@ pub struct ListParams {
     pub kind: Option<Kind>,
     /// Only panes whose status is one of these.
     pub status: Option<Vec<AgentStatus>>,
-    /// Case-insensitive match on workspace, tab or pane label, or agent name.
+    /// Case-insensitive match on workspace, tab or pane label, or an agent's name or title. The way to find an agent (for example by a word in its title) before reading any pane.
     pub label_contains: Option<String>,
 }
 
@@ -261,6 +262,7 @@ impl<'a> Filter<'a> {
                 Some(tab.label.as_str()),
                 pane.label.as_deref(),
                 agent.and_then(|a| a.name.as_deref()),
+                agent_title(agent).as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -386,6 +388,9 @@ fn pane_json(
         if let Some(name) = &agent.name {
             out.insert("name".into(), json!(name));
         }
+        if let Some(title) = agent_title(Some(agent)) {
+            out.insert("title".into(), json!(title));
+        }
     }
     let tokens = agent.map_or(&pane.tokens, |agent| &agent.tokens);
     if let Some(parent) = provenance::parent_of(tokens) {
@@ -401,6 +406,21 @@ fn pane_json(
         out.insert("foreground".into(), front);
     }
     Value::Object(out)
+}
+
+/// What the agent says it is doing: its title, else its terminal title (Claude Code sets that
+/// to the current task), trimmed and capped.
+fn agent_title(agent: Option<&AgentInfo>) -> Option<String> {
+    let agent = agent?;
+    [
+        agent.title.as_deref(),
+        agent.terminal_title_stripped.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|title| !title.is_empty())
+    .map(|title| truncate_head(title, MAX_TITLE_CHARS))
 }
 
 fn foreground(info: &PaneProcessInfo) -> Option<Value> {

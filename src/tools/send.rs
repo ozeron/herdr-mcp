@@ -9,10 +9,11 @@ use tokio_util::sync::CancellationToken;
 use crate::caller::Resolution;
 use crate::guard::TargetKind;
 use crate::herdr::{
-    AgentInfo, AgentPromptParams, AgentStatus, ApiErrorCode, Client, HerdrError, Outcome,
-    PaneSendInputParams, PromptWait,
+    AgentInfo, AgentPromptParams, AgentReadParams, AgentStatus, ApiErrorCode, Client, HerdrError,
+    Outcome, PaneSendInputParams, PromptWait, ReadSource,
 };
 use crate::provenance;
+use crate::providers::provider;
 use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 use crate::tools::interrupt;
@@ -45,6 +46,8 @@ pub struct SendParams {
     pub keys: Option<Vec<String>>,
     /// For a prompt. auto (default) refuses a working agent with busy; after_idle waits for idle, then sends; steer types into a working agent and returns no turn; restart interrupts, waits for idle, then sends.
     pub mode: Option<SendMode>,
+    /// For a prompt typed into a working agent that queues it (Claude Code): submit the queued prompt now with the agent's send-now key. Interrupts the agent's current turn flow; use only when the user wants the new prompt handled immediately. Ignored, with a note, for agents without such a key.
+    pub send_now: Option<bool>,
     /// Answer a blocked agent's prompt, or a startup dialog on screen, with text or keys. Only for an agent you launched; refused otherwise.
     pub answer_blocked: Option<bool>,
     /// How long after_idle and restart wait for idle, in milliseconds. Default 30000, capped at the wait cap.
@@ -79,6 +82,11 @@ fn validate(params: &SendParams) -> Result<(), HerdrError> {
     if raw && params.mode.is_some() {
         return Err(HerdrError::invalid_params(
             "mode applies to a prompt, not to text or keys",
+        ));
+    }
+    if raw && params.send_now.is_some() {
+        return Err(HerdrError::invalid_params(
+            "send_now applies to a prompt, not to text or keys",
         ));
     }
     if params.prompt.is_some() && params.answer_blocked == Some(true) {
@@ -126,7 +134,17 @@ pub async fn run(
                 settle: inner.interrupt_settle,
                 timeout,
             };
-            send_prompt(client, pane, agent, prompt, mode, pacing, ct).await
+            let send_now = params.send_now.unwrap_or(false);
+            send_prompt(
+                client,
+                pane,
+                agent,
+                prompt,
+                Options { mode, send_now },
+                pacing,
+                ct,
+            )
+            .await
         }
         None => send_raw(client, resolution, pane, is_agent, &params).await,
     }
@@ -150,6 +168,12 @@ struct Pacing {
     timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Options {
+    mode: SendMode,
+    send_now: bool,
+}
+
 /// Cancellation while waiting for idle, with nothing typed.
 fn cancelled(pane: &str, interrupted: bool) -> HerdrError {
     HerdrError::detailed(
@@ -166,17 +190,22 @@ async fn send_prompt(
     pane: &str,
     agent: Option<&AgentInfo>,
     prompt: &str,
-    mode: SendMode,
+    options: Options,
     pacing: Pacing,
     ct: &CancellationToken,
 ) -> Result<Value, HerdrError> {
-    let status = client.agent_get(pane).await?.agent_status;
+    let Options { mode, send_now } = options;
+    let current = client.agent_get(pane).await?;
+    let status = current.agent_status;
+    let kind = current.agent.as_deref();
     if status == AgentStatus::Blocked {
         return Err(blocked(pane));
     }
     let deadline = Instant::now() + pacing.timeout;
     let (result, interrupted) = match mode {
-        SendMode::Steer => return steer(client, pane, prompt).await,
+        SendMode::Steer => {
+            return steer(client, pane, prompt, status, kind, send_now, pacing.settle).await;
+        }
         SendMode::Auto => match status {
             AgentStatus::Idle | AgentStatus::Done => ("started", false),
             AgentStatus::Working => {
@@ -233,20 +262,86 @@ async fn send_prompt(
     let turn = turn_for(client, &agent).await;
     let mut out = json!({
         "result": result, "mode": mode, "pane": pane,
-        "status": agent.agent_status, "turn": turn,
+        "status": agent.agent_status, "turn": turn, "delivery": "started",
     });
+    if send_now && provider(kind).send_now_key.is_none() {
+        out["note"] = json!(no_send_now_note(kind));
+    }
     if mode == SendMode::Restart {
         out["interrupted"] = json!(interrupted);
     }
     Ok(out)
 }
 
-async fn steer(client: &Client, pane: &str, prompt: &str) -> Result<Value, HerdrError> {
+fn no_send_now_note(kind: Option<&str>) -> String {
+    format!(
+        "send_now is not supported for {}; ignored",
+        kind.unwrap_or("this agent kind")
+    )
+}
+
+const QUEUED_NOTE: &str = "The agent is mid-turn and queued this prompt; it runs when the current turn ends. Use send_now to submit it immediately, or herdr_wait on the agent to know when it finishes.";
+
+/// Whether the visible screen shows the kind's queue marker.
+async fn shows_queue_marker(client: &Client, pane: &str, marker: &str) -> bool {
+    let mut params = AgentReadParams::new(pane);
+    params.source = ReadSource::Visible;
+    client
+        .agent_read(&params)
+        .await
+        .is_ok_and(|read| read.text.to_lowercase().contains(marker))
+}
+
+/// Types the prompt without waiting for activity. For a working agent whose kind queues input,
+/// one visible-screen read after `settle` tells a queued prompt from a steering one.
+async fn steer(
+    client: &Client,
+    pane: &str,
+    prompt: &str,
+    status: AgentStatus,
+    kind: Option<&str>,
+    send_now: bool,
+    settle: Duration,
+) -> Result<Value, HerdrError> {
     client
         .agent_prompt(&AgentPromptParams::new(pane, prompt))
         .await
         .map_err(|err| prompt_error(err, pane, json!({"phase": "prompted", "pane": pane})))?;
-    Ok(json!({"result": "steered", "mode": "steer", "pane": pane, "turn": null}))
+    let provider = provider(kind);
+    let working = status == AgentStatus::Working;
+    let mut delivery = if working { "steered" } else { "started" };
+    let mut note = None;
+    if working && let Some(marker) = provider.queue_marker {
+        sleep(settle).await;
+        if shows_queue_marker(client, pane, marker).await {
+            delivery = "queued";
+            note = Some(QUEUED_NOTE.to_string());
+            if send_now && let Some(key) = provider.send_now_key {
+                client
+                    .agent_send_keys(pane, &[key.to_string()])
+                    .await
+                    .map_err(|err| {
+                        HerdrError::detailed(
+                            "send_now_failed",
+                            format!("the prompt was typed into {pane} and queued but {key} failed: {err}"),
+                            json!({"pane": pane, "prompt_sent": true, "cause": err.code()}),
+                        )
+                    })?;
+                delivery = "sent_now";
+                note = None;
+            }
+        }
+    }
+    if send_now && provider.send_now_key.is_none() {
+        note = Some(no_send_now_note(kind));
+    }
+    let mut out = json!({
+        "result": "steered", "mode": "steer", "pane": pane, "turn": null, "delivery": delivery,
+    });
+    if let Some(note) = note {
+        out["note"] = json!(note);
+    }
+    Ok(out)
 }
 
 async fn wait_idle(

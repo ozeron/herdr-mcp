@@ -167,15 +167,16 @@ async fn start(opts: Opts) -> Harness {
         dialog_settle: Duration::from_millis(60),
         ..launch_tuning()
     };
-    let mailbox = opts.mailbox.clone();
+    let mailbox = opts
+        .mailbox
+        .clone()
+        .unwrap_or_else(|| log_dir.path().join("state"));
     tokio::spawn(async move {
         let mut server = HerdrMcp::new(config)
             .with_wait_tuning(wait_tuning())
             .with_interrupt_settle(Duration::from_millis(1))
             .with_launch_tuning(tuning);
-        if let Some(dir) = mailbox {
-            server = server.with_mailbox_state_dir(dir);
-        }
+        server = server.with_mailbox_state_dir(mailbox);
         let running = server.serve(server_io).await.unwrap();
         let _ = running.waiting().await;
     });
@@ -1739,6 +1740,131 @@ async fn steer_types_into_a_working_agent_with_no_turn() {
     let prompt = &requests(&h.fake, "agent.prompt")[0]["params"];
     assert_eq!(prompt["text"], "also check the tests");
     assert!(prompt.get("wait").is_none_or(Value::is_null));
+}
+
+fn rev_kind(status: &'static str, kind: &'static str) -> Value {
+    json!({"type": "agent_info", "agent": Rev {status, seq: 3, parent: Some("w1:p1"), kind}.json()})
+}
+
+const QUEUED_SCREEN: &str =
+    "> next task\n\n  Press up to edit queued messages\n  ctrl+enter to send now\n";
+const WORKING_SCREEN: &str = "* Pondering... (esc to interrupt)\n> \n";
+
+async fn steer_with(kind: &'static str, screen: &str, extra: Value) -> (Harness, Value) {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", kind)]);
+    screens(&h.fake, &[screen]);
+    let mut params = json!({"target": "rev", "prompt": "next task", "mode": "steer"});
+    params
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let out = ok(&h, "herdr_send", params).await;
+    (h, out)
+}
+
+#[tokio::test]
+async fn an_idle_agent_gets_delivery_started() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+
+    let out = ok(&h, "herdr_send", json!({"target": "rev", "prompt": "go"})).await;
+
+    assert_eq!(out["delivery"], "started");
+    assert!(out["turn"].is_object());
+    assert!(out.get("note").is_none());
+    assert_eq!(count(&h.fake, "agent.read"), 0);
+}
+
+#[tokio::test]
+async fn a_working_claude_that_queues_the_prompt_is_delivery_queued_with_a_note() {
+    let (h, out) = steer_with("claude", QUEUED_SCREEN, json!({})).await;
+
+    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["result"], "steered");
+    assert!(out["turn"].is_null());
+    let note = out["note"].as_str().unwrap();
+    assert!(note.contains("queued this prompt"), "{note}");
+    assert!(note.contains("send_now"), "{note}");
+    assert!(typed_keys(&h).is_empty());
+}
+
+#[tokio::test]
+async fn send_now_presses_ctrl_enter_on_a_queued_claude_prompt() {
+    let (h, out) = steer_with("claude", QUEUED_SCREEN, json!({"send_now": true})).await;
+
+    assert_eq!(out["delivery"], "sent_now");
+    assert!(out.get("note").is_none());
+    assert_eq!(typed_keys(&h), [json!(["ctrl+enter"])]);
+    assert!(index_of(&h.fake, "agent.prompt") < index_of(&h.fake, "agent.send_keys"));
+}
+
+#[tokio::test]
+async fn send_now_without_a_queue_marker_presses_nothing() {
+    let (h, out) = steer_with("claude", WORKING_SCREEN, json!({"send_now": true})).await;
+
+    assert_eq!(out["delivery"], "steered");
+    assert!(typed_keys(&h).is_empty());
+}
+
+#[tokio::test]
+async fn a_working_claude_without_the_queue_marker_is_steered() {
+    let (_h, out) = steer_with("claude", WORKING_SCREEN, json!({})).await;
+
+    assert_eq!(out["delivery"], "steered");
+    assert!(out.get("note").is_none());
+}
+
+#[tokio::test]
+async fn a_working_codex_is_steered_without_reading_the_screen() {
+    let (h, out) = steer_with("codex", QUEUED_SCREEN, json!({})).await;
+
+    assert_eq!(out["delivery"], "steered");
+    assert_eq!(count(&h.fake, "agent.read"), 0);
+}
+
+#[tokio::test]
+async fn send_now_for_a_kind_without_the_key_is_noted_and_presses_nothing() {
+    let (h, out) = steer_with("codex", QUEUED_SCREEN, json!({"send_now": true})).await;
+
+    assert_eq!(out["delivery"], "steered");
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("send_now is not supported for codex")
+    );
+    assert!(typed_keys(&h).is_empty());
+}
+
+#[tokio::test]
+async fn send_now_on_an_idle_codex_start_is_noted() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "send_now": true}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "started");
+    assert!(out["note"].as_str().unwrap().contains("not supported"));
+    assert!(typed_keys(&h).is_empty());
+}
+
+#[tokio::test]
+async fn send_now_with_raw_text_is_invalid() {
+    let h = start(Opts::default()).await;
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "text": "x", "send_now": true}),
+    )
+    .await;
+    assert!(out.to_string().contains("send_now"));
+    assert_nothing_typed(&h.fake);
 }
 
 #[tokio::test]
