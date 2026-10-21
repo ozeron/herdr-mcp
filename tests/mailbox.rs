@@ -14,7 +14,7 @@ use harness::{count, process_info, requests, snapshot};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::log::Logger;
-use herdr_mcp::mailbox::{recipient_key, session_key};
+use herdr_mcp::mailbox::{Inbox, name_key, recipient_key, session_key};
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
 use herdr_mcp::tools::mail::{WaitEnd, wait_for_mail};
@@ -130,6 +130,11 @@ async fn env() -> Env {
         json!({"target": "nobody"}),
         fake_herdr::Script::error("agent_not_found", "no agent"),
     );
+    fake.on_params(
+        "agent.get",
+        json!({"target": "w1:p77"}),
+        fake_herdr::Script::error("agent_not_found", "no agent"),
+    );
     fake.reply_seq("agent.get", vec![agent_info("idle")]);
     fake.reply_seq("agent.prompt", vec![prompted()]);
     Env {
@@ -153,6 +158,14 @@ fn inbox(env: &Env, pane: &str) -> PathBuf {
         .join("herdr-mcp/mailbox")
         .join(session_key(env.fake.path()))
         .join(recipient_key(pane))
+}
+
+fn name_inbox(env: &Env, name: &str) -> PathBuf {
+    env.state
+        .path()
+        .join("herdr-mcp/mailbox")
+        .join(session_key(env.fake.path()))
+        .join(name_key(name))
 }
 
 fn files(dir: &Path) -> Vec<PathBuf> {
@@ -226,11 +239,11 @@ async fn an_agent_name_resolves_to_its_pane_and_a_pane_id_records_the_name() {
         )
         .await;
     assert_eq!(plain["to"], json!({"pane": "w1:p2", "name": null}));
-    assert_eq!(files(&inbox(&env, "w1:p4").join("new")).len(), 1);
+    assert_eq!(files(&name_inbox(&env, "rev").join("new")).len(), 1);
     assert_eq!(files(&inbox(&env, "w1:p2").join("new")).len(), 1);
     assert_eq!(
         sender
-            .err_code("herdr_mail_send", json!({"to": "nobody", "body": "x"}))
+            .err_code("herdr_mail_send", json!({"to": "w1:p77", "body": "x"}))
             .await,
         "target_not_found"
     );
@@ -390,7 +403,7 @@ async fn a_failed_nudge_still_delivers_and_does_not_set_the_marker() {
     assert_eq!(out["delivered"], true);
     assert_eq!(out["nudged"], false);
     assert!(out["nudge_skipped"].is_string());
-    assert!(!inbox(&env, "w1:p4").join(".nudged").exists());
+    assert!(!name_inbox(&env, "rev").join(".nudged").exists());
 }
 
 #[tokio::test]
@@ -401,7 +414,7 @@ async fn nudges_coalesce_until_the_inbox_is_read() {
         .ok("herdr_mail_send", json!({"to": "rev", "body": "one"}))
         .await;
     assert_eq!(first["nudged"], true);
-    assert!(inbox(&env, "w1:p4").join(".nudged").exists());
+    assert!(name_inbox(&env, "rev").join(".nudged").exists());
 
     let second = sender
         .ok("herdr_mail_send", json!({"to": "rev", "body": "two"}))
@@ -411,7 +424,7 @@ async fn nudges_coalesce_until_the_inbox_is_read() {
     assert_eq!(count(&env.fake, "agent.prompt"), 1);
 
     reader.ok("herdr_mail_read", json!({})).await;
-    assert!(!inbox(&env, "w1:p4").join(".nudged").exists());
+    assert!(!name_inbox(&env, "rev").join(".nudged").exists());
 
     let third = sender
         .ok("herdr_mail_send", json!({"to": "rev", "body": "three"}))
@@ -437,14 +450,14 @@ async fn read_limit_and_remaining_and_mark_read_false() {
         .await;
     assert_eq!(peek["messages"].as_array().unwrap().len(), 2);
     assert_eq!(peek["remaining"], 1);
-    assert_eq!(files(&inbox(&env, "w1:p4").join("new")).len(), 3);
+    assert_eq!(files(&name_inbox(&env, "rev").join("new")).len(), 3);
 
     let first = reader.ok("herdr_mail_read", json!({"limit": 2})).await;
     assert_eq!(first["messages"][0]["body"], "m0");
     assert_eq!(first["messages"][1]["body"], "m1");
     assert_eq!(first["remaining"], 1);
-    assert_eq!(files(&inbox(&env, "w1:p4").join("new")).len(), 1);
-    assert_eq!(files(&inbox(&env, "w1:p4").join("read")).len(), 2);
+    assert_eq!(files(&name_inbox(&env, "rev").join("new")).len(), 1);
+    assert_eq!(files(&name_inbox(&env, "rev").join("read")).len(), 2);
 
     let rest = reader.ok("herdr_mail_read", json!({})).await;
     assert_eq!(rest["messages"][0]["body"], "m2");
@@ -462,7 +475,7 @@ async fn read_deletes_read_files_older_than_24_hours() {
         )
         .await;
     reader.ok("herdr_mail_read", json!({})).await;
-    let read_dir = inbox(&env, "w1:p4").join("read");
+    let read_dir = name_inbox(&env, "rev").join("read");
     let kept = read_dir.join("fresh.json");
     let stale = read_dir.join("stale.json");
     fs::write(&kept, "{}").unwrap();
@@ -564,7 +577,8 @@ async fn mail_wait_stops_when_cancelled() {
     let started = Instant::now();
     let end = wait_for_mail(
         &mailbox,
-        "w1:p4",
+        &Inbox::new("w1:p4", None),
+        None,
         Duration::from_secs(30),
         Duration::from_millis(20),
         &ct,
@@ -589,7 +603,7 @@ async fn bodies_over_16_kib_are_refused() {
             .await,
         "body_too_large"
     );
-    assert!(files(&inbox(&env, "w1:p4").join("new")).is_empty());
+    assert!(files(&name_inbox(&env, "rev").join("new")).is_empty());
     let exact = "a".repeat(16 * 1024);
     sender
         .ok(
@@ -609,7 +623,7 @@ async fn an_inbox_holds_at_most_500_unread() {
             json!({"to": "rev", "body": "seed", "notify": false}),
         )
         .await;
-    let new = inbox(&env, "w1:p4").join("new");
+    let new = name_inbox(&env, "rev").join("new");
     for n in 0..499 {
         fs::write(
             new.join(format!("0000000000000-0000000001-{n:06}.json")),
@@ -644,7 +658,7 @@ async fn directories_are_0700_and_files_0600() {
     sender
         .ok("herdr_mail_send", json!({"to": "rev", "body": "x"}))
         .await;
-    let root = inbox(&env, "w1:p4");
+    let root = name_inbox(&env, "rev");
     for dir in [
         root.parent().unwrap().to_path_buf(),
         root.clone(),
@@ -677,7 +691,7 @@ async fn two_concurrent_senders_lose_nothing() {
     );
     let (x, y) = tokio::join!(fa, fb);
     assert_ne!(x["id"], y["id"]);
-    assert_eq!(files(&inbox(&env, "w1:p4").join("new")).len(), 2);
+    assert_eq!(files(&name_inbox(&env, "rev").join("new")).len(), 2);
     let read = reader.ok("herdr_mail_read", json!({})).await;
     let mut bodies: Vec<&str> = read["messages"]
         .as_array()
@@ -713,7 +727,7 @@ async fn logs_never_contain_a_message_body() {
         .await;
     reader.ok("herdr_mail_read", json!({})).await;
     sender
-        .err_code("herdr_mail_send", json!({"to": "nobody", "body": SENTINEL}))
+        .err_code("herdr_mail_send", json!({"to": "w1:p77", "body": SENTINEL}))
         .await;
     let mut seen = 0;
     for entry in fs::read_dir(env.logs.path().join("logs")).unwrap() {
@@ -722,4 +736,190 @@ async fn logs_never_contain_a_message_body() {
         seen += text.lines().count();
     }
     assert!(seen >= 3);
+}
+
+fn plain_message(from: Value, body: &str) -> herdr_mcp::mailbox::Message {
+    herdr_mcp::mailbox::Message {
+        id: herdr_mcp::mailbox::new_id(),
+        ts_ms: herdr_mcp::mailbox::now_ms(),
+        from: serde_json::from_value(from).unwrap(),
+        to: serde_json::from_value(json!({"pane": "w1:p4", "name": null})).unwrap(),
+        body: body.into(),
+        reply_to: None,
+    }
+}
+
+#[tokio::test]
+async fn mail_to_a_named_agent_lands_in_its_name_inbox_not_its_pane_inbox() {
+    let env = env().await;
+    let (sender, reader) = pair(&env).await;
+    sender
+        .ok(
+            "herdr_mail_send",
+            json!({"to": "w1:p4", "body": "by pane id", "notify": false}),
+        )
+        .await;
+    assert_eq!(files(&name_inbox(&env, "rev").join("new")).len(), 1);
+    assert!(files(&inbox(&env, "w1:p4").join("new")).is_empty());
+    let read = reader.ok("herdr_mail_read", json!({})).await;
+    assert_eq!(read["messages"][0]["body"], "by pane id");
+}
+
+#[tokio::test]
+async fn the_sender_carries_its_agent_name() {
+    let env = env().await;
+    let (_, rev) = pair(&env).await;
+    rev.ok(
+        "herdr_mail_send",
+        json!({"to": "w1:p2", "body": "hi", "notify": false}),
+    )
+    .await;
+    let msg = files(&inbox(&env, "w1:p2").join("new")).pop().unwrap();
+    let parsed: Value = serde_json::from_slice(&fs::read(msg).unwrap()).unwrap();
+    assert_eq!(parsed["from"], json!({"pane": "w1:p4", "name": "rev"}));
+}
+
+#[tokio::test]
+async fn an_offline_name_is_delivered_to_its_name_inbox_and_not_nudged() {
+    let env = env().await;
+    let (sender, _) = pair(&env).await;
+    let out = sender
+        .ok("herdr_mail_send", json!({"to": "nobody", "body": "later"}))
+        .await;
+    assert_eq!(out["delivered"], true);
+    assert_eq!(out["nudged"], false);
+    assert_eq!(out["nudge_skipped"], "recipient_offline");
+    assert_eq!(out["to"], json!({"pane": null, "name": "nobody"}));
+    assert_eq!(files(&name_inbox(&env, "nobody").join("new")).len(), 1);
+    assert_eq!(count(&env.fake, "agent.prompt"), 0);
+}
+
+#[tokio::test]
+async fn a_respawned_agent_of_the_same_name_on_another_pane_reads_the_mail() {
+    let env = env().await;
+    let (sender, _) = pair(&env).await;
+    sender
+        .ok(
+            "herdr_mail_send",
+            json!({"to": "nobody", "body": "for the next one"}),
+        )
+        .await;
+    // "nobody" now lives in w1:p5.
+    let mut respawned = agent_info("idle");
+    respawned["agent"]["name"] = json!("nobody");
+    respawned["agent"]["pane_id"] = json!("w1:p5");
+    respawned["agent"]["terminal_id"] = json!("t-w1:p5");
+    env.fake
+        .reply_params("agent.get", json!({"target": "w1:p5"}), respawned);
+    env.fake.reply_params(
+        "pane.process_info",
+        json!({"pane_id": "w1:p5"}),
+        process_info("w1:p5", 6666, 6666),
+    );
+    let next = bridge(&env, ToolMode::Control, Some("w1:p5"), 6666).await;
+    let read = next.ok("herdr_mail_read", json!({})).await;
+    assert_eq!(read["messages"][0]["body"], "for the next one");
+    assert!(files(&name_inbox(&env, "nobody").join("new")).is_empty());
+}
+
+#[tokio::test]
+async fn a_caller_reads_the_union_of_its_pane_and_name_inboxes_oldest_first() {
+    let env = env().await;
+    let (sender, reader) = pair(&env).await;
+    let mailbox = herdr_mcp::mailbox::Mailbox::new(env.state.path(), env.fake.path());
+    mailbox
+        .deliver(
+            &recipient_key("w1:p4"),
+            &plain_message(json!({"pane": "w1:p9", "name": null}), "to the pane"),
+        )
+        .unwrap();
+    sender
+        .ok(
+            "herdr_mail_send",
+            json!({"to": "rev", "body": "to the name", "notify": false}),
+        )
+        .await;
+    let waited = reader
+        .ok("herdr_mail_wait", json!({"timeout_ms": 1000}))
+        .await;
+    assert_eq!(waited["count"], 2);
+    let read = reader.ok("herdr_mail_read", json!({})).await;
+    let bodies: Vec<&str> = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["to the pane", "to the name"]);
+    assert_eq!(read["remaining"], 0);
+}
+
+#[tokio::test]
+async fn reading_clears_the_nudge_marker_of_both_inboxes() {
+    let env = env().await;
+    let (sender, reader) = pair(&env).await;
+    sender
+        .ok("herdr_mail_send", json!({"to": "rev", "body": "x"}))
+        .await;
+    assert!(name_inbox(&env, "rev").join(".nudged").exists());
+    reader.ok("herdr_mail_read", json!({})).await;
+    assert!(!name_inbox(&env, "rev").join(".nudged").exists());
+}
+
+#[tokio::test]
+async fn mail_read_from_returns_only_that_sender_and_leaves_the_rest_unread() {
+    let env = env().await;
+    let (sender, reader) = pair(&env).await;
+    let external = bridge(&env, ToolMode::Read, None, 1).await;
+    sender
+        .ok(
+            "herdr_mail_send",
+            json!({"to": "rev", "body": "from p1", "notify": false}),
+        )
+        .await;
+    external
+        .ok(
+            "herdr_mail_send",
+            json!({"to": "rev", "body": "from outside", "notify": false}),
+        )
+        .await;
+    let only = reader.ok("herdr_mail_read", json!({"from": "w1:p1"})).await;
+    assert_eq!(only["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(only["messages"][0]["body"], "from p1");
+    assert_eq!(only["remaining"], 0);
+    assert_eq!(files(&name_inbox(&env, "rev").join("new")).len(), 1);
+    let by_name = reader
+        .ok("herdr_mail_read", json!({"from": "external"}))
+        .await;
+    assert_eq!(by_name["messages"][0]["body"], "from outside");
+    let none = reader.ok("herdr_mail_read", json!({})).await;
+    assert_eq!(none["messages"], json!([]));
+}
+
+#[tokio::test]
+async fn mail_wait_from_matches_only_that_sender() {
+    let env = env().await;
+    let (_, reader) = pair(&env).await;
+    let external = bridge(&env, ToolMode::Read, None, 1).await;
+    external
+        .ok(
+            "herdr_mail_send",
+            json!({"to": "rev", "body": "x", "notify": false}),
+        )
+        .await;
+    let other = reader
+        .ok(
+            "herdr_mail_wait",
+            json!({"from": "w1:p1", "timeout_ms": 400}),
+        )
+        .await;
+    assert_eq!(other["timed_out"], true);
+    let own = reader
+        .ok(
+            "herdr_mail_wait",
+            json!({"from": "external", "timeout_ms": 400}),
+        )
+        .await;
+    assert_eq!(own["matched"], true);
+    assert_eq!(own["count"], 1);
 }

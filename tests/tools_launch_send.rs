@@ -42,6 +42,8 @@ fn launch_tuning() -> LaunchTuning {
         dialog_settle: Duration::from_millis(60),
         idle_poll: Duration::from_millis(5),
         startup_grace: Duration::from_millis(200),
+        mail_poll: Duration::from_millis(10),
+        reply_grace: Duration::from_millis(300),
     }
 }
 
@@ -124,6 +126,7 @@ struct Opts {
     install_env: Option<InstallEnv>,
     max_wait: Option<Duration>,
     quiet: Duration,
+    mailbox: Option<PathBuf>,
 }
 
 impl Default for Opts {
@@ -133,6 +136,7 @@ impl Default for Opts {
             install_env: None,
             max_wait: Some(Duration::from_secs(5)),
             quiet: Duration::from_millis(40),
+            mailbox: None,
         }
     }
 }
@@ -163,14 +167,16 @@ async fn start(opts: Opts) -> Harness {
         dialog_settle: Duration::from_millis(60),
         ..launch_tuning()
     };
+    let mailbox = opts.mailbox.clone();
     tokio::spawn(async move {
-        let running = HerdrMcp::new(config)
+        let mut server = HerdrMcp::new(config)
             .with_wait_tuning(wait_tuning())
             .with_interrupt_settle(Duration::from_millis(1))
-            .with_launch_tuning(tuning)
-            .serve(server_io)
-            .await
-            .unwrap();
+            .with_launch_tuning(tuning);
+        if let Some(dir) = mailbox {
+            server = server.with_mailbox_state_dir(dir);
+        }
+        let running = server.serve(server_io).await.unwrap();
         let _ = running.waiting().await;
     });
     let client = ClientConfig::new(
@@ -200,6 +206,7 @@ fn direct_inner(fake: &FakeHerdr, mode: ToolMode, log_dir: &TempDir) -> Inner {
         wait: wait_tuning(),
         interrupt_settle: Duration::from_millis(1),
         launch: launch_tuning(),
+        mailbox_state: log_dir.path().join("state"),
     }
 }
 
@@ -2353,4 +2360,520 @@ async fn launch_split_of_a_pane_id_targets_that_pane() {
     let split = &requests(&h.fake, "pane.split")[0]["params"];
     assert_eq!(split["target_pane_id"], "w2:p3");
     assert_eq!(count(&h.fake, "tab.create"), 0);
+}
+
+// ---- reply: "mail" -------------------------------------------------------------------------
+
+use herdr_mcp::mailbox::{Inbox, Mailbox, Message, Party, new_id, now_ms, recipient_key};
+
+const PARAGRAPH_TAIL: &str = ". The body is the deliverable: exact, complete, nothing else. Do this even if you also print it.";
+
+fn paragraph(parent: &str) -> String {
+    format!(
+        "When you have finished, send your complete final result as the body of one herdr_mail_send call to {parent}{PARAGRAPH_TAIL}"
+    )
+}
+
+fn mail_from(pane: &str, name: Option<&str>, body: &str) -> Message {
+    Message {
+        id: new_id(),
+        ts_ms: now_ms(),
+        from: Party {
+            pane: Some(pane.into()),
+            name: name.map(Into::into),
+        },
+        to: Party {
+            pane: Some("w1:p1".into()),
+            name: None,
+        },
+        body: body.into(),
+        reply_to: None,
+    }
+}
+
+struct MailEnv {
+    h: Harness,
+    state: TempDir,
+}
+
+impl MailEnv {
+    fn mailbox(&self) -> Mailbox {
+        Mailbox::new(self.state.path(), self.h.fake.path())
+    }
+
+    fn parent_inbox(&self) -> Inbox {
+        Inbox::new("w1:p1", None)
+    }
+
+    fn unread(&self) -> usize {
+        self.mailbox().unread_count(&self.parent_inbox(), None)
+    }
+}
+
+async fn mail_env(opts: Opts) -> MailEnv {
+    let state = tempfile::tempdir().unwrap();
+    let h = start(Opts {
+        mailbox: Some(state.path().to_path_buf()),
+        ..opts
+    })
+    .await;
+    MailEnv { h, state }
+}
+
+fn deliver_later(env: &MailEnv, after: Duration, message: Message) -> tokio::task::JoinHandle<()> {
+    let mailbox = env.mailbox();
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        mailbox.deliver(&recipient_key("w1:p1"), &message).unwrap();
+    })
+}
+
+fn script_working_child(fake: &FakeHerdr) {
+    script_launch_then(
+        fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+        kid("working", 7, true, false),
+    );
+}
+
+fn mail_launch_args(extra: Value) -> Value {
+    let mut args = json!({
+        "kind": "codex", "name": "kid", "instructions": "go", "wait": "turn", "reply": "mail",
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    args
+}
+
+#[tokio::test]
+async fn a_blocking_mail_reply_is_exact_consumed_and_leaves_other_mail_alone() {
+    let env = mail_env(Opts::default()).await;
+    script_working_child(&env.h.fake);
+    let other = mail_from("w1:p3", None, "someone else");
+    env.mailbox()
+        .deliver(&recipient_key("w1:p1"), &other)
+        .unwrap();
+    let child = mail_from("w1:p9", Some("kid"), "the exact result");
+    let sent = deliver_later(&env, Duration::from_millis(300), child.clone());
+
+    let out = ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    sent.await.unwrap();
+
+    assert_eq!(out["reply"]["body"], "the exact result");
+    assert_eq!(out["reply"]["id"], child.id);
+    assert_eq!(out["reply"]["ts_ms"], child.ts_ms);
+    assert_eq!(
+        out["reply"]["from"],
+        json!({"pane": "w1:p9", "name": "kid"})
+    );
+    assert!(out.get("excerpt").is_none(), "{out}");
+    assert_eq!(out["phase"], "waiting");
+    assert_eq!(out["matched"], true);
+    assert_eq!(out["timed_out"], false);
+    assert!(out["status"].is_string());
+    // Only the child's message was consumed.
+    assert_eq!(env.unread(), 1);
+    let (left, _) = env
+        .mailbox()
+        .take(&env.parent_inbox(), None, false, 10)
+        .unwrap();
+    assert_eq!(left[0].body, "someone else");
+    assert_no_cleanup(&env.h.fake);
+}
+
+#[tokio::test]
+async fn a_name_match_alone_is_enough_to_claim_the_reply() {
+    let env = mail_env(Opts::default()).await;
+    script_working_child(&env.h.fake);
+    let msg = mail_from("w1:p42", Some("kid"), "by name");
+    let sent = deliver_later(&env, Duration::from_millis(100), msg);
+    let out = ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    sent.await.unwrap();
+    assert_eq!(out["reply"]["body"], "by name");
+}
+
+#[tokio::test]
+async fn a_long_multi_line_json_reply_round_trips_byte_exact() {
+    let env = mail_env(Opts::default()).await;
+    script_working_child(&env.h.fake);
+    let long_path = format!(
+        "crates/{}/src/deeply/nested/module/file.rs",
+        "segment".repeat(30)
+    );
+    let value = json!({
+        "findings": (0..12).map(|n| json!({
+            "path": long_path, "line": n, "note": format!("quote \" backslash \\ tab\t é ✓ {n}"),
+        })).collect::<Vec<_>>(),
+        "summary": "line one\nline two\n",
+    });
+    let body = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
+    assert!(body.len() > 2000 && body.len() <= 16 * 1024);
+    let sent = deliver_later(
+        &env,
+        Duration::from_millis(100),
+        mail_from("w1:p9", Some("kid"), &body),
+    );
+    let out = ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    sent.await.unwrap();
+    assert_eq!(out["reply"]["body"].as_str().unwrap(), body);
+}
+
+#[tokio::test]
+async fn the_instruction_ends_with_the_parent_pane_id_when_the_caller_has_no_name() {
+    let env = mail_env(Opts::default()).await;
+    script_working_child(&env.h.fake);
+    let sent = deliver_later(
+        &env,
+        Duration::from_millis(50),
+        mail_from("w1:p9", Some("kid"), "x"),
+    );
+    ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    sent.await.unwrap();
+    let prompt = &requests(&env.h.fake, "agent.prompt")[0]["params"];
+    assert_eq!(
+        prompt["text"].as_str().unwrap(),
+        format!("go\n\n{}", paragraph("w1:p1"))
+    );
+}
+
+fn snapshot_with_agents(with_new: bool, extra: Vec<Value>) -> Value {
+    let mut snapshot = snapshot(with_new, None);
+    snapshot["snapshot"]["agents"]
+        .as_array_mut()
+        .unwrap()
+        .extend(extra);
+    snapshot
+}
+
+fn script_named_caller(fake: &FakeHerdr) {
+    let extra = || vec![harness::agent("w1:p1", "w1:t1", "w1", "boss")];
+    fake.reply_seq(
+        "session.snapshot",
+        vec![
+            snapshot_with_agents(false, extra()),
+            snapshot_with_agents(true, extra()),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn the_instruction_names_the_parent_when_the_caller_is_a_named_agent() {
+    let env = mail_env(Opts::default()).await;
+    script_working_child(&env.h.fake);
+    script_named_caller(&env.h.fake);
+    // The caller's name inbox is where the child's mail goes.
+    let msg = mail_from("w1:p9", Some("kid"), "named parent");
+    let mailbox = env.mailbox();
+    let sent = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        mailbox
+            .deliver(&herdr_mcp::mailbox::name_key("boss"), &msg)
+            .unwrap();
+    });
+    let out = ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    sent.await.unwrap();
+    assert_eq!(out["reply"]["body"], "named parent");
+    let prompt = &requests(&env.h.fake, "agent.prompt")[0]["params"];
+    assert_eq!(
+        prompt["text"].as_str().unwrap(),
+        format!("go\n\n{}", paragraph("boss"))
+    );
+}
+
+#[tokio::test]
+async fn a_child_that_settles_without_mailing_gets_the_grace_then_null_and_the_excerpt() {
+    let env = mail_env(Opts::default()).await;
+    script_launch(
+        &env.h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let began = Instant::now();
+    let out = ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+
+    assert!(
+        began.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(out["reply"], Value::Null);
+    assert_eq!(
+        out["note"],
+        "child finished without mailing a result; read its pane"
+    );
+    assert_eq!(out["status"], "done");
+    assert_eq!(out["excerpt"], "all done");
+    assert_eq!(out["timed_out"], false);
+}
+
+#[tokio::test]
+async fn mail_that_arrives_during_the_grace_is_still_the_reply() {
+    let env = mail_env(Opts::default()).await;
+    script_launch(
+        &env.h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let sent = deliver_later(
+        &env,
+        Duration::from_millis(150),
+        mail_from("w1:p9", Some("kid"), "just in time"),
+    );
+    let out = ok(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    sent.await.unwrap();
+    assert_eq!(out["reply"]["body"], "just in time");
+    assert_eq!(out["status"], "done");
+    assert!(out.get("excerpt").is_none(), "{out}");
+    assert!(out.get("note").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn a_timeout_returns_a_mail_rewait_for_the_child() {
+    let fake = FakeHerdr::start().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let inner = capped_inner(&fake, &log_dir, 900);
+    script_working_child(&fake);
+
+    let out = launch::run(
+        &inner,
+        None,
+        CancellationToken::new(),
+        None,
+        launch_params(json!({
+            "kind": "codex", "instructions": "go", "wait": "turn", "reply": "mail",
+        })),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(out["timed_out"], true, "{out}");
+    assert_eq!(out["reply"], Value::Null);
+    assert_eq!(out["rewait"], json!({"mail": {"from": "kid"}}));
+}
+
+#[tokio::test]
+async fn an_async_mail_launch_returns_pending_and_the_idle_parent_is_nudged_by_child_mail() {
+    let env = mail_env(Opts::default()).await;
+    // Once the prompt is sent, agent.get answers for the parent: idle, so it can be nudged.
+    let mut idle_parent = harness::agent("w1:p1", "w1:t1", "w1", "boss");
+    idle_parent["agent_status"] = json!("idle");
+    script_launch_then(
+        &env.h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+        json!({"type": "agent_info", "agent": idle_parent}),
+    );
+
+    let out = ok(
+        &env.h,
+        "herdr_launch",
+        mail_launch_args(json!({"wait": "none"})),
+    )
+    .await;
+
+    assert_eq!(out["reply"], "pending");
+    assert_eq!(
+        out["note"],
+        "The child will mail its result to you; end your turn, and the mail nudge will wake you."
+    );
+    assert_eq!(out["phase"], "prompted");
+    assert_eq!(count(&env.h.fake, "events.subscribe"), 0);
+
+    // The child mails the parent later. The parent is an idle agent by then.
+    let agents = vec![
+        harness::agent("w1:p1", "w1:t1", "w1", "boss"),
+        harness::agent("w1:p9", "w1:t9", "w1", "kid"),
+    ];
+    env.h
+        .fake
+        .reply_seq("session.snapshot", vec![snapshot_with_agents(true, agents)]);
+    env.h.fake.reply_params(
+        "pane.process_info",
+        json!({"pane_id": "w1:p9"}),
+        process_info("w1:p9", 9500, 9500),
+    );
+    env.h.fake.reply("agent.prompt", prompted_kid("working", 8));
+    let child = child_bridge(&env).await;
+    let sent = call(
+        &child,
+        "herdr_mail_send",
+        json!({"to": "boss", "body": "all finished"}),
+    )
+    .await;
+    assert_ne!(sent.is_error, Some(true), "{sent:?}");
+    let sent = sent.structured_content.unwrap();
+    assert_eq!(sent["nudged"], true, "{sent}");
+    let prompts = requests(&env.h.fake, "agent.prompt");
+    let last = &prompts.last().unwrap()["params"];
+    assert_eq!(last["target"], "w1:p1");
+    assert!(
+        last["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("New herdr mail from kid."),
+        "{last}"
+    );
+}
+
+/// A second bridge on the same fake and mailbox, running as the child in w1:p9.
+async fn child_bridge(env: &MailEnv) -> Harness {
+    let config = BridgeConfig {
+        socket_path: env.h.fake.path().to_path_buf(),
+        profile: Profile::new(None, Some(Duration::from_secs(5))),
+        mode: ToolMode::Read,
+        ancestry: Arc::new(StaticAncestry(vec![9500, 1])),
+        caller_env: CallerEnv {
+            pane_id: Some("w1:p9".into()),
+            tab_id: Some("w1:t9".into()),
+            workspace_id: Some("w1".into()),
+        },
+        logger: Logger::to_dir(env.state.path().join("child-logs")).unwrap(),
+        install_env: None,
+    };
+    let dir = env.state.path().to_path_buf();
+    let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+    tokio::spawn(async move {
+        let running = HerdrMcp::new(config)
+            .with_mailbox_state_dir(dir)
+            .serve(server_io)
+            .await
+            .unwrap();
+        let _ = running.waiting().await;
+    });
+    let client = ClientConfig::new(
+        ClientCapabilities::default(),
+        Implementation::new("test-client", "1.0.0"),
+    )
+    .serve(client_io)
+    .await
+    .unwrap();
+    Harness {
+        fake: FakeHerdr::start().await,
+        client,
+        _log_dir: tempfile::tempdir().unwrap(),
+    }
+}
+
+fn assert_no_creation(fake: &FakeHerdr) {
+    for method in [
+        "tab.create",
+        "pane.split",
+        "workspace.create",
+        "agent.start",
+        "agent.prompt",
+        "pane.close",
+    ] {
+        assert_eq!(count(fake, method), 0, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn reply_mail_from_an_unverified_caller_is_refused_before_anything_is_created() {
+    let env = mail_env(Opts::default()).await;
+    // No pane.process_info script for the caller: its shell cannot be matched.
+    env.h
+        .fake
+        .reply_seq("session.snapshot", vec![snapshot(false, None)]);
+    let code = err_code(&env.h, "herdr_launch", mail_launch_args(json!({}))).await;
+    assert_eq!(code, "invalid_params");
+    assert_no_creation(&env.h.fake);
+}
+
+#[tokio::test]
+async fn reply_mail_with_an_unsupported_kind_is_refused_before_anything_is_created() {
+    let sandbox = Sandbox::new();
+    let env = mail_env(Opts {
+        install_env: Some(sandbox.env.clone()),
+        ..Opts::default()
+    })
+    .await;
+    caller_ok(&env.h.fake);
+    env.h
+        .fake
+        .reply_seq("session.snapshot", vec![snapshot(false, None)]);
+    let result = err(
+        &env.h,
+        "herdr_launch",
+        mail_launch_args(json!({"kind": "opencode"})),
+    )
+    .await;
+    assert_eq!(result["code"], "reply_unsupported");
+    assert_no_creation(&env.h.fake);
+}
+
+#[tokio::test]
+async fn reply_mail_needs_instructions() {
+    let env = mail_env(Opts::default()).await;
+    let code = err_code(
+        &env.h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "reply": "mail"}),
+    )
+    .await;
+    assert_eq!(code, "invalid_params");
+    assert!(env.h.fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn reply_screen_is_the_default_and_adds_nothing() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go", "wait": "turn"}),
+    )
+    .await;
+    assert!(out.get("reply").is_none(), "{out}");
+    assert_eq!(out["excerpt"], "all done");
+    let prompt = &requests(&h.fake, "agent.prompt")[0]["params"];
+    assert_eq!(prompt["text"], "go");
+}
+
+#[tokio::test]
+async fn a_long_unwrapped_line_survives_in_the_excerpt() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let long = format!(
+        "path: /srv/{}/config.json done",
+        "very-long-directory-name/".repeat(20)
+    );
+    assert!(long.len() > 400);
+    h.fake
+        .reply_seq("pane.read", vec![read_result(&format!("first\n{long}\n"))]);
+    let out = ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go", "wait": "turn"}),
+    )
+    .await;
+    assert!(
+        out["excerpt"].as_str().unwrap().lines().any(|l| l == long),
+        "{out}"
+    );
+    for read in requests(&h.fake, "pane.read") {
+        assert_eq!(read["params"]["source"], "recent_unwrapped");
+    }
 }

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::caller::resolve_caller;
 use crate::guard::{self, TargetKind};
 use crate::herdr::{AgentPromptParams, AgentStatus, Client, HerdrError};
-use crate::mailbox::{self, Mailbox, Message, Party};
+use crate::mailbox::{self, Inbox, Mailbox, Message, Party, SenderFilter};
 use crate::server::Inner;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::wait::{PROGRESS_INTERVAL, Progress};
@@ -23,7 +23,7 @@ const DEFAULT_READ_LIMIT: u32 = 50;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct SendParams {
-    /// Pane ID or agent name of the recipient.
+    /// Pane ID or agent name of the recipient. A name with no live agent is delivered to its name inbox anyway, so a respawned agent of that name gets it.
     pub to: String,
     /// The message text, at most 16 KiB.
     pub body: String,
@@ -38,6 +38,8 @@ pub struct SendParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadParams {
+    /// Only mail from this sender (agent name or pane ID); other mail stays unread.
+    pub from: Option<String>,
     /// Move the returned messages out of the unread inbox (default true).
     pub mark_read: Option<bool>,
     /// At most this many messages, oldest first (default 50).
@@ -47,6 +49,8 @@ pub struct ReadParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct WaitParams {
+    /// Only wait for mail from this sender (agent name or pane ID).
+    pub from: Option<String>,
     /// How long to wait, in milliseconds. Default 30000, capped at the wait cap.
     pub timeout_ms: Option<u64>,
 }
@@ -92,19 +96,24 @@ pub async fn send(
         client.session_snapshot(),
         resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
     )?;
-    let target = guard::resolve_target(&client, &snapshot, &params.to).await?;
-    if target.kind != TargetKind::Pane {
-        return Err(HerdrError::tool(
-            "unsupported_target",
-            "herdr_mail_send takes a pane ID or an agent name",
-        ));
+    let target = match guard::resolve_target(&client, &snapshot, &params.to).await {
+        Ok(target) => Some(target),
+        Err(err) if err.code() == "target_not_found" && !looks_like_herdr_id(&params.to) => None,
+        Err(err) => return Err(err),
+    };
+    if let Some(target) = &target {
+        if target.kind != TargetKind::Pane {
+            return Err(HerdrError::tool(
+                "unsupported_target",
+                "herdr_mail_send takes a pane ID or an agent name",
+            ));
+        }
+        guard::self_guard(
+            resolution.guard_target.as_deref(),
+            target,
+            params.allow_self.unwrap_or(false),
+        )?;
     }
-    guard::self_guard(
-        resolution.guard_target.as_deref(),
-        &target,
-        params.allow_self.unwrap_or(false),
-    )?;
-    let pane = target.id;
     let agent_name = |pane: &str| {
         snapshot
             .agents
@@ -112,7 +121,6 @@ pub async fn send(
             .find(|agent| agent.pane_id == pane)
             .and_then(|agent| agent.name.clone())
     };
-    let recipient_name = agent_name(&pane);
     let from = match resolution
         .caller
         .as_ref()
@@ -133,18 +141,30 @@ pub async fn send(
             .or(from.pane.as_deref())
             .unwrap_or("external"),
     );
+    // Without a live agent the recipient is the name itself.
+    let (pane, recipient_name) = match target {
+        Some(target) => {
+            let name = agent_name(&target.id);
+            (Some(target.id), name)
+        }
+        None => (None, Some(params.to.clone())),
+    };
+    let key = match &recipient_name {
+        Some(name) => mailbox::name_key(name),
+        None => mailbox::recipient_key(pane.as_deref().unwrap_or_default()),
+    };
     let message = Message {
         id: mailbox::new_id(),
         ts_ms: mailbox::now_ms(),
         from,
         to: Party {
-            pane: Some(pane.clone()),
+            pane: pane.clone(),
             name: recipient_name.clone(),
         },
         body: params.body,
         reply_to: params.reply_to,
     };
-    mailbox.deliver(&pane, &message)?;
+    mailbox.deliver(&key, &message)?;
 
     let mut out = json!({
         "id": message.id,
@@ -152,13 +172,18 @@ pub async fn send(
         "delivered": true,
         "nudged": false,
     });
-    let is_agent = snapshot.agents.iter().any(|agent| agent.pane_id == pane);
-    let skipped = if !params.notify.unwrap_or(true) {
-        Some("notify_false".to_string())
-    } else if !is_agent {
-        Some("not_an_agent".to_string())
-    } else {
-        nudge(&client, mailbox, &pane, &sender_label).await
+    let skipped = match &pane {
+        None => Some("recipient_offline".to_string()),
+        Some(pane) => {
+            let is_agent = snapshot.agents.iter().any(|agent| agent.pane_id == *pane);
+            if !params.notify.unwrap_or(true) {
+                Some("notify_false".to_string())
+            } else if !is_agent {
+                Some("not_an_agent".to_string())
+            } else {
+                nudge(&client, mailbox, pane, &key, &sender_label).await
+            }
+        }
     };
     match skipped {
         Some(reason) => out["nudge_skipped"] = json!(reason),
@@ -167,11 +192,29 @@ pub async fn send(
     Ok(out)
 }
 
+/// Whether `raw` has the shape of a Herdr pane, tab or workspace ID (`w1:p2`, `w1:t2`, `w1`), so
+/// a miss is a wrong ID, not an agent name that is not running.
+fn looks_like_herdr_id(raw: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
+    match raw.split_once(':') {
+        Some((scope, rest)) => {
+            !scope.is_empty()
+                && !scope.contains(char::is_whitespace)
+                && rest
+                    .strip_prefix('p')
+                    .or_else(|| rest.strip_prefix('t'))
+                    .is_some_and(digits)
+        }
+        None => raw.strip_prefix('w').is_some_and(digits),
+    }
+}
+
 /// `None` when the nudge was sent, else why it was not.
 async fn nudge(
     client: &Client,
     mailbox: &Mailbox,
     pane: &str,
+    key: &str,
     sender_label: &str,
 ) -> Option<String> {
     match client.agent_get(pane).await.map(|agent| agent.agent_status) {
@@ -181,7 +224,7 @@ async fn nudge(
         Ok(AgentStatus::Unknown) => return Some("recipient_status_unknown".into()),
         Err(_) => return Some("recipient_status_unavailable".into()),
     }
-    if !mailbox.claim_nudge(pane) {
+    if !mailbox.claim_nudge(key) {
         return Some("already_nudged".into());
     }
     let text = format!(
@@ -193,19 +236,32 @@ async fn nudge(
     {
         Ok(_) => None,
         Err(_) => {
-            mailbox.release_nudge(pane);
+            mailbox.release_nudge(key);
             Some("nudge_failed".into())
         }
     }
 }
 
-async fn verified_pane(inner: &Inner, tool: &str) -> Result<String, HerdrError> {
+/// The verified caller's pane, with the inbox it reads: its pane inbox plus its name inbox when
+/// `agent.get` says the pane holds a named agent.
+async fn caller_inbox(inner: &Inner, tool: &str) -> Result<Inbox, HerdrError> {
     let client = inner.client()?;
     let resolution = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()).await?;
-    match resolution.caller {
-        Some(caller) if resolution.caller_verified => Ok(caller.pane_id),
-        _ => Err(no_caller(tool)),
-    }
+    let pane = match resolution.caller {
+        Some(caller) if resolution.caller_verified => caller.pane_id,
+        _ => return Err(no_caller(tool)),
+    };
+    let name = match client.agent_get(&pane).await {
+        Ok(agent) => agent.name,
+        Err(err) if err.is_target_gone() => None,
+        Err(err) => return Err(err),
+    };
+    Ok(Inbox::new(&pane, name.as_deref()))
+}
+
+fn sender_filter(from: Option<String>) -> Option<SenderFilter> {
+    from.filter(|from| !from.is_empty())
+        .map(|from| SenderFilter::new([from]))
 }
 
 pub async fn read(
@@ -213,9 +269,15 @@ pub async fn read(
     mailbox: &Mailbox,
     params: ReadParams,
 ) -> Result<Value, HerdrError> {
-    let pane = verified_pane(inner, "herdr_mail_read").await?;
+    let inbox = caller_inbox(inner, "herdr_mail_read").await?;
     let limit = params.limit.unwrap_or(DEFAULT_READ_LIMIT).max(1) as usize;
-    let (messages, remaining) = mailbox.take(&pane, params.mark_read.unwrap_or(true), limit)?;
+    let filter = sender_filter(params.from);
+    let (messages, remaining) = mailbox.take(
+        &inbox,
+        filter.as_ref(),
+        params.mark_read.unwrap_or(true),
+        limit,
+    )?;
     Ok(json!({"messages": messages, "remaining": remaining}))
 }
 
@@ -227,12 +289,14 @@ pub async fn wait(
     progress: Option<UnboundedSender<Progress>>,
     params: WaitParams,
 ) -> Result<Value, HerdrError> {
-    let pane = verified_pane(inner, "herdr_mail_wait").await?;
+    let inbox = caller_inbox(inner, "herdr_mail_wait").await?;
     let cap = inner.profile.wait_cap(client_name);
     let (timeout, note) = clamp_timeout(params.timeout_ms, cap, DEFAULT_TIMEOUT);
+    let filter = sender_filter(params.from);
     let end = wait_for_mail(
         mailbox,
-        &pane,
+        &inbox,
+        filter.as_ref(),
         timeout,
         POLL_INTERVAL,
         ct,
@@ -255,11 +319,12 @@ pub async fn wait(
     Ok(out)
 }
 
-/// Polls the inbox until it holds unread mail, `timeout` passes or `ct` is cancelled.
-/// It does not consume anything.
+/// Polls the inbox until it holds unread mail (from `from`, when given), `timeout` passes or
+/// `ct` is cancelled. It does not consume anything.
 pub async fn wait_for_mail(
     mailbox: &Mailbox,
-    pane: &str,
+    inbox: &Inbox,
+    from: Option<&SenderFilter>,
     timeout: Duration,
     poll: Duration,
     ct: &CancellationToken,
@@ -269,7 +334,7 @@ pub async fn wait_for_mail(
     let deadline = started + timeout;
     let mut last_tick = started;
     loop {
-        let count = mailbox.unread_count(pane);
+        let count = mailbox.unread_count(inbox, from);
         if count > 0 {
             return WaitEnd::Mail(count);
         }
