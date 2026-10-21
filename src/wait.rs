@@ -19,6 +19,7 @@ pub const OBSERVE_WINDOW: Duration = Duration::from_secs(2);
 pub const RECHECK_DELAY: Duration = Duration::from_millis(300);
 
 const EXCERPT_TIMEOUT: Duration = Duration::from_secs(2);
+const LAST_LOOK: Duration = Duration::from_millis(100);
 const UNKNOWN_NOTE: &str =
     "status is unknown: read the pane before concluding anything about the turn";
 
@@ -222,15 +223,18 @@ fn stale() -> HerdrError {
 }
 
 /// Runs one socket step within `min(the client's timeout, the time left before deadline)`, so a
-/// stalled Herdr cannot push a wait past its cap.
+/// stalled Herdr cannot push a wait past its cap. A poll that wakes at the deadline still gets
+/// `LAST_LOOK` for its final read, instead of failing with 0 ms.
 async fn bounded<T>(
     client: &Client,
     deadline: Instant,
     step: impl Future<Output = Result<T, HerdrError>>,
 ) -> Result<T, HerdrError> {
-    let limit = client
-        .timeout()
-        .min(deadline.saturating_duration_since(Instant::now()));
+    let limit = client.timeout().min(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(LAST_LOOK),
+    );
     tokio::time::timeout(limit, step).await.unwrap_or_else(|_| {
         Err(HerdrError::tool(
             "herdr_timeout",
