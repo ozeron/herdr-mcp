@@ -3,7 +3,9 @@
 //! Every request to `/mcp` goes through a [`TokenCheck`] first. With no check configured the
 //! server uses [`DenyAll`], so it fails closed.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::Router;
@@ -29,15 +31,17 @@ pub struct Denied;
 /// Decides whether a bearer token may reach `/mcp`. `bearer` is the token after `Bearer `, or
 /// `None` when the header is missing or is not a bearer credential.
 pub trait TokenCheck: Send + Sync + 'static {
-    fn check(&self, bearer: Option<&str>) -> Result<(), Denied>;
+    fn check<'a>(&'a self, bearer: Option<&'a str>) -> CheckFuture<'a>;
 }
+
+pub type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Denied>> + Send + 'a>>;
 
 /// Refuses every request. The default until real auth is configured.
 pub struct DenyAll;
 
 impl TokenCheck for DenyAll {
-    fn check(&self, _bearer: Option<&str>) -> Result<(), Denied> {
-        Err(Denied)
+    fn check<'a>(&'a self, _bearer: Option<&'a str>) -> CheckFuture<'a> {
+        Box::pin(async { Err(Denied) })
     }
 }
 
@@ -104,8 +108,8 @@ struct AuthState {
 
 /// The `/mcp` route behind the auth layer. Every MCP session gets a clone of `handler`, so all
 /// of them share one `Inner`: the active session, audit log, expiry and tunnel config.
-/// Cancelling `shutdown` ends the open MCP sessions. Other routes (U2's OAuth endpoints) are
-/// merged next to this one, outside the auth layer.
+/// Cancelling `shutdown` ends the open MCP sessions. Other routes, such as
+/// [`crate::oauth::metadata_router`], are merged next to this one, outside the auth layer.
 pub fn mcp_router(
     handler: HerdrMcp,
     options: &HttpOptions,
@@ -147,7 +151,7 @@ async fn require_token(State(state): State<AuthState>, request: Request, next: N
             scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
         })
         .filter(|token| !token.is_empty());
-    match state.check.check(bearer) {
+    match state.check.check(bearer).await {
         Ok(()) => next.run(request).await,
         Err(Denied) => (
             StatusCode::UNAUTHORIZED,

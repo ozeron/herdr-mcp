@@ -8,9 +8,10 @@ use herdr_mcp::caller::{CallerEnv, ProcessAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::cli::{Args, Command, HttpServeArgs, InstallArgs, PrintConfigArgs, TunnelCommand};
 use herdr_mcp::herdr::{SessionEnv, resolve_socket_path};
-use herdr_mcp::http::{self, DenyAll, HttpOptions};
+use herdr_mcp::http::{self, DenyAll, HttpOptions, TokenCheck};
 use herdr_mcp::install::{self, Action, InstallEnv, Io, Options};
 use herdr_mcp::log::Logger;
+use herdr_mcp::oauth::{self, JwtCheck};
 use herdr_mcp::print_config;
 use herdr_mcp::profile::ClientKind;
 use herdr_mcp::profile::Profile;
@@ -61,6 +62,13 @@ async fn run_http_serve(args: &HttpServeArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let check = match build_check(args) {
+        Ok(check) => check,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return ExitCode::from(2);
+        }
+    };
     let listener = match http::bind_loopback(args.bind).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -80,9 +88,13 @@ async fn run_http_serve(args: &HttpServeArgs) -> ExitCode {
         Err(code) => return code,
     };
     let shutdown = CancellationToken::new();
-    // No auth is configured yet, so every request to /mcp is refused.
-    let router = match http::mcp_router(server, &options, Arc::new(DenyAll), shutdown.clone()) {
-        Ok(router) => router,
+    let router = match http::mcp_router(server, &options, check, shutdown.clone()) {
+        Ok(router) => match (&args.oauth_issuer, &args.oauth_audience) {
+            (Some(issuer), Some(audience)) => {
+                router.merge(oauth::metadata_router(audience, issuer))
+            }
+            _ => router,
+        },
         Err(err) => {
             eprintln!("herdr-mcp: {err}");
             return ExitCode::from(2);
@@ -98,6 +110,17 @@ async fn run_http_serve(args: &HttpServeArgs) -> ExitCode {
             eprintln!("herdr-mcp: http server failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn build_check(args: &HttpServeArgs) -> Result<Arc<dyn TokenCheck>, oauth::OAuthError> {
+    match (&args.oauth_issuer, &args.oauth_audience) {
+        (Some(issuer), Some(audience)) => Ok(Arc::new(JwtCheck::new(
+            issuer,
+            audience,
+            args.owners.clone(),
+        )?)),
+        _ => Ok(Arc::new(DenyAll)),
     }
 }
 

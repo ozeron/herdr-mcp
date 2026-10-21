@@ -25,10 +25,12 @@ tokio-util = { version = "0.7.20", features = ["codec"] }
 libc = "0.2"
 toml_edit = "0.25"
 futures-util = { version = "0.3", default-features = false }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 [dev-dependencies]
 rmcp = { version = "=3.5.1", features = ["client"] }
 tempfile = "3.27.0"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+base64 = "0.22"
 tokio = { version = "1.54.0", features = ["process", "fs"] }

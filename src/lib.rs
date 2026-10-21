@@ -10,6 +10,7 @@ pub mod install;
 pub mod log;
 pub mod mailbox;
 pub mod matcher;
+pub mod oauth;
 pub mod output;
 pub mod place;
 pub mod print_config;

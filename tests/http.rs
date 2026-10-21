@@ -12,7 +12,7 @@ use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::herdr::SessionEnv;
 use herdr_mcp::http::{
-    self, Denied, DenyAll, HttpError, HttpOptions, MCP_PATH, TokenCheck, bind_loopback,
+    self, CheckFuture, Denied, DenyAll, HttpError, HttpOptions, MCP_PATH, TokenCheck, bind_loopback,
 };
 use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
@@ -28,12 +28,13 @@ const TOKEN: &str = "test-token";
 struct FixedToken;
 
 impl TokenCheck for FixedToken {
-    fn check(&self, bearer: Option<&str>) -> Result<(), Denied> {
-        if bearer == Some(TOKEN) {
+    fn check<'a>(&'a self, bearer: Option<&'a str>) -> CheckFuture<'a> {
+        let result = if bearer == Some(TOKEN) {
             Ok(())
         } else {
             Err(Denied)
-        }
+        };
+        Box::pin(async move { result })
     }
 }
 
