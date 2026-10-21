@@ -85,13 +85,20 @@ impl TunnelEnv {
     }
 }
 
-/// A tunnel ID is `tunnel_` plus a non-empty rest without whitespace.
+/// The shape `tunnel-client` itself accepts: `tunnel_` plus 32 lowercase letters or digits.
 pub fn validate_tunnel_id(raw: &str) -> Result<&str, TunnelError> {
     let id = raw.trim();
     match id.strip_prefix("tunnel_") {
-        Some(rest) if !rest.is_empty() && !id.contains(char::is_whitespace) => Ok(id),
+        Some(rest)
+            if rest.len() == 32
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) =>
+        {
+            Ok(id)
+        }
         _ => Err(TunnelError::new(
-            "a tunnel ID looks like tunnel_ followed by letters and digits",
+            "a tunnel ID is tunnel_ followed by 32 lowercase letters or digits",
         )),
     }
 }

@@ -10,7 +10,7 @@ use herdr_mcp::tunnel::{TunnelEnv, prepare_run, setup, validate_tunnel_id};
 use tempfile::TempDir;
 
 const KEY: &str = "sk-test-runtime-key-123";
-const ID: &str = "tunnel_abc123";
+const ID: &str = "tunnel_0123456789abcdef0123456789abcdef";
 
 struct Sandbox {
     _tmp: TempDir,
@@ -129,14 +129,18 @@ fn prepared(env: &TunnelEnv, session: Option<&str>) -> Command {
 
 #[test]
 fn validator_accepts_prefixed_ids_and_rejects_the_rest() {
-    assert_eq!(validate_tunnel_id("tunnel_abc\n").unwrap(), "tunnel_abc");
+    assert_eq!(validate_tunnel_id(&format!("{ID}\n")).unwrap(), ID);
     for bad in [
         "",
         "tunnel_",
         "abc",
-        "Tunnel_abc",
-        "tunnel_a b",
-        "tunnel-abc",
+        "tunnel_abc",
+        "Tunnel_0123456789abcdef0123456789abcdef",
+        "tunnel_0123456789ABCDEF0123456789abcdef",
+        "tunnel_0123456789abcdef0123456789abcde",
+        "tunnel_0123456789abcdef0123456789abcdef0",
+        "tunnel_0123456789abcdef 123456789abcdef",
+        "tunnel-0123456789abcdef0123456789abcdef",
         " ",
     ] {
         assert!(validate_tunnel_id(bad).is_err(), "{bad:?} must be rejected");
