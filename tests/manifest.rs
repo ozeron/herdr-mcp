@@ -97,8 +97,8 @@ fn every_command_runs_bin_herdr_mcp_with_a_subcommand_it_accepts() {
         .chain(tables(&doc, "panes"))
         .collect();
     assert!(
-        entries.len() >= 9,
-        "status, install, install-control, remove, tunnel-setup, tunnel-start-full, tunnel-start, tunnel-stop, tunnel-status"
+        entries.len() >= 10,
+        "status, install, install-control, remove, tunnel-setup, tunnel-start-full, tunnel-start, tunnel-stop, tunnel-status, tunnel-doctor"
     );
     for entry in entries {
         let id = text(entry, "id");
@@ -131,11 +131,12 @@ fn install_and_remove_open_a_pane_because_actions_have_no_tty() {
     }
     for action in tables(&doc, "actions") {
         let words = bridge_argv(&argv(action));
-        let allowed: [&[&str]; 4] = [
+        let allowed: [&[&str]; 5] = [
             &["install", "--status"],
             &["tunnel", "start"],
             &["tunnel", "stop"],
             &["tunnel", "status"],
+            &["tunnel", "doctor"],
         ];
         assert!(
             allowed.iter().any(|ok| words[1..] == **ok),
@@ -176,6 +177,7 @@ fn tunnel_entries_cover_start_full_start_read_stop_and_status() {
     assert_eq!(flags("tunnel-start"), ["tunnel", "start"]);
     assert_eq!(flags("tunnel-stop"), ["tunnel", "stop"]);
     assert_eq!(flags("tunnel-status"), ["tunnel", "status"]);
+    assert_eq!(flags("tunnel-doctor"), ["tunnel", "doctor"]);
     assert_eq!(flags("tunnel-start-full"), ["tunnel", "start", "--full"]);
     assert!(
         actions.iter().all(|a| text(a, "id") != "tunnel-start-full"),

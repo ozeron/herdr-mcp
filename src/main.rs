@@ -167,6 +167,12 @@ fn run_tunnel(command: &TunnelCommand) -> ExitCode {
         }
         TunnelCommand::Stop => tunnel::stop(&env, &SystemRunner, &mut io),
         TunnelCommand::Status => tunnel::status(&env, &SystemRunner, &mut io),
+        TunnelCommand::Doctor => tunnel::doctor(
+            &env,
+            &SystemRunner,
+            &tunnel::DoctorOptions::default(),
+            &mut io,
+        ),
         TunnelCommand::Log(args) => tunnel::log(&env, args.lines, &mut io),
         TunnelCommand::Run(args) => {
             let options = RunOptions {

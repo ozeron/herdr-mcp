@@ -14,6 +14,9 @@ use crate::audit::{self, iso8601, unix_now};
 use crate::env::{env_nonempty, env_nonempty_string};
 use crate::install::{Io, shim_path_in};
 
+mod doctor;
+pub use doctor::{DoctorOptions, doctor};
+
 pub const KEYCHAIN_SERVICE: &str = "herdr-mcp-tunnel";
 pub const KEYCHAIN_ACCOUNT: &str = "runtime-key";
 pub const KEY_ENV: &str = "CONTROL_PLANE_API_KEY";
@@ -338,16 +341,11 @@ pub fn build_command(
     command
 }
 
-fn read_key(env: &TunnelEnv) -> Result<String, TunnelError> {
-    if let Some(key) = &env.api_key {
-        return Ok(key.clone());
-    }
-    let missing = || {
-        TunnelError::new(format!(
-            "no runtime key: set {KEY_ENV} or run `herdr-mcp tunnel setup`"
-        ))
+/// The key stored in the Keychain, if any.
+fn keychain_key(env: &TunnelEnv) -> Result<Option<String>, TunnelError> {
+    let Some(security) = env.on_path("security") else {
+        return Ok(None);
     };
-    let security = env.on_path("security").ok_or_else(missing)?;
     let output = Command::new(security)
         .args([
             "find-generic-password",
@@ -362,11 +360,20 @@ fn read_key(env: &TunnelEnv) -> Result<String, TunnelError> {
         .output()
         .map_err(|err| TunnelError::new(format!("security: {err}")))?;
     let key = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if output.status.success() && !key.is_empty() {
-        Ok(key)
-    } else {
-        Err(missing())
+    Ok((output.status.success() && !key.is_empty()).then_some(key))
+}
+
+fn missing_key() -> TunnelError {
+    TunnelError::new(format!(
+        "no runtime key: set {KEY_ENV} or run `herdr-mcp tunnel setup`"
+    ))
+}
+
+fn read_key(env: &TunnelEnv) -> Result<String, TunnelError> {
+    if let Some(key) = &env.api_key {
+        return Ok(key.clone());
     }
+    keychain_key(env)?.ok_or_else(missing_key)
 }
 
 fn read_tunnel_id(env: &TunnelEnv) -> Result<String, TunnelError> {
@@ -440,27 +447,95 @@ fn save_tunnel_id(env: &TunnelEnv, id: &str) -> Result<(), TunnelError> {
     writeln!(file, "{id}").map_err(fail)
 }
 
-fn store_key(env: &TunnelEnv) -> Result<(), TunnelError> {
+const MIN_KEY_LEN: usize = 40;
+
+/// A key that looks whole: `sk-`, long enough, and only the characters OpenAI keys use.
+fn validate_key(raw: &str) -> Result<&str, TunnelError> {
+    let key = raw.trim();
+    let charset = key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if key.starts_with("sk-") && key.len() >= MIN_KEY_LEN && charset {
+        Ok(key)
+    } else {
+        Err(TunnelError::new(format!(
+            "that is not a whole runtime key: paste the whole key (sk-..., at least {MIN_KEY_LEN} characters, letters, digits, - and _ only)"
+        )))
+    }
+}
+
+/// Turns terminal echo off on stdin while alive, when stdin is a terminal.
+struct EchoOff(Option<libc::termios>);
+
+impl EchoOff {
+    fn new() -> Self {
+        // SAFETY: termios is plain data and tcgetattr/tcsetattr only read or write the struct we pass.
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut saved) != 0 {
+                return Self(None);
+            }
+            let mut quiet = saved;
+            quiet.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(0, libc::TCSANOW, &quiet) != 0 {
+                return Self(None);
+            }
+            Self(Some(saved))
+        }
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.0 {
+            // SAFETY: restores the attributes tcgetattr returned.
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, saved) };
+        }
+    }
+}
+
+fn read_secret(io: &mut Io) -> std::io::Result<String> {
+    let echo = EchoOff::new();
+    let mut line = String::new();
+    let result = io.input.read_line(&mut line);
+    let hidden = echo.0.is_some();
+    drop(echo);
+    if hidden {
+        let _ = writeln!(io.out);
+    }
+    result.map(|_| line)
+}
+
+/// Stores the key through `security -i`, so it travels on stdin: no argv exposure, no prompt length limit.
+fn store_key(env: &TunnelEnv, key: &str) -> Result<(), TunnelError> {
     let security = env
         .on_path("security")
         .ok_or_else(|| TunnelError::new("security not found; the Keychain is macOS only"))?;
-    // `-w` last makes security prompt for the secret on the terminal itself.
-    let status = Command::new(security)
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-        ])
-        .status()
+    let mut child = Command::new(security)
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|err| TunnelError::new(format!("security: {err}")))?;
-    if status.success() {
+    let command = format!(
+        "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w \"{key}\"\n"
+    );
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(command.as_bytes())
+            .map_err(|err| TunnelError::new(format!("security: {err}")))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|err| TunnelError::new(format!("security: {err}")))?;
+    if !status.success() {
+        return Err(TunnelError::new("security did not store the key"));
+    }
+    if keychain_key(env)?.as_deref() == Some(key) {
         Ok(())
     } else {
-        Err(TunnelError::new("security did not store the key"))
+        Err(TunnelError::new("the Keychain stored a different key"))
     }
 }
 
@@ -501,10 +576,14 @@ fn try_setup(env: &TunnelEnv, io: &mut Io) -> Result<i32, TunnelError> {
     let id = validate_tunnel_id(&line)?;
     let _ = writeln!(
         io.out,
-        "Paste the runtime key (restricted, Tunnels Read+Use) when the Keychain asks. It goes straight to the Keychain, not through herdr-mcp."
+        "Paste the runtime key (restricted, Tunnels Read+Use). It goes into the Keychain and is never printed or logged."
     );
+    let _ = write!(io.out, "Runtime key (sk-...): ");
     let _ = io.out.flush();
-    store_key(env)?;
+    let raw = read_secret(io)
+        .map_err(|err| TunnelError::new(format!("cannot read the runtime key: {err}")))?;
+    let key = validate_key(&raw)?;
+    store_key(env, key)?;
     save_tunnel_id(env, id)?;
     let _ = writeln!(
         io.out,
@@ -725,6 +804,53 @@ fn last_error(env: &TunnelEnv) -> Option<String> {
         .filter(|line| !line.trim().is_empty())
 }
 
+/// `code` as a number of its own, so a port like 54012 does not count as a 401.
+fn has_status_code(line: &str, code: &str) -> bool {
+    line.match_indices(code).any(|(at, _)| {
+        let before = line[..at].bytes().next_back();
+        let after = line.as_bytes().get(at + code.len());
+        !before.is_some_and(|b| b.is_ascii_digit()) && !after.is_some_and(u8::is_ascii_digit)
+    })
+}
+
+fn is_auth_failure(line: &str) -> bool {
+    has_status_code(line, "401") || line.contains("invalid_api_key")
+}
+
+fn is_auth_success(line: &str) -> bool {
+    line.contains("tunnel metadata fetched") || line.contains("tunnel-client started")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Auth {
+    Accepted,
+    Rejected,
+    Unknown,
+}
+
+/// What the append-only error log says about the key: whichever of rejection and success came last.
+fn auth_in_log(lines: &[String]) -> Auth {
+    let bad = lines.iter().rposition(|line| is_auth_failure(line));
+    let good = lines.iter().rposition(|line| is_auth_success(line));
+    match (bad, good) {
+        (Some(bad), Some(good)) if bad < good => Auth::Accepted,
+        (Some(_), _) => Auth::Rejected,
+        (None, Some(_)) => Auth::Accepted,
+        (None, None) => Auth::Unknown,
+    }
+}
+
+fn err_log_lines(env: &TunnelEnv) -> Vec<String> {
+    fs::read(env.state_dir().join("tunnel.err.log"))
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn report(io: &mut Io, result: Result<i32, TunnelError>) -> i32 {
     match result {
         Ok(code) => code,
@@ -930,6 +1056,14 @@ fn try_status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> Result<i32, 
         ),
     };
     let _ = writeln!(io.out, "service:   {service}");
+    if matches!(job, JobState::Running | JobState::Loaded)
+        && auth_in_log(&err_log_lines(env)) == Auth::Rejected
+    {
+        let _ = writeln!(
+            io.out,
+            "auth:      FAILING (401 invalid_api_key) - run herdr-mcp tunnel doctor"
+        );
+    }
     if let Some(state) = &state {
         let when = |key: &str| state[key].as_u64().map(iso8601);
         let text = |key: &str| state[key].as_str().map(str::to_owned);

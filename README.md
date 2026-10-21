@@ -152,7 +152,7 @@ herdr plugin update herdr-mcp
 ```sh
 herdr-mcp tunnel setup
 ```
-The ID goes to `~/.config/herdr-mcp/tunnel` (or under `$XDG_CONFIG_HOME`). The Keychain prompts for the key; it never passes through herdr-mcp and never reaches the LaunchAgent file.
+The ID goes to `~/.config/herdr-mcp/tunnel` (or under `$XDG_CONFIG_HOME`). Setup asks for the tunnel ID, then the key with the terminal echo off. The key goes into the Keychain through `security -i` on stdin, so it never appears in a process list or the LaunchAgent file, and setup reads it back to check it was stored whole. It is never printed or logged.
 
 **4. Start it**
 ```sh
@@ -161,7 +161,7 @@ herdr-mcp tunnel start --full          # control tools, after a typed disclosure
 herdr-mcp tunnel start --for 8h        # stop by itself after 30m, 8h, 2d...
 herdr-mcp tunnel start --session work  # begin in a named Herdr session
 ```
-There is no time limit unless you pass `--for`. `--full` prints what ChatGPT will be able to do and starts only if you type `full access`. The mode is fixed at start; ChatGPT cannot change it. The plugin has the same entries: start (read), start (full access), stop and status.
+There is no time limit unless you pass `--for`. `--full` prints what ChatGPT will be able to do and starts only if you type `full access`. The mode is fixed at start; ChatGPT cannot change it. The plugin has the same entries: start (read), start (full access), stop, status and doctor.
 
 **5. Connect ChatGPT**
 Plugins, +, Add custom MCP server, Connection: Tunnel, pick your tunnel, keep it private to you. Accept the risk warning and create it as a plugin. A workspace admin must allow custom MCP servers first.
@@ -172,9 +172,14 @@ Ask ChatGPT to call `herdr_sessions` to see your Herdr sessions and `herdr_use_s
 **7. Stop, check, kill switches**
 ```sh
 herdr-mcp tunnel status      # running or not, mode, started, expires, last 5 audit lines
+herdr-mcp tunnel doctor      # PASS/FAIL/WARN per check, with a fix for each failure
 herdr-mcp tunnel log -n 100  # the audit log
 herdr-mcp tunnel stop        # boot out the LaunchAgent and remove it
 ```
+`tunnel doctor` checks the client, tunnel ID, key (type and length, never the value), the bridge, whether OpenAI accepts the key, the service and the tunnel's health. With no service loaded it briefly connects with `tunnel-client`, which takes the tunnel for a few seconds, so do not run it while another client serves the same tunnel. It exits 1 if anything fails. The plugin has the same action.
+
+If ChatGPT says "denied access", the tunnel usually is not connected: run `herdr-mcp tunnel doctor`. A 401 from OpenAI means the stored key is wrong or was cut short; rerun `herdr-mcp tunnel setup`.
+
 Other ways to stop it:
 - ask ChatGPT to call `herdr_tunnel_stop` (present only behind the tunnel);
 - disable the plugin in ChatGPT;

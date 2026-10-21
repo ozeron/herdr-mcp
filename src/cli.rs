@@ -73,6 +73,8 @@ pub enum TunnelCommand {
     Stop,
     /// Show whether the background tunnel runs, its mode, expiry and recent audit lines
     Status,
+    /// Check everything ChatGPT needs: client, ID, key, bridge, OpenAI auth and the service
+    Doctor,
     /// Print the tunnel audit log
     Log(TunnelLogArgs),
 }

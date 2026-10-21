@@ -1,15 +1,17 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use herdr_mcp::install::Io;
 use herdr_mcp::tunnel::{
-    JobState, RunOptions, Runner, StartOptions, TunnelEnv, log, parse_duration, parse_job_state,
-    prepare_run, setup, start, status, stop, validate_tunnel_id,
+    DoctorOptions, JobState, RunOptions, Runner, StartOptions, TunnelEnv, doctor, log,
+    parse_duration, parse_job_state, prepare_run, setup, start, status, stop, validate_tunnel_id,
 };
 use tempfile::TempDir;
 
@@ -330,25 +332,64 @@ fn setup_without_a_tty_errors_and_writes_nothing() {
     assert!(!sandbox.root.join("xdg/herdr-mcp/tunnel").exists());
 }
 
+const SETUP_KEY: &str = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcdefgh";
+
+impl Sandbox {
+    /// A fake `security`: records argv and the stdin of `-i`, and answers `find-generic-password`
+    /// with `readback`, or with the key it was last given when `readback` is `None`.
+    fn fake_security(&self, readback: Option<&str>) {
+        let rec = self.record("security");
+        let stdin = self.root.join("security.stdin");
+        let stored = self.root.join("security.stored");
+        let find = match readback {
+            Some(text) => format!("printf '%s\\n' '{text}'"),
+            None => format!("cat '{}'", stored.display()),
+        };
+        let script = format!(
+            "#!/bin/sh\necho \"argv:$*\" >> '{rec}'\ncase \"$1\" in\n-i) cat >> '{stdin}'; sed -n 's/.* -w \"\\(.*\\)\"$/\\1/p' '{stdin}' | tail -n 1 > '{stored}' ;;\nfind-generic-password) {find} ;;\nesac\nexit 0\n",
+            rec = rec.display(),
+            stdin = stdin.display(),
+            stored = stored.display(),
+        );
+        let path = self.bin().join("security");
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn security_stdin(&self) -> String {
+        fs::read_to_string(self.root.join("security.stdin")).unwrap_or_default()
+    }
+}
+
+fn setup_input(key: &str) -> String {
+    format!("{ID}\n{key}\n")
+}
+
 #[test]
 fn setup_stores_the_key_via_security_and_saves_the_id_privately() {
     let sandbox = Sandbox::new();
-    sandbox.fake("security", "", 0);
+    sandbox.fake_security(None);
     let env = sandbox.env();
-    let run = drive(true, &format!("{ID}\n"), |io| setup(&env, io));
+    let run = drive(true, &setup_input(SETUP_KEY), |io| setup(&env, io));
     assert_eq!(run.code, 0, "{}{}", run.out, run.err);
-    assert!(
-        sandbox
-            .recorded("security")
-            .contains("argv:add-generic-password -U -s herdr-mcp-tunnel -a runtime-key -w\n"),
-        "-w must be last so security prompts for the secret"
+    assert_eq!(
+        sandbox.recorded("security"),
+        "argv:-i\nargv:find-generic-password -s herdr-mcp-tunnel -a runtime-key -w\n"
     );
+    assert_eq!(
+        sandbox.security_stdin(),
+        format!("add-generic-password -U -s herdr-mcp-tunnel -a runtime-key -w \"{SETUP_KEY}\"\n")
+    );
+    assert!(!sandbox.recorded("security").contains(SETUP_KEY));
     let path = sandbox.root.join("xdg/herdr-mcp/tunnel");
     assert_eq!(fs::read_to_string(&path).unwrap().trim(), ID);
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    assert!(run.out.contains("Runtime key (sk-...): "), "{}", run.out);
+    assert!(!run.out.contains("when the Keychain asks"), "{}", run.out);
+    assert!(run.out.contains("goes into the Keychain"), "{}", run.out);
     for needle in [
         "Plugins",
         "Add custom MCP server",
@@ -360,6 +401,71 @@ fn setup_stores_the_key_via_security_and_saves_the_id_privately() {
     ] {
         assert!(run.out.contains(needle), "missing {needle}: {}", run.out);
     }
+}
+
+#[test]
+fn setup_stores_a_164_character_key_whole_and_never_prints_it() {
+    let sandbox = Sandbox::new();
+    sandbox.fake_security(None);
+    let env = sandbox.env();
+    let key = format!("sk-proj-{}", "aB3_-x".repeat(26));
+    assert_eq!(key.len(), 164);
+    let run = drive(true, &setup_input(&format!("  {key}  ")), |io| {
+        setup(&env, io)
+    });
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert!(
+        sandbox
+            .security_stdin()
+            .contains(&format!("-w \"{key}\"\n"))
+    );
+    assert!(!run.out.contains(&key) && !run.err.contains(&key));
+    assert!(!sandbox.recorded("security").contains(&key));
+}
+
+#[test]
+fn setup_rejects_a_key_that_is_short_or_has_a_space_or_a_quote_before_any_security_call() {
+    let long = "x".repeat(60);
+    let bad = [
+        "sk-short".to_owned(),
+        format!("sk-{}", "a".repeat(36)),
+        format!("pk-{long}"),
+        format!("sk-{long} {long}"),
+        format!("sk-{long}\"; delete-generic-password"),
+        format!("sk-{long}'"),
+        String::new(),
+    ];
+    for key in bad {
+        let sandbox = Sandbox::new();
+        sandbox.fake_security(None);
+        let env = sandbox.env();
+        let run = drive(true, &setup_input(&key), |io| setup(&env, io));
+        assert_eq!(run.code, 1, "{key:?}: {}{}", run.out, run.err);
+        assert!(run.err.contains("paste the whole key"), "{}", run.err);
+        assert!(!run.err.contains(&long) && !run.out.contains(&long));
+        assert_eq!(sandbox.recorded("security"), "", "{key:?}");
+        assert!(!sandbox.root.join("xdg/herdr-mcp/tunnel").exists());
+    }
+}
+
+#[test]
+fn setup_fails_when_the_keychain_reads_back_a_different_key() {
+    let sandbox = Sandbox::new();
+    sandbox.fake_security(Some(&SETUP_KEY[..40]));
+    let env = sandbox.env();
+    let run = drive(true, &setup_input(SETUP_KEY), |io| setup(&env, io));
+    assert_eq!(run.code, 1);
+    assert!(
+        run.err.contains("the Keychain stored a different key"),
+        "{}",
+        run.err
+    );
+    let all = format!("{}{}", run.out, run.err);
+    assert!(
+        !all.contains(SETUP_KEY) && !all.contains(&SETUP_KEY[..40]),
+        "{all}"
+    );
+    assert!(!sandbox.root.join("xdg/herdr-mcp/tunnel").exists());
 }
 
 #[test]
@@ -1031,4 +1137,573 @@ fn status_reports_a_failing_job_with_its_last_error() {
         "{}",
         run.out
     );
+}
+
+// ---- doctor ----
+
+const LONG_KEY_BODY: &str = "aB3_-x";
+
+fn proj_key(len: usize) -> String {
+    let body = len - "sk-proj-".len();
+    format!(
+        "sk-proj-{}",
+        LONG_KEY_BODY.repeat(body / 6 + 1)[..body].to_owned()
+    )
+}
+
+const RUNNING: &str =
+    "gui/501/dev.herdr-mcp.tunnel = {\n\tstate = running\n\tlast exit code = (never exited)\n}\n";
+
+/// Answers `launchctl print` with `print`, or as not loaded when that is `None`.
+struct PrintRunner(Option<&'static str>);
+
+impl Runner for PrintRunner {
+    fn run(&self, _program: &Path, _args: &[String]) -> std::io::Result<i32> {
+        Ok(i32::from(self.0.is_none()))
+    }
+
+    fn run_output(&self, program: &Path, args: &[String]) -> std::io::Result<(i32, String)> {
+        let code = self.run(program, args)?;
+        Ok((code, self.0.unwrap_or_default().to_owned()))
+    }
+}
+
+impl Sandbox {
+    /// A fake `tunnel-client`: `--version` prints `version`; `run` records argv, the pid and
+    /// whether the key is in its env, prints `lines`, then stays up until killed.
+    fn fake_client(&self, version: &str, lines: &[&str]) {
+        let rec = self.record("tunnel-client");
+        let pid = self.root.join("tunnel-client.pid");
+        let printed: String = lines
+            .iter()
+            .map(|line| format!("printf '%s\\n' '{line}'\n"))
+            .collect();
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version}'; echo second line; exit 0; fi\n{{ echo \"argv:$*\"; if [ -n \"${{CONTROL_PLANE_API_KEY+x}}\" ]; then echo key:set; else echo key:unset; fi; }} >> '{rec}'\necho $$ > '{pid}'\n{printed}exec sleep 30\n",
+            rec = rec.display(),
+            pid = pid.display()
+        );
+        let path = self.bin().join("tunnel-client");
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn probe_pid(&self) -> Option<i32> {
+        fs::read_to_string(self.root.join("tunnel-client.pid"))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    }
+
+    fn write_err_log(&self, lines: &[&str]) {
+        fs::create_dir_all(self.state_dir()).unwrap();
+        fs::write(
+            self.state_dir().join("tunnel.err.log"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    fn doctor_env(&self) -> TunnelEnv {
+        let mut env = self.env();
+        env.exe = PathBuf::from(env!("CARGO_BIN_EXE_herdr-mcp"));
+        env
+    }
+
+    /// Everything present and healthy as far as the fakes go.
+    fn doctor_ready(&self, key: &str) {
+        self.fake_client("tunnel-client 1.2.3", &[]);
+        self.fake_security(Some(key));
+        self.save_id(ID);
+    }
+}
+
+fn options(probe_ms: u64) -> DoctorOptions {
+    DoctorOptions {
+        probe_timeout: Duration::from_millis(probe_ms),
+        ..DoctorOptions::default()
+    }
+}
+
+fn run_doctor(env: &TunnelEnv, runner: &dyn Runner, options: &DoctorOptions) -> Run {
+    drive(false, "", |io| doctor(env, runner, options, io))
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A localhost server for the two health GETs the doctor makes.
+fn serve_health(mcp_body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = if request.starts_with(b"GET /readyz") {
+                "ready"
+            } else {
+                mcp_body
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+fn has_line(out: &str, tag: &str, needle: &str) -> bool {
+    out.lines()
+        .any(|line| line.starts_with(tag) && line.contains(needle))
+}
+
+#[test]
+fn doctor_checks_client_id_and_key_and_never_prints_the_key() {
+    let sandbox = Sandbox::new();
+    let key = proj_key(164);
+    sandbox.doctor_ready(&key);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(
+        has_line(&run.out, "PASS", "tunnel-client 1.2.3 ("),
+        "{}",
+        run.out
+    );
+    assert!(!run.out.contains("second line"), "{}", run.out);
+    assert!(
+        has_line(&run.out, "PASS", &format!("tunnel ID: {ID}")),
+        "{}",
+        run.out
+    );
+    assert!(
+        has_line(&run.out, "PASS", "Keychain, sk-proj- key, 164 characters"),
+        "{}",
+        run.out
+    );
+    assert!(!run.out.contains(&key) && !run.err.contains(&key));
+}
+
+#[test]
+fn doctor_warns_when_the_key_is_exactly_128_characters() {
+    let sandbox = Sandbox::new();
+    let key = proj_key(128);
+    sandbox.doctor_ready("unused");
+    let mut env = sandbox.doctor_env();
+    env.api_key = Some(key.clone());
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "WARN",
+            "CONTROL_PLANE_API_KEY, sk-proj- key, 128 characters; looks truncated"
+        ),
+        "{}",
+        run.out
+    );
+    assert!(
+        run.out.contains("fix: rerun `herdr-mcp tunnel setup`"),
+        "{}",
+        run.out
+    );
+    assert!(!run.out.contains(&key));
+}
+
+#[test]
+fn doctor_fails_with_fixes_when_client_id_and_key_are_missing() {
+    let sandbox = Sandbox::new();
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(100));
+    assert_eq!(run.code, 1, "{}", run.out);
+    assert!(
+        has_line(&run.out, "FAIL", "tunnel-client: not found"),
+        "{}",
+        run.out
+    );
+    assert!(
+        run.out
+            .contains("fix: brew install openai/tools/tunnel-client")
+    );
+    assert!(
+        has_line(&run.out, "FAIL", "tunnel ID: no tunnel ID saved"),
+        "{}",
+        run.out
+    );
+    assert!(
+        has_line(&run.out, "FAIL", "runtime key: none"),
+        "{}",
+        run.out
+    );
+    assert!(run.out.contains("fix: run `herdr-mcp tunnel setup`"));
+    assert!(
+        has_line(&run.out, "WARN", "OpenAI key check: skipped"),
+        "{}",
+        run.out
+    );
+}
+
+#[test]
+fn doctor_asks_the_real_bridge_for_its_tools() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(has_line(&run.out, "PASS", "answers MCP, "), "{}", run.out);
+    assert!(run.out.contains(" read tools"), "{}", run.out);
+    // The bridge got a scratch HOME and state dir, so it left nothing in the sandbox's.
+    assert!(!sandbox.home().join(".config").exists());
+    assert!(!sandbox.state_dir().exists());
+}
+
+#[test]
+fn doctor_fails_when_the_bridge_does_not_exist() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let env = sandbox.env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "FAIL",
+            "bridge: /opt/herdr/bin/herdr-mcp does not exist"
+        ),
+        "{}",
+        run.out
+    );
+    assert_eq!(run.code, 1);
+}
+
+#[test]
+fn doctor_reads_a_newest_401_in_the_log_as_a_rejected_key() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    sandbox.write_err_log(&[
+        "tunnel-client started",
+        "tunnel metadata fetched",
+        "poll failed: 401 invalid_api_key",
+    ]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(Some(RUNNING)), &options(1500));
+    assert_eq!(run.code, 1, "{}", run.out);
+    assert!(
+        has_line(&run.out, "FAIL", "OpenAI rejected the key (401)"),
+        "{}",
+        run.out
+    );
+    assert_eq!(
+        sandbox.recorded("tunnel-client"),
+        "",
+        "no probe while the service runs"
+    );
+}
+
+#[test]
+fn doctor_reads_a_newest_fetch_in_the_log_as_an_accepted_key() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    sandbox.write_err_log(&[
+        "poll failed: 401 invalid_api_key",
+        "listening on http://127.0.0.1:40123",
+        "tunnel metadata fetched",
+    ]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(Some(RUNNING)), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "PASS",
+            "OpenAI accepted the key; tunnel connected"
+        ),
+        "{}",
+        run.out
+    );
+    assert_eq!(sandbox.recorded("tunnel-client"), "");
+}
+
+#[test]
+fn a_port_that_contains_401_is_not_an_auth_failure() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    sandbox.write_err_log(&[
+        "tunnel-client started",
+        "listening on http://127.0.0.1:54012",
+    ]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(Some(RUNNING)), &options(1500));
+    assert!(
+        has_line(&run.out, "PASS", "OpenAI accepted the key"),
+        "{}",
+        run.out
+    );
+}
+
+#[test]
+fn doctor_without_a_service_probes_and_passes_on_a_metadata_line_then_kills_it() {
+    let sandbox = Sandbox::new();
+    let key = proj_key(164);
+    sandbox.doctor_ready(&key);
+    sandbox.fake_client("tunnel-client 1.2.3", &["boot", "tunnel metadata fetched"]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "PASS",
+            "OpenAI accepted the key; tunnel metadata fetched"
+        ),
+        "{}",
+        run.out
+    );
+    assert!(run.out.contains("briefly takes the tunnel"), "{}", run.out);
+    let rec = sandbox.recorded("tunnel-client");
+    assert!(
+        rec.contains(&format!(
+            "argv:run --embedded-stateless-mcp-stub --control-plane.tunnel-id {ID} --health.listen-addr 127.0.0.1:0\nkey:set"
+        )),
+        "{rec}"
+    );
+    assert!(!rec.contains(&key) && !run.out.contains(&key));
+    let pid = sandbox.probe_pid().expect("probe ran");
+    assert!(!alive(pid), "the probe must be killed");
+}
+
+#[test]
+fn doctor_probe_fails_on_401_and_403_and_warns_on_a_timeout() {
+    let cases = [
+        (
+            "tunnel-client started",
+            "HTTP 401 invalid_api_key",
+            "FAIL",
+            "rejected the key (401 invalid_api_key)",
+            1,
+        ),
+        (
+            "tunnel-client started",
+            "403 Forbidden",
+            "FAIL",
+            "the key lacks Tunnels Read+Use, or the tunnel is in another org or workspace",
+            1,
+        ),
+        (
+            "x",
+            "insufficient permission for tunnel",
+            "FAIL",
+            "the key lacks Tunnels Read+Use",
+            1,
+        ),
+    ];
+    for (_, line, tag, text, code) in cases {
+        let sandbox = Sandbox::new();
+        sandbox.doctor_ready(&proj_key(164));
+        sandbox.fake_client("tunnel-client 1.2.3", &[line]);
+        let env = sandbox.doctor_env();
+        let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+        assert!(has_line(&run.out, tag, text), "{line}: {}", run.out);
+        assert_eq!(run.code, code);
+        assert!(!alive(sandbox.probe_pid().unwrap()));
+    }
+
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let env = sandbox.doctor_env();
+    let start = std::time::Instant::now();
+    let run = run_doctor(&env, &PrintRunner(None), &options(300));
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert!(
+        has_line(&run.out, "WARN", "no answer from OpenAI within 300ms"),
+        "{}",
+        run.out
+    );
+    assert!(
+        !alive(sandbox.probe_pid().unwrap()),
+        "a timed-out probe is killed"
+    );
+}
+
+#[test]
+fn doctor_probe_reports_a_client_that_exits_early() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let script =
+        "#!/bin/sh\n[ \"$1\" = --version ] && echo v1 && exit 0\necho 'unknown flag' >&2\nexit 3\n";
+    let path = sandbox.bin().join("tunnel-client");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "FAIL",
+            "tunnel-client exited (code 3) before connecting: unknown flag"
+        ),
+        "{}",
+        run.out
+    );
+}
+
+#[test]
+fn doctor_reports_the_service_state_and_warns_when_it_is_not_running() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(None), &options(1500));
+    assert!(
+        has_line(&run.out, "WARN", "service: not loaded"),
+        "{}",
+        run.out
+    );
+    assert!(run.out.contains("fix: run `herdr-mcp tunnel start`"));
+    let failing = "\tstate = waiting\n\tlast exit code = 1\n";
+    sandbox.write_err_log(&["herdr-mcp: boom"]);
+    let run = run_doctor(&env, &PrintRunner(Some(failing)), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "WARN",
+            "service: failing (last exit 1): herdr-mcp: boom"
+        ),
+        "{}",
+        run.out
+    );
+}
+
+#[test]
+fn doctor_checks_the_tunnels_health_endpoints_when_the_service_runs() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let port = serve_health(
+        r#"{"component":"mcp","status":"ok","state":"observed","details":{"channel":"main","transport":"stdio","initialize":{"ok":true},"tools_list":{"ok":true,"tool_names":["a","b","c","d","e","f","g"]}}}"#,
+    );
+    sandbox.write_err_log(&[
+        "tunnel metadata fetched",
+        &format!("health listening on http://127.0.0.1:{port}"),
+    ]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(Some(RUNNING)), &options(1500));
+    assert!(
+        has_line(&run.out, "PASS", "service: running"),
+        "{}",
+        run.out
+    );
+    assert!(
+        has_line(&run.out, "PASS", &format!("/readyz on port {port}")),
+        "{}",
+        run.out
+    );
+    assert!(
+        has_line(&run.out, "PASS", "initialize ok, tools/list ok, 7 tools"),
+        "{}",
+        run.out
+    );
+    assert_eq!(run.code, 0, "{}", run.out);
+}
+
+#[test]
+fn doctor_treats_not_observed_as_fine() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    // The shape tunnel-client 0.0.16 returned before any ChatGPT call.
+    let port = serve_health(
+        r#"{"schema_version":1,"component":"mcp","status":"unknown","state":"not_observed","limited":false,"details":{"channel":"main","transport":"stdio","child_state":"running","initialize":{"ok":false,"identity_complete":false,"limited":false,"capability_names":[]},"tools_list":{"ok":false,"tool_names":[],"retained_count":0,"complete":false}}}"#,
+    );
+    sandbox.write_err_log(&[
+        "tunnel metadata fetched",
+        &format!("health on http://127.0.0.1:{port}"),
+    ]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(Some(RUNNING)), &options(1500));
+    assert!(
+        has_line(
+            &run.out,
+            "PASS",
+            "initialize not observed, tools/list not observed (ChatGPT has not called yet)"
+        ),
+        "{}",
+        run.out
+    );
+}
+
+#[test]
+fn doctor_fails_when_the_health_port_is_closed() {
+    let sandbox = Sandbox::new();
+    sandbox.doctor_ready(&proj_key(164));
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    sandbox.write_err_log(&[
+        "tunnel metadata fetched",
+        &format!("health on http://127.0.0.1:{closed}"),
+    ]);
+    let env = sandbox.doctor_env();
+    let run = run_doctor(&env, &PrintRunner(Some(RUNNING)), &options(1500));
+    assert!(has_line(&run.out, "FAIL", "/readyz"), "{}", run.out);
+    assert_eq!(run.code, 1);
+}
+
+#[test]
+fn status_flags_a_401_as_the_newest_auth_line_while_the_service_runs() {
+    let sandbox = Sandbox::new();
+    sandbox.write_err_log(&[
+        "tunnel metadata fetched",
+        "poll failed: 401 invalid_api_key",
+    ]);
+    let env = sandbox.env();
+    let run = drive(false, "", |io| {
+        status(&env, &PrintRunner(Some(RUNNING)), io)
+    });
+    assert!(
+        run.out
+            .contains("auth:      FAILING (401 invalid_api_key) - run herdr-mcp tunnel doctor"),
+        "{}",
+        run.out
+    );
+
+    sandbox.write_err_log(&[
+        "poll failed: 401 invalid_api_key",
+        "tunnel metadata fetched",
+    ]);
+    let run = drive(false, "", |io| {
+        status(&env, &PrintRunner(Some(RUNNING)), io)
+    });
+    assert!(!run.out.contains("auth:"), "{}", run.out);
+
+    sandbox.write_err_log(&["poll failed: 401 invalid_api_key"]);
+    let run = drive(false, "", |io| status(&env, &PrintRunner(None), io));
+    assert!(!run.out.contains("auth:"), "not loaded: {}", run.out);
+}
+
+#[test]
+fn end_to_end_doctor_exits_zero_when_nothing_fails_and_non_zero_otherwise() {
+    let sandbox = Sandbox::new();
+    sandbox.fake_launchctl(false);
+    sandbox.fake_client("tunnel-client 1.2.3", &["tunnel metadata fetched"]);
+    sandbox.fake_security(Some(&proj_key(164)));
+    sandbox.save_id(ID);
+    let output = sandbox.herdr_mcp(&["tunnel", "doctor"], None);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        out.contains("PASS  tunnel-client: tunnel-client 1.2.3"),
+        "{out}"
+    );
+
+    let empty = Sandbox::new();
+    empty.fake_launchctl(false);
+    let output = empty.herdr_mcp(&["tunnel", "doctor"], None);
+    assert_eq!(output.status.code(), Some(1));
 }

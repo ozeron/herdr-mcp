@@ -74,3 +74,10 @@ title = "Herdr MCP: ChatGPT tunnel (status)"
 description = "Show whether the tunnel runs, its mode, expiry and the last audit lines. Writes nothing."
 contexts = ["global"]
 command = ["bin/herdr-mcp", "tunnel", "status"]
+
+[[actions]]
+id = "tunnel-doctor"
+title = "Herdr MCP: ChatGPT tunnel (doctor)"
+description = "Check the tunnel client, ID, key, bridge, OpenAI auth and service. Writes nothing."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "doctor"]
