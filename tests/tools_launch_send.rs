@@ -1640,14 +1640,116 @@ async fn auto_to_an_idle_agent_starts_a_turn() {
 }
 
 #[tokio::test]
-async fn auto_to_a_working_agent_is_busy_and_sends_nothing() {
+async fn auto_to_a_working_claude_queues_the_prompt() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
+    screens(&h.fake, &[QUEUED_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next task"}),
+    )
+    .await;
+
+    assert_eq!(out["mode"], "auto");
+    assert_eq!(out["result"], "queued");
+    assert_eq!(out["delivery"], "queued");
+    assert!(out["turn"].is_null());
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+}
+
+#[tokio::test]
+async fn auto_to_a_working_codex_waits_for_idle_then_sends() {
+    let h = start(Opts::default()).await;
+    script_send(
+        &h.fake,
+        Some("w1:p1"),
+        vec![rev("working", 3), rev("working", 3), rev("done", 4)],
+    );
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next", "timeout_ms": 5000}),
+    )
+    .await;
+
+    assert_eq!(out["mode"], "auto");
+    assert_eq!(out["result"], "sent_after_idle");
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+}
+
+#[tokio::test]
+async fn auto_to_a_codex_that_never_idles_is_not_sent() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev("working", 3)]);
 
-    let out = err(&h, "herdr_send", json!({"target": "rev", "prompt": "next"})).await;
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next", "timeout_ms": 60}),
+    )
+    .await;
 
-    assert_eq!(out["code"], "busy");
-    assert_eq!(out["status"], "working");
+    assert_eq!(out["code"], "not_sent");
+    assert_nothing_typed(&h.fake);
+}
+
+#[tokio::test]
+async fn wait_turn_returns_the_settled_turn_with_its_excerpt() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3), rev("done", 6)]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "wait": "turn"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "started");
+    assert_eq!(out["matched"], true);
+    assert_eq!(out["timed_out"], false);
+    assert_eq!(out["status"], "done");
+    assert!(out["excerpt"].is_string(), "{out}");
+    assert_eq!(out["turn"]["after"], 5);
+    assert_eq!(out["pane"], "w1:p4");
+}
+
+#[tokio::test]
+async fn wait_turn_on_a_queued_prompt_returns_at_once() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
+    screens(&h.fake, &[QUEUED_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next task", "wait": "turn"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "queued");
+    assert!(out.get("matched").is_none());
+}
+
+#[tokio::test]
+async fn wait_is_refused_for_text_and_keys() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "text": "hi", "wait": "turn"}),
+    )
+    .await;
+
+    assert!(
+        out.to_string().contains("wait applies to a prompt"),
+        "{out}"
+    );
     assert_nothing_typed(&h.fake);
 }
 
@@ -1692,7 +1794,7 @@ async fn cancel_while_waiting_for_idle_sends_nothing() {
         });
 
         let began = Instant::now();
-        let result = send::run(&inner, None, &cancel, params).await;
+        let result = send::run(&inner, None, &cancel, None, params).await;
         task.await.unwrap();
 
         let err = result.unwrap_err();

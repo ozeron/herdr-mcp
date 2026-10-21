@@ -427,6 +427,84 @@ async fn list_filters_match_pruning_the_unfiltered_tree() {
 }
 
 #[tokio::test]
+async fn list_tail_adds_each_panes_last_lines() {
+    let h = start(Some("w1:p1")).await;
+    script_tree(&h.fake);
+    h.fake.reply_params(
+        "agent.read",
+        json!({"target": "w2:p1"}),
+        read_result("w2:p1", "one\n\ntwo\nthree\n"),
+    );
+    h.fake.on_params(
+        "agent.read",
+        json!({}),
+        Script::error("agent_not_found", "no agent"),
+    );
+    h.fake.reply_params(
+        "pane.read",
+        json!({"pane_id": "w1:p2"}),
+        read_result("w1:p2", "VITE ready\n"),
+    );
+    h.fake.on_params(
+        "pane.read",
+        json!({}),
+        Script::error("pane_not_found", "no pane"),
+    );
+
+    let list = ok(&h, "herdr_list", json!({"tail": 2})).await;
+
+    assert_eq!(find(&list, "w2:p1")["tail"], json!(["two", "three"]));
+    assert_eq!(find(&list, "w1:p2")["tail"], json!(["VITE ready"]));
+    assert!(find(&list, "w1:p3").get("tail").is_none());
+    let lines: Vec<Value> = h
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|r| r["method"] == "agent.read" && r["params"]["target"] == "w2:p1")
+        .map(|r| r["params"]["lines"].clone())
+        .collect();
+    assert_eq!(lines, [json!(8)]);
+}
+
+#[tokio::test]
+async fn list_without_tail_reads_no_pane() {
+    let h = start(Some("w1:p1")).await;
+    script_tree(&h.fake);
+
+    let list = ok(&h, "herdr_list", json!({})).await;
+
+    assert!(panes_of(&list).iter().all(|p| p.get("tail").is_none()));
+    assert!(
+        h.fake
+            .requests()
+            .iter()
+            .all(|r| r["method"] != "agent.read" && r["method"] != "pane.read")
+    );
+}
+
+#[tokio::test]
+async fn read_source_screen_is_the_visible_screen() {
+    let h = start(None).await;
+    h.fake.reply("agent.read", read_result("w1:p4", "screen"));
+
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "screen"}),
+    )
+    .await;
+
+    assert_eq!(read["source"], "visible");
+    let read_req = h
+        .fake
+        .requests()
+        .into_iter()
+        .find(|r| r["method"] == "agent.read")
+        .unwrap();
+    assert_eq!(read_req["params"]["source"], "visible");
+}
+
+#[tokio::test]
 async fn blocked_agent_has_a_short_reason_and_idle_agent_has_none() {
     let h = start(Some("w1:p1")).await;
     script_tree(&h.fake);

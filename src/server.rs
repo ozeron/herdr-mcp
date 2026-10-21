@@ -42,6 +42,24 @@ const CONTROL_TOOLS: [&str; 5] = [
     "herdr_close",
 ];
 
+/// Who is calling, for the audit log: set around each tool call.
+#[derive(Debug, Clone, Default)]
+struct Caller {
+    client: Option<String>,
+    mcp_session: Option<String>,
+}
+
+tokio::task_local! {
+    static CALLER: Caller;
+}
+
+/// The MCP session id an HTTP client sent, shortened: enough to tell two chats apart.
+fn mcp_session(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    let id = parts.headers.get("mcp-session-id")?.to_str().ok()?;
+    Some(id.chars().take(8).collect())
+}
+
 /// The calling client's name, as the profile's wait cap keys on it.
 fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
     ctx.client_info().map(|info| info.name)
@@ -243,12 +261,20 @@ impl HerdrMcp {
         result: Result<serde_json::Value, HerdrError>,
     ) -> Result<CallToolResult, ErrorData> {
         let elapsed = started.elapsed();
-        let (outcome, response) = match result {
-            Ok(value) => ("ok".to_owned(), tools::success(value)),
-            Err(err) => (
-                err.code().to_owned(),
-                tools::failure_with(err.code(), &err.to_string(), err.details()),
-            ),
+        let audited = self.inner.tunnel.is_some();
+        let (outcome, note, response) = match result {
+            Ok(value) => {
+                let note = if audited { note.result(&value) } else { note };
+                ("ok".to_owned(), note, tools::success(value))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                (
+                    err.code().to_owned(),
+                    note.error(&message),
+                    tools::failure_with(err.code(), &message, err.details()),
+                )
+            }
         };
         self.inner.logger.call(tool, &outcome, elapsed);
         self.audit(tool, &outcome, elapsed, &note);
@@ -258,7 +284,13 @@ impl HerdrMcp {
     fn audit(&self, tool: &str, outcome: &str, elapsed: Duration, note: &Note) {
         if let Some(tunnel) = &self.inner.tunnel {
             let session = self.inner.sessions.active().name;
-            tunnel.audit.record(tool, &session, outcome, elapsed, note);
+            let note = CALLER
+                .try_with(|caller| {
+                    note.clone()
+                        .caller(caller.client.as_deref(), caller.mcp_session.as_deref())
+                })
+                .unwrap_or_else(|_| note.clone());
+            tunnel.audit.record(tool, &session, outcome, elapsed, &note);
         }
     }
 
@@ -437,8 +469,14 @@ impl HerdrMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let note = Note::send(&params);
-        let result =
-            tools::send::run(&self.inner, client_name(&ctx).as_deref(), &ctx.ct, params).await;
+        let result = tools::send::run(
+            &self.inner,
+            client_name(&ctx).as_deref(),
+            &ctx.ct,
+            tools::progress_sink(&ctx),
+            params,
+        )
+        .await;
         self.finish("herdr_send", started, note, result)
     }
 
@@ -547,8 +585,12 @@ impl ServerHandler for HerdrMcp {
             )
             .into_call_tool_result();
         }
+        let caller = Caller {
+            client: client_name(&context),
+            mcp_session: mcp_session(&context),
+        };
         let context = ToolCallContext::new(self, request, context);
-        self.tool_router.call(context).await
+        CALLER.scope(caller, self.tool_router.call(context)).await
     }
 
     fn get_info(&self) -> ServerConfig {

@@ -1,6 +1,7 @@
 //! The tunnel audit log: one JSON line per tool call, kept apart from `herdr-mcp.log`.
 //! It deliberately holds commands, text and keys, so the file is 0600 in a 0700 directory.
-//! Pane output, read text and tool results never reach it.
+//! Pane output, read text and tool results never reach it: a result adds only a short summary
+//! (delivery, match flags, how many characters a read returned).
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -21,7 +22,7 @@ pub fn log_path(state_home: &Path) -> PathBuf {
 }
 
 /// What one call asked for: its target and the parameters worth recording.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Note {
     target: Option<String>,
     extra: Map<String, Value>,
@@ -107,6 +108,66 @@ impl Note {
     pub fn use_session(params: &sessions::UseParams) -> Self {
         Self::none().with("name", Some(json!(params.name)))
     }
+
+    /// Who called: the MCP client's name and its session, so two chats can be told apart.
+    pub fn caller(self, client: Option<&str>, mcp_session: Option<&str>) -> Self {
+        self.with("client", client.map(|c| json!(c)))
+            .with("mcp_session", mcp_session.map(|s| json!(s)))
+    }
+
+    /// A short, content-free summary of a successful result.
+    pub fn result(mut self, result: &Value) -> Self {
+        for key in SUMMARY_KEYS {
+            if let Some(item) = result.get(*key).filter(|item| is_scalar(item)) {
+                self.extra.insert((*key).to_owned(), item.clone());
+            }
+        }
+        if let Some(text) = result.get("text").and_then(Value::as_str) {
+            self.extra
+                .insert("chars".into(), json!(text.chars().count()));
+        }
+        if let Some(workspaces) = result.get("workspaces").and_then(Value::as_array) {
+            let panes = workspaces
+                .iter()
+                .flat_map(|ws| ws["tabs"].as_array().into_iter().flatten())
+                .map(|tab| tab["panes"].as_array().map_or(0, Vec::len))
+                .sum::<usize>();
+            self.extra.insert("panes".into(), json!(panes));
+        }
+        if result.get("turn").is_some_and(|turn| !turn.is_null()) {
+            self.extra.insert("turn".into(), json!(true));
+        }
+        self
+    }
+
+    /// Why a call failed, capped.
+    pub fn error(self, message: &str) -> Self {
+        self.with(
+            "error",
+            Some(json!(crate::output::truncate_head(
+                message,
+                MAX_ERROR_CHARS
+            ))),
+        )
+    }
+}
+
+/// Result fields that say what happened without carrying pane output.
+const SUMMARY_KEYS: &[&str] = &[
+    "result",
+    "delivery",
+    "source",
+    "truncated",
+    "matched",
+    "timed_out",
+    "ready_matched",
+    "phase",
+    "status",
+];
+const MAX_ERROR_CHARS: usize = 300;
+
+fn is_scalar(item: &Value) -> bool {
+    matches!(item, Value::String(_) | Value::Bool(_) | Value::Number(_))
 }
 
 #[derive(Debug, Clone)]

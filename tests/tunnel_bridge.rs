@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fake_herdr::FakeHerdr;
+use fake_herdr::{FakeHerdr, Script};
 use harness::{Harness, call, err, err_code, ok};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
@@ -184,6 +184,32 @@ async fn each_call_appends_one_json_line_with_tool_session_target_outcome_and_ms
     assert!(read["ts"].as_str().unwrap().ends_with('Z'), "{read}");
     assert_eq!(lines[1]["tool"], "herdr_sessions");
     assert!(lines[1].get("target").is_none());
+}
+
+#[tokio::test]
+async fn each_line_carries_the_client_a_result_summary_and_the_error() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    r.h.fake.reply("agent.read", read_result(SECRET));
+    ok(&r.h, "herdr_read", json!({"target": "w1:p4"})).await;
+    r.h.fake
+        .on("agent.read", Script::error("agent_not_found", "no agent"));
+    r.h.fake
+        .on("pane.read", Script::error("pane_not_found", "no pane"));
+    err_code(&r.h, "herdr_read", json!({"target": "ghost"})).await;
+
+    let lines = r.lines();
+    let read = &lines[0];
+    assert!(read["client"].is_string(), "{read}");
+    assert_eq!(read["source"], "recent");
+    assert_eq!(read["chars"], SECRET.chars().count());
+    assert!(read.get("error").is_none());
+    let failed = &lines[1];
+    assert_eq!(failed["outcome"], "target_not_found");
+    assert!(
+        failed["error"].as_str().unwrap().contains("ghost"),
+        "{failed}"
+    );
+    assert!(!r.raw().contains(SECRET), "{}", r.raw());
 }
 
 #[tokio::test]

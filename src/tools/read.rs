@@ -18,6 +18,7 @@ pub const MAX_CHARS: usize = 100_000;
 #[schemars(crate = "rmcp::schemars")]
 pub enum Source {
     Recent,
+    #[serde(alias = "screen")]
     Visible,
 }
 
@@ -35,9 +36,9 @@ impl Source {
 pub struct ReadParams {
     /// Pane ID or agent name. Defaults to the calling pane.
     pub target: Option<String>,
-    /// `recent` is scrollback; `visible` is the current screen. Default `recent`.
+    /// `recent` (default) is the latest output, scrollback included; `visible` (alias `screen`) is exactly what is on screen now.
     pub source: Option<Source>,
-    /// Lines to return. Blank lines and box-drawing rules are skipped unless `raw`. Default 80, capped at 1000.
+    /// Lines to return. Blank lines and box-drawing rules are skipped unless `raw`. Default 80, enough for an agent's latest turn; leave it unset unless you need more. Capped at 1000.
     pub lines: Option<u32>,
     /// Character cap on the returned text; the oldest output is cut first. Default 32000, capped at 100000.
     pub max_chars: Option<usize>,
@@ -77,31 +78,21 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         lines.saturating_mul(4).min(MAX_LINES)
     };
 
-    let (first, agent) = tokio::join!(read_agent(&client, &target, source, rows), async {
+    let (fetched, agent) = tokio::join!(fetch(&client, &target, source, rows), async {
         match inner.client() {
             Ok(client) => client.agent_get(&target).await.ok(),
             Err(_) => None,
         }
     });
     let status = agent.map(|agent| agent.agent_status);
-    let result = match first {
-        Err(HerdrError::Api {
-            code: ApiErrorCode::AgentNotIdle,
-            ..
-        }) if source == Source::Recent => {
-            source = Source::Visible;
-            notes.push(
-                "agent is busy in a full-screen UI, so scrollback is unavailable; returned the visible screen"
-                    .to_string(),
-            );
-            read_agent(&client, &target, source, rows).await?
-        }
-        Err(HerdrError::Api {
-            code: ApiErrorCode::AgentNotFound,
-            ..
-        }) => read_pane(&client, &target, source, rows).await?,
-        other => other?,
-    };
+    let (result, used) = fetched?;
+    if used != source {
+        source = used;
+        notes.push(
+            "agent is busy in a full-screen UI, so scrollback is unavailable; returned the visible screen"
+                .to_string(),
+        );
+    }
 
     let clean = strip_ansi(&result.text);
     let clean = if raw {
@@ -128,6 +119,38 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         out["note"] = Value::String(notes.join("; "));
     }
     Ok(out)
+}
+
+/// Reads an agent, or a plain pane when `target` is no agent. A busy full-screen agent has no
+/// scrollback, so `recent` falls back to the visible screen; the source used comes back.
+async fn fetch(
+    client: &Client,
+    target: &str,
+    source: Source,
+    rows: u32,
+) -> Result<(PaneReadResult, Source), HerdrError> {
+    match read_agent(client, target, source, rows).await {
+        Err(HerdrError::Api {
+            code: ApiErrorCode::AgentNotIdle,
+            ..
+        }) if source == Source::Recent => Ok((
+            read_agent(client, target, Source::Visible, rows).await?,
+            Source::Visible,
+        )),
+        Err(HerdrError::Api {
+            code: ApiErrorCode::AgentNotFound,
+            ..
+        }) => Ok((read_pane(client, target, source, rows).await?, source)),
+        other => Ok((other?, source)),
+    }
+}
+
+/// The last `lines` meaningful lines of a pane, for a listing; `None` when it cannot be read.
+pub async fn tail(client: &Client, target: &str, lines: u32) -> Option<Vec<String>> {
+    let rows = lines.saturating_mul(4).min(MAX_LINES);
+    let (result, _) = fetch(client, target, Source::Recent, rows).await.ok()?;
+    let text = last_meaningful(&strip_ansi(&result.text), lines as usize);
+    Some(text.lines().map(str::to_owned).collect())
 }
 
 async fn read_agent(

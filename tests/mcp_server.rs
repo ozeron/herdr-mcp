@@ -272,7 +272,13 @@ async fn a_bridge_without_a_caller_pane_serves_the_remote_instructions() {
 
     assert_ne!(local_text, remote_text);
     assert!(!local_text.contains("label_contains"));
-    for needle in ["herdr_sessions", "label_contains", "delivery", "queued"] {
+    for needle in [
+        "herdr_capabilities",
+        "tail",
+        "label_contains",
+        "wait: turn",
+        "queued",
+    ] {
         assert!(remote_text.contains(needle), "missing {needle}");
     }
 }
@@ -293,6 +299,10 @@ async fn capabilities_reports_caller_versions_and_agents() {
     assert_eq!(caps["herdr"]["version"], "0.9.3");
     assert_eq!(caps["herdr"]["protocol"], 22);
     assert_eq!(caps["wait_cap_ms"], 600_000);
+    assert!(
+        caps["sessions"].as_array().is_some_and(|s| !s.is_empty()),
+        "{caps}"
+    );
     let agents = caps["agents"].as_array().unwrap();
     let find = |kind: &str| agents.iter().find(|a| a["kind"] == kind).unwrap();
     assert_eq!(find("claude")["mcp"], "injectable");

@@ -3,6 +3,7 @@ use std::time::Duration;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +21,7 @@ use crate::tools::interrupt;
 use crate::tools::launch::visible_dialog;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::Turn;
+use crate::wait::{self, Condition, Progress, Request};
 
 pub const ACTIVITY_GATE_MS: u64 = 6000;
 
@@ -33,6 +35,16 @@ pub enum SendMode {
     Restart,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "snake_case")]
+pub enum SendWait {
+    /// Wait for the turn the prompt started to settle, bounded by the wait cap.
+    Turn,
+    /// Return once the prompt is delivered. Default.
+    None,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct SendParams {
@@ -44,8 +56,10 @@ pub struct SendParams {
     pub text: Option<String>,
     /// Raw keys to send, such as ["Enter"] or ["y"].
     pub keys: Option<Vec<String>>,
-    /// For a prompt. auto (default) refuses a working agent with busy; after_idle waits for idle, then sends; steer types into a working agent and returns no turn; restart interrupts, waits for idle, then sends.
+    /// For a prompt. auto (default) starts a turn on an idle agent; on a working agent it queues the prompt where the agent supports that (Claude Code: delivery queued), else waits for idle like after_idle. after_idle waits for idle, then sends; steer types into a working agent and returns no turn; restart interrupts, waits for idle, then sends.
     pub mode: Option<SendMode>,
+    /// For a prompt. turn waits for the turn it started to settle and returns the excerpt, bounded by the wait cap; on timed_out, pass the turn to herdr_wait. none (default) returns once delivered. A queued prompt has no turn yet, so it returns at once.
+    pub wait: Option<SendWait>,
     /// For a prompt typed into a working agent that queues it (Claude Code): submit the queued prompt now with the agent's send-now key. Interrupts the agent's current turn flow; use only when the user wants the new prompt handled immediately. Ignored, with a note, for agents without such a key.
     pub send_now: Option<bool>,
     /// Answer a blocked agent's prompt, or a startup dialog on screen, with text or keys. Only for an agent you launched; refused otherwise.
@@ -84,6 +98,11 @@ fn validate(params: &SendParams) -> Result<(), HerdrError> {
             "mode applies to a prompt, not to text or keys",
         ));
     }
+    if raw && params.wait.is_some() {
+        return Err(HerdrError::invalid_params(
+            "wait applies to a prompt, not to text or keys",
+        ));
+    }
     if raw && params.send_now.is_some() {
         return Err(HerdrError::invalid_params(
             "send_now applies to a prompt, not to text or keys",
@@ -101,9 +120,11 @@ pub async fn run(
     inner: &Inner,
     client_info_name: Option<&str>,
     ct: &CancellationToken,
+    progress: Option<UnboundedSender<Progress>>,
     params: SendParams,
 ) -> Result<Value, HerdrError> {
     validate(&params)?;
+    let started = Instant::now();
     let mut scope = Scope::open(inner)?;
     let request = TargetRequest::new(
         &params.target,
@@ -135,7 +156,7 @@ pub async fn run(
                 timeout,
             };
             let send_now = params.send_now.unwrap_or(false);
-            send_prompt(
+            let mut out = send_prompt(
                 client,
                 pane,
                 agent,
@@ -144,7 +165,12 @@ pub async fn run(
                 pacing,
                 ct,
             )
-            .await
+            .await?;
+            if params.wait == Some(SendWait::Turn) {
+                let remaining = cap.saturating_sub(started.elapsed());
+                await_turn(client, inner, &mut out, remaining, ct, progress).await?;
+            }
+            Ok(out)
         }
         None => send_raw(client, resolution, pane, is_agent, &params).await,
     }
@@ -208,14 +234,19 @@ async fn send_prompt(
         }
         SendMode::Auto => match status {
             AgentStatus::Idle | AgentStatus::Done => ("started", false),
+            AgentStatus::Working if provider(kind).queue_marker.is_some() => {
+                let mut out =
+                    steer(client, pane, prompt, status, kind, send_now, pacing.settle).await?;
+                out["mode"] = json!(SendMode::Auto);
+                out["result"] = json!(out["delivery"]);
+                return Ok(out);
+            }
             AgentStatus::Working => {
-                return Err(HerdrError::detailed(
-                    "busy",
-                    format!(
-                        "{pane} is working and nothing was sent; use mode after_idle to queue behind it, steer to type into it, or restart"
-                    ),
-                    json!({"pane": pane, "status": "working"}),
-                ));
+                tokio::select! {
+                    idle = wait_idle(client, pacing.idle_poll, pane, deadline, false) => idle?,
+                    () = ct.cancelled() => return Err(cancelled(pane, false)),
+                }
+                ("sent_after_idle", false)
             }
             _ => {
                 return Err(HerdrError::tool(
@@ -271,6 +302,49 @@ async fn send_prompt(
         out["interrupted"] = json!(interrupted);
     }
     Ok(out)
+}
+
+/// Waits for the turn in `out` to settle and merges the outcome in. Without a turn (queued,
+/// steered, or a prompt that started nothing) there is nothing to wait on, so `out` is kept.
+async fn await_turn(
+    client: &Client,
+    inner: &Inner,
+    out: &mut Value,
+    remaining: Duration,
+    ct: &CancellationToken,
+    progress: Option<UnboundedSender<Progress>>,
+) -> Result<(), HerdrError> {
+    let Some(turn) = serde_json::from_value::<Turn>(out["turn"].clone()).ok() else {
+        return Ok(());
+    };
+    if remaining.is_zero() {
+        out["timed_out"] = json!(true);
+        out["note"] = json!(
+            "the wait cap was used up before the turn could be waited on; call herdr_wait with the turn"
+        );
+        return Ok(());
+    }
+    let request = Request {
+        pane: turn.pane.clone(),
+        condition: Condition::Turn(turn),
+        cap: remaining,
+    };
+    let outcome = tokio::select! {
+        outcome = wait::wait(client, &inner.wait, request, progress) => outcome?,
+        // The prompt is already delivered; a cancelled wait only stops waiting.
+        () = ct.cancelled() => {
+            out["timed_out"] = json!(true);
+            return Ok(());
+        }
+    };
+    if let (Some(fields), Some(target)) = (outcome.to_json().as_object(), out.as_object_mut()) {
+        for (key, value) in fields {
+            if key != "pane" {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn no_send_now_note(kind: Option<&str>) -> String {

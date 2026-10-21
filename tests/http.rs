@@ -336,6 +336,9 @@ async fn tunnel_mode_audits_calls_over_http() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["tool"], "herdr_list");
     assert_eq!(lines[0]["outcome"], "ok");
+    let session: String = mcp.session.as_deref().unwrap().chars().take(8).collect();
+    assert_eq!(lines[0]["mcp_session"], session.as_str());
+    assert!(lines[0]["panes"].is_u64(), "{}", lines[0]);
 }
 
 #[tokio::test]

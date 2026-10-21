@@ -10,10 +10,11 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
     let (client, active) = inner.session()?;
     // `join!`, not `try_join!`, so an error is chosen by order (compat, caller, manifests) and not
     // by whichever call fails first.
-    let (compat, resolution, manifests) = tokio::join!(
+    let (compat, resolution, manifests, sessions) = tokio::join!(
         client.check_compat(),
         inner.resolve_caller(&client, &active),
         client.agent_manifests(),
+        inner.sessions.list(),
     );
     let (compat, resolution, manifests) = (compat?, resolution?, manifests?);
 
@@ -42,6 +43,7 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
         "guard_target": resolution.guard_target,
         "tool_mode": inner.mode.as_str(),
         "session": {"name": active.name, "socket": active.socket_path, "home": active.home},
+        "sessions": sessions,
         "herdr": {"version": compat.version, "protocol": compat.protocol},
         "agents": agents,
         "wait_cap_ms": u64::try_from(wait_cap.as_millis()).unwrap_or(u64::MAX),
