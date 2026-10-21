@@ -3,7 +3,7 @@ mod fake_herdr;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
@@ -18,7 +18,7 @@ use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::http::{self, HttpOptions, MCP_PATH, TokenCheck, bind_loopback};
 use herdr_mcp::log::Logger;
-use herdr_mcp::oauth::{self, JwtCheck};
+use herdr_mcp::oauth::{self, DenialLog, JwtCheck};
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -40,6 +40,9 @@ struct IssuerState {
     jwks: Value,
     jwks_hits: usize,
     oidc_missing: bool,
+    jwks_down: bool,
+    hang: bool,
+    named_issuer: Option<String>,
 }
 
 struct Issuer {
@@ -56,13 +59,27 @@ impl Issuer {
         self.state.lock().unwrap().jwks = json!({"keys": [jwk]});
     }
 
+    fn set_jwks_down(&self, down: bool) {
+        self.state.lock().unwrap().jwks_down = down;
+    }
+
     fn jwks_hits(&self) -> usize {
         self.state.lock().unwrap().jwks_hits
     }
 }
 
 async fn discovery(State(s): State<(String, Arc<Mutex<IssuerState>>)>) -> impl IntoResponse {
-    let body = json!({"issuer": s.0, "jwks_uri": format!("{}/jwks", s.0)});
+    let (hang, named) = {
+        let state = s.1.lock().unwrap();
+        (state.hang, state.named_issuer.clone())
+    };
+    if hang {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+    }
+    let body = json!({
+        "issuer": named.unwrap_or_else(|| s.0.clone()),
+        "jwks_uri": format!("{}/jwks", s.0),
+    });
     ([(CONTENT_TYPE, "application/json")], body.to_string())
 }
 
@@ -73,10 +90,13 @@ async fn openid(State(s): State<(String, Arc<Mutex<IssuerState>>)>) -> axum::res
     discovery(State(s)).await.into_response()
 }
 
-async fn jwks(State(s): State<(String, Arc<Mutex<IssuerState>>)>) -> impl IntoResponse {
+async fn jwks(State(s): State<(String, Arc<Mutex<IssuerState>>)>) -> axum::response::Response {
     let mut state = s.1.lock().unwrap();
     state.jwks_hits += 1;
-    ([(CONTENT_TYPE, "application/json")], state.jwks.to_string())
+    if state.jwks_down {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    ([(CONTENT_TYPE, "application/json")], state.jwks.to_string()).into_response()
 }
 
 async fn issuer(oidc_missing: bool) -> Issuer {
@@ -115,6 +135,15 @@ fn sign(alg: Algorithm, kid: &str, key: &EncodingKey, claims: &Value) -> String 
     let mut header = Header::new(alg);
     header.kid = Some(kid.to_owned());
     jsonwebtoken::encode(&header, claims, key).unwrap()
+}
+
+fn rs256_without_kid(pem: &str, claims: &Value) -> String {
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::RS256),
+        claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
 }
 
 fn rs256(kid: &str, pem: &str, claims: &Value) -> String {
@@ -196,6 +225,10 @@ fn check_for(issuer: &Issuer) -> Arc<JwtCheck> {
 }
 
 async fn rig(issuer: &Issuer) -> Rig {
+    rig_with(issuer, check_for(issuer)).await
+}
+
+async fn rig_with(issuer: &Issuer, check: Arc<JwtCheck>) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let fake = FakeHerdr::start_at(dir.path().join("herdr.sock")).await;
@@ -213,7 +246,7 @@ async fn rig(issuer: &Issuer) -> Rig {
     let addr = listener.local_addr().unwrap();
     let options = HttpOptions::new(addr, None).unwrap();
     let shutdown = CancellationToken::new();
-    let check: Arc<dyn TokenCheck> = check_for(issuer);
+    let check: Arc<dyn TokenCheck> = check;
     let router = http::mcp_router(handler, &options, check, shutdown.clone())
         .unwrap()
         .merge(oauth::metadata_router(AUDIENCE, &issuer.url));
@@ -339,6 +372,126 @@ async fn an_unknown_kid_refetches_the_jwks_once_then_fails() {
 }
 
 #[tokio::test]
+async fn tokens_missing_exp_aud_or_kid_are_denied() {
+    let iss = issuer(false).await;
+    let r = rig(&iss).await;
+    let good = claims(&iss.url);
+
+    for claim in ["exp", "aud"] {
+        let mut c = good.clone();
+        c.as_object_mut().unwrap().remove(claim);
+        r.assert_denied(Some(&rs256("kid-a", KEY_A, &c)), claim)
+            .await;
+    }
+    r.assert_denied(Some(&rs256_without_kid(KEY_A, &good)), "no kid")
+        .await;
+}
+
+#[tokio::test]
+async fn owners_match_exactly_by_sub_and_case_insensitively_by_verified_email() {
+    let iss = issuer(false).await;
+    let r = rig(&iss).await;
+
+    let mut stranger = claims(&iss.url);
+    stranger["sub"] = json!("user_stranger");
+    stranger["email"] = json!(OWNER_SUB);
+    stranger["email_verified"] = json!(true);
+    r.assert_denied(
+        Some(&rs256("kid-a", KEY_A, &stranger)),
+        "a verified email equal to a sub-style owner",
+    )
+    .await;
+
+    let mut upper = claims(&iss.url);
+    upper["sub"] = json!("user_stranger");
+    upper["email"] = json!("OWNER@Example.Test");
+    upper["email_verified"] = json!(true);
+    r.assert_ok(&rs256("kid-a", KEY_A, &upper)).await;
+}
+
+#[tokio::test]
+async fn a_discovery_document_naming_another_issuer_is_not_trusted() {
+    let iss = issuer(false).await;
+    iss.state.lock().unwrap().named_issuer = Some("https://evil.example.test".to_owned());
+    let r = rig(&iss).await;
+    r.assert_denied(
+        Some(&rs256("kid-a", KEY_A, &claims(&iss.url))),
+        "discovery issuer mismatch",
+    )
+    .await;
+    assert_eq!(iss.jwks_hits(), 0);
+}
+
+fn timed_check(iss: &Issuer, ttl: Duration, cap: Duration) -> Arc<JwtCheck> {
+    Arc::new(
+        JwtCheck::new_insecure_for_tests(&iss.url, AUDIENCE, vec![OWNER_SUB.to_owned()])
+            .unwrap()
+            .with_cache_timing(ttl, cap),
+    )
+}
+
+#[tokio::test]
+async fn cached_keys_keep_serving_while_the_issuer_is_down_until_the_cap() {
+    let iss = issuer(false).await;
+    let r = rig_with(
+        &iss,
+        timed_check(
+            &iss,
+            Duration::from_millis(100),
+            Duration::from_millis(1500),
+        ),
+    )
+    .await;
+    let good = rs256("kid-a", KEY_A, &claims(&iss.url));
+    r.assert_ok(&good).await;
+
+    iss.set_jwks_down(true);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    r.assert_ok(&good).await;
+    r.assert_denied(
+        Some(&rs256("kid-zzz", KEY_B, &claims(&iss.url))),
+        "unknown kid while the refetch fails",
+    )
+    .await;
+    r.assert_ok(&good).await;
+
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    r.assert_denied(Some(&good), "past the staleness cap").await;
+}
+
+#[tokio::test]
+async fn a_hanging_issuer_does_not_hold_the_check_for_long() {
+    let iss = issuer(false).await;
+    iss.state.lock().unwrap().hang = true;
+    let r = rig(&iss).await;
+    let token = rs256("kid-a", KEY_A, &claims(&iss.url));
+    let started = Instant::now();
+    r.assert_denied(Some(&token), "issuer hangs").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_burst_of_one_denial_reason_prints_once_per_window() {
+    let mut log = DenialLog::default();
+    let t = Instant::now();
+    let secs = Duration::from_secs;
+    let first = log.line("not_owner", t).expect("the first prints");
+    assert!(first.ends_with("auth denied: not_owner"), "{first}");
+    for i in 1..=5 {
+        assert!(log.line("not_owner", t + secs(i)).is_none());
+    }
+    assert!(log.line("expired", t + secs(6)).is_some());
+    let next = log.line("not_owner", t + secs(61)).expect("window over");
+    assert!(next.contains("auth denied: not_owner"), "{next}");
+    assert!(next.contains("5 suppressed"), "{next}");
+    assert!(log.line("not_owner", t + secs(62)).is_none());
+}
+
+#[tokio::test]
 async fn the_metadata_document_names_the_issuer_and_the_resource() {
     let iss = issuer(false).await;
     let r = rig(&iss).await;
@@ -389,4 +542,21 @@ fn the_binary_refuses_an_issuer_without_an_owner_or_over_http() {
     ]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("https"));
+}
+
+#[test]
+fn the_stdio_command_has_no_oauth_flags() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_herdr-mcp"))
+        .args(["--oauth-issuer", "https://issuer.example.test"])
+        .args(["--oauth-audience", AUDIENCE, "--owner", "u"])
+        .env("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

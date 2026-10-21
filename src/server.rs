@@ -63,6 +63,7 @@ pub struct TunnelRuntime {
     pub audit: Audit,
     pub expires_at: Option<u64>,
     pub stopper: Arc<dyn Stopper>,
+    pub start_command: &'static str,
 }
 
 pub struct Inner {
@@ -166,6 +167,7 @@ impl HerdrMcp {
             audit,
             expires_at: config.expires_at,
             stopper: config.stopper,
+            start_command: config.start_command,
         });
         self
     }
@@ -324,7 +326,7 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Stop the ChatGPT tunnel. The reply comes first, then the tunnel shuts down and this connection ends. Restart it on the Mac with `herdr-mcp tunnel start`.",
+        description = "Stop the ChatGPT tunnel. The reply comes first, then the tunnel shuts down and this connection ends. Restart it from a terminal on the Mac.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn herdr_tunnel_stop(&self) -> Result<CallToolResult, ErrorData> {
@@ -535,9 +537,12 @@ impl ServerHandler for HerdrMcp {
                 started.elapsed(),
                 &Note::none(),
             );
+            let start = self.inner.tunnel.as_ref().map_or("", |t| t.start_command);
             return tools::failure_with(
                 "tunnel_expired",
-                "the tunnel has expired and is shutting down; restart it on the Mac with `herdr-mcp tunnel start`",
+                &format!(
+                    "the tunnel has expired and is shutting down; restart it on the Mac with `{start}`"
+                ),
                 None,
             )
             .into_call_tool_result();

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::audit::{self, iso8601, unix_now};
 use crate::env::{env_nonempty, env_nonempty_string};
@@ -29,6 +30,7 @@ const AGENT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 const LAUNCHCTL: &str = "/bin/launchctl";
 /// How long `start` watches a new job before trusting that it stays up.
 const START_SETTLE: Duration = Duration::from_secs(3);
+const ERR_LOG_TAIL: u64 = 64 * 1024;
 /// One LaunchAgent this module manages: the OpenAI tunnel or the ngrok remote.
 #[derive(Debug, Clone, Copy)]
 pub struct Service {
@@ -168,16 +170,38 @@ pub trait Stopper: Send + Sync {
     fn stop(&self);
 }
 
+/// Boots the LaunchAgent out when it is loaded, and cancels `cancel` so a foreground `run`
+/// ends too.
 pub struct ServiceStopper {
     env: TunnelEnv,
     service: Service,
     runner: Arc<dyn Runner>,
+    cancel: Option<CancellationToken>,
+}
+
+impl ServiceStopper {
+    pub fn new(
+        env: TunnelEnv,
+        service: Service,
+        runner: Arc<dyn Runner>,
+        cancel: Option<CancellationToken>,
+    ) -> Self {
+        Self {
+            env,
+            service,
+            runner,
+            cancel,
+        }
+    }
 }
 
 impl Stopper for ServiceStopper {
     fn stop(&self) {
         if let Err(err) = stop_service_for(&self.env, &self.service, self.runner.as_ref()) {
             eprintln!("herdr-mcp: cannot stop the tunnel: {err}");
+        }
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
         }
     }
 }
@@ -189,24 +213,33 @@ pub struct TunnelConfig {
     pub state_home: PathBuf,
     pub expires_at: Option<u64>,
     pub stopper: Arc<dyn Stopper>,
+    /// The command that restarts the service, for the expiry message.
+    pub start_command: &'static str,
 }
 
 impl TunnelConfig {
     pub fn from_process(expires_at: Option<u64>) -> Result<Self, TunnelError> {
-        Self::for_service(OPENAI, expires_at)
+        Self::for_service(OPENAI, expires_at, None)
     }
 
-    /// Tunnel mode where `herdr_tunnel_stop` and the expiry stop `service`.
-    pub fn for_service(service: Service, expires_at: Option<u64>) -> Result<Self, TunnelError> {
+    /// Tunnel mode where `herdr_tunnel_stop` and the expiry stop `service`, and cancel `cancel`
+    /// for a foreground run.
+    pub fn for_service(
+        service: Service,
+        expires_at: Option<u64>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Self, TunnelError> {
         let env = TunnelEnv::from_process()?;
         Ok(Self {
             state_home: env.state_home(),
             expires_at,
-            stopper: Arc::new(ServiceStopper {
+            stopper: Arc::new(ServiceStopper::new(
                 env,
                 service,
-                runner: Arc::new(SystemRunner),
-            }),
+                Arc::new(SystemRunner),
+                cancel,
+            )),
+            start_command: service.start_command,
         })
     }
 }
@@ -893,15 +926,25 @@ fn auth_in_log(lines: &[String]) -> Auth {
     }
 }
 
+/// The last `ERR_LOG_TAIL` bytes of the service's error log, as lines. A log that grows with
+/// every request would otherwise be read whole.
 fn err_log_lines(env: &TunnelEnv, service: &Service) -> Vec<String> {
-    fs::read(env.state_dir().join(service.log_name("err")))
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<Vec<String>> {
+        let mut file = fs::File::open(env.state_dir().join(service.log_name("err")))?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(ERR_LOG_TAIL);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(ERR_LOG_TAIL).read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines = text.lines();
+        if start > 0 {
+            lines.next();
+        }
+        Ok(lines.map(str::to_owned).collect())
+    };
+    read().unwrap_or_default()
 }
 
 fn report(io: &mut Io, result: Result<i32, TunnelError>) -> i32 {
@@ -992,24 +1035,51 @@ fn try_start(
         confirm_full(&disclosure(env), "herdr-mcp tunnel start", io)?;
     }
     let expires_at = options.duration.map(|d| now + d.as_secs());
-    let mut run_args = Vec::new();
-    if options.full {
-        run_args.extend(["--full".to_owned(), "--full-confirmed".to_owned()]);
-    }
-    if let Some(at) = expires_at {
-        run_args.extend(["--expires-at".to_owned(), at.to_string()]);
-    }
-    if let Some(name) = &options.session {
-        run_args.extend(["--session".to_owned(), name.clone()]);
-    }
-
     launch(
         env,
         &OPENAI,
-        &plist(env, &OPENAI, &["tunnel", "run"], &run_args),
+        &plist(
+            env,
+            &OPENAI,
+            &["tunnel", "run"],
+            &run_args(options, expires_at),
+        ),
         runner,
     )?;
+    let mode = write_state(env, &OPENAI, options, now, expires_at)?;
+    let expiry = expiry_text(expires_at);
+    let _ = writeln!(
+        io.out,
+        "Tunnel started in the background ({mode} tools, {expiry}).\nStatus: herdr-mcp tunnel status\nStop:   herdr-mcp tunnel stop\nAudit log: {}",
+        env.audit_path().display()
+    );
+    Ok(0)
+}
 
+/// The `run` arguments a background start passes. `--full-confirmed` is only here because
+/// `start --full` showed the typed disclosure first.
+fn run_args(options: &StartOptions, expires_at: Option<u64>) -> Vec<String> {
+    let mut args = Vec::new();
+    if options.full {
+        args.extend(["--full".to_owned(), "--full-confirmed".to_owned()]);
+    }
+    if let Some(at) = expires_at {
+        args.extend(["--expires-at".to_owned(), at.to_string()]);
+    }
+    if let Some(name) = &options.session {
+        args.extend(["--session".to_owned(), name.clone()]);
+    }
+    args
+}
+
+/// Writes the state file `status` reads; returns the mode name.
+fn write_state(
+    env: &TunnelEnv,
+    service: &Service,
+    options: &StartOptions,
+    now: u64,
+    expires_at: Option<u64>,
+) -> Result<&'static str, TunnelError> {
     let mode = if options.full { "full" } else { "read" };
     let state = json!({
         "mode": mode,
@@ -1017,17 +1087,15 @@ fn try_start(
         "expires_at": expires_at,
         "session": options.session,
     });
-    write_file(&env.state_file(&OPENAI), &state.to_string())?;
-    let expiry = match expires_at {
+    write_file(&env.state_file(service), &state.to_string())?;
+    Ok(mode)
+}
+
+fn expiry_text(expires_at: Option<u64>) -> String {
+    match expires_at {
         Some(at) => format!("stops at {}", iso8601(at)),
         None => "no time limit".to_owned(),
-    };
-    let _ = writeln!(
-        io.out,
-        "Tunnel started in the background ({mode} tools, {expiry}).\nStatus: herdr-mcp tunnel status\nStop:   herdr-mcp tunnel stop\nAudit log: {}",
-        env.audit_path().display()
-    );
-    Ok(0)
+    }
 }
 
 /// Watches the new job for `START_SETTLE`; returns its exit code if it is already failing.

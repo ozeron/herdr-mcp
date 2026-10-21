@@ -10,31 +10,29 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use toml_edit::{Array, DocumentMut, value};
 
 use super::doctor::{Level, Report};
 use super::{
     JobState, MACOS_ONLY, NGROK, Runner, StartOptions, TunnelConfig, TunnelEnv, TunnelError,
-    confirm_full, err_log_lines, job_state, last_error, launch, plist, private_dir, report,
-    stop_service_for, tail, write_file,
+    confirm_full, err_log_lines, expiry_text, job_state, last_error, launch, plist, private_dir,
+    report, run_args, stop_service_for, tail, write_file, write_state,
 };
 use crate::audit::{iso8601, unix_now};
 use crate::cli::ToolMode;
 use crate::http::{self, TokenCheck};
 use crate::install::Io;
-use crate::oauth::JwtCheck;
+use crate::oauth::{self, DENIED_PREFIX, JwtCheck};
 use crate::serve::{BridgeOptions, HttpSpec, prepare_http};
 
 const NGROK_BIN: &str = "ngrok";
 const INSTALL_NGROK: &str = "brew install ngrok";
 const ADD_AUTHTOKEN: &str = "ngrok config add-authtoken <token>";
-const DISCOVERY_PATHS: [&str; 2] = [
-    "/.well-known/openid-configuration",
-    "/.well-known/oauth-authorization-server",
-];
 const SERVING_MARK: &str = "herdr-mcp: serving ";
-const DENIED_MARK: &str = "auth denied:";
+const SAVE_ISSUER_EXACTLY: &str =
+    "save the issuer exactly as the provider's discovery document names it";
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,15 +140,8 @@ fn validate_domain(raw: &str) -> Result<String, TunnelError> {
     }
 }
 
-fn validate_https(what: &str, raw: &str) -> Result<String, TunnelError> {
-    let url = raw.trim();
-    let host = url.strip_prefix("https://").unwrap_or_default();
-    if host.is_empty() || url.contains(char::is_whitespace) || host.starts_with('/') {
-        return Err(TunnelError::new(format!(
-            "{what} must be an https URL, got {raw:?}"
-        )));
-    }
-    Ok(url.to_owned())
+fn validate_https(what: &'static str, raw: &str) -> Result<String, TunnelError> {
+    oauth::validate_https(what, raw).map_err(|err| TunnelError::new(err.to_string()))
 }
 
 fn load_config(env: &TunnelEnv) -> Result<NgrokConfig, TunnelError> {
@@ -211,12 +202,16 @@ fn prompt(io: &mut Io, label: &str) -> Result<String, TunnelError> {
     Ok(line.trim().to_owned())
 }
 
-pub fn setup(env: &TunnelEnv, io: &mut Io) -> i32 {
-    let result = try_setup(env, io);
+pub async fn setup(env: &TunnelEnv, io: &mut Io<'_>, options: &DoctorOptions) -> i32 {
+    let result = try_setup(env, io, options).await;
     report(io, result)
 }
 
-fn try_setup(env: &TunnelEnv, io: &mut Io) -> Result<i32, TunnelError> {
+async fn try_setup(
+    env: &TunnelEnv,
+    io: &mut Io<'_>,
+    options: &DoctorOptions,
+) -> Result<i32, TunnelError> {
     if !io.stdin_is_tty {
         let _ = writeln!(
             io.err,
@@ -238,6 +233,17 @@ fn try_setup(env: &TunnelEnv, io: &mut Io) -> Result<i32, TunnelError> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .map_err(|err| TunnelError::new(format!("{}: {err}", path.display())))?;
     let _ = writeln!(io.out, "Saved {}", path.display());
+
+    // Best effort: an unreachable issuer is not a setup failure.
+    if let Ok((body, _)) = discover(&config, options).await
+        && let Some(named) = other_issuer(&config.issuer, &body)
+    {
+        let _ = writeln!(
+            io.err,
+            "warning: the issuer is saved as {}, but its discovery document names {named}; every login would fail. Fix: {SAVE_ISSUER_EXACTLY}.",
+            config.issuer
+        );
+    }
 
     match check_ngrok(env) {
         NgrokCheck::Missing => {
@@ -333,35 +339,19 @@ fn try_start(
         )?;
     }
     let expires_at = options.duration.map(|d| now + d.as_secs());
-    let mut run_args = Vec::new();
-    if options.full {
-        run_args.push("--full".to_owned());
-    }
-    if let Some(at) = expires_at {
-        run_args.extend(["--expires-at".to_owned(), at.to_string()]);
-    }
-    if let Some(name) = &options.session {
-        run_args.extend(["--session".to_owned(), name.clone()]);
-    }
     launch(
         env,
         &NGROK,
-        &plist(env, &NGROK, &["tunnel", "ngrok", "run"], &run_args),
+        &plist(
+            env,
+            &NGROK,
+            &["tunnel", "ngrok", "run"],
+            &run_args(options, expires_at),
+        ),
         runner,
     )?;
-
-    let mode = if options.full { "full" } else { "read" };
-    let state = json!({
-        "mode": mode,
-        "started_at": now,
-        "expires_at": expires_at,
-        "session": options.session,
-    });
-    write_file(&env.state_file(&NGROK), &state.to_string())?;
-    let expiry = match expires_at {
-        Some(at) => format!("stops at {}", iso8601(at)),
-        None => "no time limit".to_owned(),
-    };
+    let mode = write_state(env, &NGROK, options, now, expires_at)?;
+    let expiry = expiry_text(expires_at);
     let _ = writeln!(
         io.out,
         "ngrok remote started in the background ({mode} tools, {expiry}).\nURL: {}\nStatus: herdr-mcp tunnel ngrok status\nStop:   herdr-mcp tunnel ngrok stop\nAudit log: {}",
@@ -402,14 +392,16 @@ pub fn status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> i32 {
 
 /// The reason of the last `auth denied:` line, if it came after the last start line.
 fn last_denial(lines: &[String]) -> Option<&str> {
-    let denied = lines.iter().rposition(|line| line.contains(DENIED_MARK))?;
+    let denied = lines
+        .iter()
+        .rposition(|line| line.contains(DENIED_PREFIX))?;
     let started = lines.iter().rposition(|line| line.contains(SERVING_MARK));
     if started.is_some_and(|started| started > denied) {
         return None;
     }
     lines[denied]
-        .split_once(DENIED_MARK)
-        .map(|(_, reason)| reason.trim())
+        .split_once(DENIED_PREFIX)
+        .and_then(|(_, rest)| rest.split_whitespace().next())
 }
 
 fn try_status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> Result<i32, TunnelError> {
@@ -479,12 +471,16 @@ fn try_status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> Result<i32, 
 #[derive(Debug, Clone)]
 pub struct DoctorOptions {
     pub http_timeout: Duration,
+    /// Where to fetch the discovery document instead of the saved issuer. Tests only.
+    #[doc(hidden)]
+    pub discovery_base: Option<String>,
 }
 
 impl Default for DoctorOptions {
     fn default() -> Self {
         Self {
             http_timeout: Duration::from_secs(5),
+            discovery_base: None,
         }
     }
 }
@@ -496,39 +492,20 @@ pub fn registration_endpoint(discovery: &Value) -> Option<&str> {
         .filter(|endpoint| !endpoint.is_empty())
 }
 
-/// The issuer's discovery document and the URL it came from: OpenID configuration first, then
-/// the OAuth authorization-server metadata.
-pub async fn fetch_discovery(issuer: &str, timeout: Duration) -> Result<(Value, String), String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|err| err.to_string())?;
-    let base = issuer.trim_end_matches('/');
-    let mut last = String::new();
-    for path in DISCOVERY_PATHS {
-        let url = format!("{base}{path}");
-        let attempt = async {
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|err| format!("{url}: {err}"))?;
-            if !response.status().is_success() {
-                return Err(format!("{url} returned {}", response.status()));
-            }
-            response
-                .json::<Value>()
-                .await
-                .map_err(|err| format!("{url}: {err}"))
-        };
-        match attempt.await {
-            Ok(body) if body.is_object() => return Ok((body, url)),
-            Ok(_) => last = format!("{url}: not a JSON object"),
-            Err(why) => last = why,
-        }
-    }
-    Err(last)
+async fn discover(
+    config: &NgrokConfig,
+    options: &DoctorOptions,
+) -> Result<(Value, String), String> {
+    let client = oauth::http_client(options.http_timeout).map_err(|err| err.to_string())?;
+    let base = options.discovery_base.as_deref().unwrap_or(&config.issuer);
+    oauth::fetch_discovery(&client, base).await
+}
+
+/// The issuer a discovery document names, when it is not exactly `configured`. Tokens carry
+/// the document's value and are compared byte for byte.
+fn other_issuer<'a>(configured: &str, discovery: &'a Value) -> Option<&'a str> {
+    let named = discovery["issuer"].as_str().unwrap_or("(none)");
+    (named != configured).then_some(named)
 }
 
 pub async fn doctor(
@@ -612,7 +589,7 @@ pub async fn doctor(
 }
 
 async fn check_issuer(config: &NgrokConfig, options: &DoctorOptions, report: &mut Report<'_, '_>) {
-    let (body, url) = match fetch_discovery(&config.issuer, options.http_timeout).await {
+    let (body, url) = match discover(config, options).await {
         Ok(found) => found,
         Err(why) => {
             report.line(
@@ -624,17 +601,14 @@ async fn check_issuer(config: &NgrokConfig, options: &DoctorOptions, report: &mu
         }
     };
     report.line(Level::Pass, format!("issuer discovery: {url}"), None);
-    let named = body["issuer"].as_str();
-    if named.is_some_and(|named| named.trim_end_matches('/') != config.issuer.trim_end_matches('/'))
-    {
+    if let Some(named) = other_issuer(&config.issuer, &body) {
         report.line(
-            Level::Warn,
+            Level::Fail,
             format!(
-                "issuer discovery: it names issuer {}, not {}",
-                named.unwrap_or_default(),
+                "issuer discovery: it names issuer {named}, but ngrok.toml has {}",
                 config.issuer
             ),
-            Some("tokens must carry the issuer exactly as saved"),
+            Some(SAVE_ISSUER_EXACTLY),
         );
     }
     match registration_endpoint(&body) {
@@ -659,6 +633,8 @@ async fn check_issuer(config: &NgrokConfig, options: &DoctorOptions, report: &mu
 pub struct RunOptions {
     pub session: Option<String>,
     pub full: bool,
+    /// Set only by `tunnel ngrok start --full`, after the typed disclosure.
+    pub full_confirmed: bool,
     pub expires_at: Option<u64>,
 }
 
@@ -675,6 +651,11 @@ pub async fn run(env: &TunnelEnv, options: &RunOptions) -> i32 {
 }
 
 async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelError> {
+    if options.full && !options.full_confirmed {
+        return Err(TunnelError::usage(
+            "full access needs the typed disclosure: run `herdr-mcp tunnel ngrok start --full`",
+        ));
+    }
     let config = load_config(env)?;
     let ngrok = env
         .find_program(NGROK_BIN)
@@ -683,7 +664,8 @@ async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelErr
         JwtCheck::new(&config.issuer, &config.audience, config.owners.clone())
             .map_err(|err| TunnelError::usage(err.to_string()))?,
     );
-    let tunnel = TunnelConfig::for_service(NGROK, options.expires_at)?;
+    let stop = CancellationToken::new();
+    let tunnel = TunnelConfig::for_service(NGROK, options.expires_at, Some(stop.clone()))?;
     let server = prepare_http(HttpSpec {
         bind: ([127, 0, 0, 1], 0).into(),
         public_url: Some(config.url()),
@@ -718,7 +700,16 @@ async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelErr
     };
     let mut child = tokio::process::Command::new(&ngrok)
         .args(["http", &format!("127.0.0.1:{port}"), "--url", &config.url()])
-        .args(["--log", "stdout", "--log-format", "json"])
+        // The inspector at 127.0.0.1:4040 would keep request headers and bodies.
+        .arg("--inspect=false")
+        .args([
+            "--log",
+            "stdout",
+            "--log-format",
+            "json",
+            "--log-level",
+            "warn",
+        ])
         .stdin(Stdio::null())
         .stdout(share()?)
         .stderr(share()?)
@@ -728,6 +719,14 @@ async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelErr
 
     let shutdown = server.shutdown.clone();
     tokio::spawn(http::cancel_on_signal(shutdown.clone()));
+    // `herdr_tunnel_stop` and the expiry reach a foreground run through this token.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            stop.cancelled().await;
+            shutdown.cancel();
+        }
+    });
     let mut serving = tokio::spawn(http::serve(
         server.listener,
         server.router,
@@ -738,27 +737,42 @@ async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelErr
         config.mcp_url(),
         if options.full { "control" } else { "read" }
     );
+    Ok(supervise(&mut child, &mut serving, &shutdown).await)
+}
 
-    let code = tokio::select! {
+/// Waits for the first of: ngrok exiting, the server stopping, or `shutdown`. Stops the others
+/// and returns the exit code: 0 for a shutdown, 1 when ngrok or the server died.
+#[doc(hidden)]
+pub async fn supervise(
+    child: &mut tokio::process::Child,
+    serving: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    shutdown: &CancellationToken,
+) -> i32 {
+    tokio::select! {
         status = child.wait() => {
             let status = status.map_or_else(|err| err.to_string(), |s| s.to_string());
             eprintln!("herdr-mcp: ngrok exited ({status}); shutting down");
             shutdown.cancel();
+            let _ = tokio::time::timeout(STOP_GRACE, serving).await;
             1
         }
         () = shutdown.cancelled() => {
-            terminate(&mut child).await;
+            terminate(child).await;
+            let _ = tokio::time::timeout(STOP_GRACE, serving).await;
             0
         }
-        result = &mut serving => {
-            eprintln!("herdr-mcp: http server stopped: {result:?}");
-            terminate(&mut child).await;
+        // The handle is spent once it resolves, so it is not awaited again.
+        result = &mut *serving => {
+            // A requested shutdown also ends the server, and can win the race with its own arm.
+            let requested = shutdown.is_cancelled();
+            if !requested {
+                eprintln!("herdr-mcp: http server stopped: {result:?}");
+            }
+            terminate(child).await;
             shutdown.cancel();
-            1
+            i32::from(!requested)
         }
-    };
-    let _ = tokio::time::timeout(STOP_GRACE, serving).await;
-    Ok(code)
+    }
 }
 
 /// SIGTERM, then SIGKILL if ngrok has not gone after `STOP_GRACE`.

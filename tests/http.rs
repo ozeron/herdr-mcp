@@ -124,6 +124,7 @@ async fn rig(check: Arc<dyn TokenCheck>, tunnel: bool) -> Rig {
             state_home: state.path().to_path_buf(),
             expires_at: None,
             stopper: Arc::new(NoStop),
+            start_command: "herdr-mcp tunnel start",
         });
     }
     let listener = bind_loopback("127.0.0.1:0".parse().unwrap()).await.unwrap();

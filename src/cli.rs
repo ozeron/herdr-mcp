@@ -30,15 +30,6 @@ impl ToolMode {
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
-    /// OAuth issuer (https) whose JWTs may reach /mcp; without it every request is refused
-    #[arg(long, requires = "oauth_audience")]
-    pub oauth_issuer: Option<String>,
-    /// Audience (the protected resource URL) tokens must carry
-    #[arg(long, requires = "oauth_issuer")]
-    pub oauth_audience: Option<String>,
-    /// Token `sub` or verified `email` allowed in; repeat for several
-    #[arg(long = "owner", requires = "oauth_issuer")]
-    pub owners: Vec<String>,
     /// Herdr session name; overrides HERDR_SOCKET_PATH and HERDR_SESSION
     #[arg(long)]
     pub session: Option<String>,
@@ -168,6 +159,9 @@ pub struct NgrokRunArgs {
     /// Register the control tools; `tunnel ngrok start --full` shows the disclosure first
     #[arg(long)]
     pub full: bool,
+    /// Proof that `tunnel ngrok start --full` showed the disclosure; do not set by hand
+    #[arg(long, requires = "full", hide = true)]
+    pub full_confirmed: bool,
     /// Stop at this Unix time (seconds)
     #[arg(long)]
     pub expires_at: Option<u64>,

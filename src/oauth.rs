@@ -4,6 +4,7 @@
 //! token only when its signature matches the issuer's JWKS, `iss`, `aud`, `exp` and `nbf` hold,
 //! and it names an owner. It never logs tokens or claims; a denial logs the reason only.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -18,9 +19,20 @@ use tokio::sync::Mutex;
 use crate::http::{CheckFuture, Denied, TokenCheck};
 
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
+/// Cached keys outlive a failing issuer this long after they were loaded.
+const JWKS_STALE_CAP: Duration = Duration::from_secs(60 * 60);
 const REFETCH_INTERVAL: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds discovery plus JWKS, so the cache lock is not held for several HTTP timeouts.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(6);
+const DENIAL_WINDOW: Duration = Duration::from_secs(60);
+const DISCOVERY_PATHS: [&str; 2] = [
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server",
+];
 const LEEWAY_SECS: u64 = 60;
+/// The prefix of every denial line on stderr; `tunnel ngrok status` reads it back.
+pub const DENIED_PREFIX: &str = "auth denied:";
 const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 
 /// RS256/384/512, ES256/384 and EdDSA. Everything else, including `none` and HS*, is refused.
@@ -56,8 +68,11 @@ pub struct JwtCheck {
     audience: String,
     owners: Vec<String>,
     allow_http: bool,
+    ttl: Duration,
+    stale_cap: Duration,
     client: reqwest::Client,
     cache: Mutex<Cache>,
+    denials: std::sync::Mutex<DenialLog>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +82,44 @@ struct Claims {
     email_verified: Option<bool>,
 }
 
+/// Decides which denial lines reach stderr: one per reason per window, with a count of the rest.
+#[derive(Default)]
+pub struct DenialLog {
+    seen: HashMap<&'static str, (Instant, u64)>,
+}
+
+impl DenialLog {
+    pub fn line(&mut self, reason: &'static str, now: Instant) -> Option<String> {
+        let suppressed = match self.seen.get_mut(reason) {
+            Some((printed, count)) if now.duration_since(*printed) < DENIAL_WINDOW => {
+                *count += 1;
+                return None;
+            }
+            Some((printed, count)) => {
+                *printed = now;
+                std::mem::take(count)
+            }
+            None => {
+                self.seen.insert(reason, (now, 0));
+                0
+            }
+        };
+        Some(if suppressed == 0 {
+            format!("herdr-mcp: {DENIED_PREFIX} {reason}")
+        } else {
+            format!("herdr-mcp: {DENIED_PREFIX} {reason} ({suppressed} suppressed)")
+        })
+    }
+}
+
 impl JwtCheck {
+    #[doc(hidden)]
+    pub fn with_cache_timing(mut self, ttl: Duration, stale_cap: Duration) -> Self {
+        self.ttl = ttl;
+        self.stale_cap = stale_cap;
+        self
+    }
+
     /// Fails closed: no owner, or an issuer that is not https, is an error.
     pub fn new(issuer: &str, audience: &str, owners: Vec<String>) -> Result<Self, OAuthError> {
         Self::build(issuer, audience, owners, false)
@@ -92,17 +144,10 @@ impl JwtCheck {
         if owners.iter().all(|owner| owner.trim().is_empty()) {
             return Err(OAuthError::NoOwner);
         }
-        if !allow_http && !issuer.starts_with("https://") {
-            return Err(OAuthError::NotHttps {
-                what: "--oauth-issuer",
-                url: issuer.to_owned(),
-            });
+        if !allow_http {
+            validate_https("--oauth-issuer", issuer)?;
         }
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(OAuthError::Client)?;
+        let client = http_client(HTTP_TIMEOUT).map_err(OAuthError::Client)?;
         Ok(Self {
             issuer: issuer.to_owned(),
             audience: audience.to_owned(),
@@ -111,8 +156,11 @@ impl JwtCheck {
                 .filter(|o| !o.trim().is_empty())
                 .collect(),
             allow_http,
+            ttl: JWKS_TTL,
+            stale_cap: JWKS_STALE_CAP,
             client,
             cache: Mutex::new(Cache::default()),
+            denials: std::sync::Mutex::new(DenialLog::default()),
         })
     }
 
@@ -156,7 +204,9 @@ impl JwtCheck {
 
     async fn key_for(&self, kid: &str) -> Result<jsonwebtoken::jwk::Jwk, &'static str> {
         let mut cache = self.cache.lock().await;
-        let fresh = cache.loaded_at.is_some_and(|at| at.elapsed() < JWKS_TTL);
+        let age = cache.loaded_at.map(|at| at.elapsed());
+        let fresh = age.is_some_and(|age| age < self.ttl);
+        let usable = age.is_some_and(|age| age < self.stale_cap);
         let find = |cache: &Cache| {
             cache
                 .keys
@@ -174,47 +224,51 @@ impl JwtCheck {
         let throttled = cache
             .last_miss
             .is_some_and(|at| at.elapsed() < REFETCH_INTERVAL);
-        if throttled && (fresh || cache.keys.is_none()) {
-            return Err(if fresh {
-                "unknown_kid"
-            } else {
-                "jwks_unavailable"
-            });
+        if throttled {
+            return match (fresh, usable) {
+                (true, _) => Err("unknown_kid"),
+                (false, true) => find(&cache).ok_or("unknown_kid"),
+                (false, false) => Err("jwks_unavailable"),
+            };
         }
         if fresh {
             cache.last_miss = Some(Instant::now());
         }
-        match self.fetch_jwks().await {
+        let fetched = tokio::time::timeout(FETCH_TIMEOUT, self.fetch_jwks())
+            .await
+            .unwrap_or(Err("jwks_unavailable"));
+        match fetched {
             Ok(set) => {
                 cache.keys = Some(set);
                 cache.loaded_at = Some(Instant::now());
             }
             Err(reason) => {
                 cache.last_miss = Some(Instant::now());
-                cache.keys = None;
-                cache.loaded_at = None;
-                return Err(reason);
+                if !usable {
+                    return Err(reason);
+                }
             }
         }
         find(&cache).ok_or("unknown_kid")
     }
 
     async fn fetch_jwks(&self) -> Result<JwkSet, &'static str> {
-        let base = self.issuer.trim_end_matches('/');
-        let mut uri = None;
-        for name in ["openid-configuration", "oauth-authorization-server"] {
-            if let Some(found) = self.discover(&format!("{base}/.well-known/{name}")).await {
-                uri = Some(found);
-                break;
-            }
+        let (doc, _) = fetch_discovery(&self.client, &self.issuer)
+            .await
+            .map_err(|_| "jwks_unavailable")?;
+        if doc.get("issuer").and_then(Value::as_str) != Some(self.issuer.as_str()) {
+            return Err("jwks_unavailable");
         }
-        let uri = uri.ok_or("jwks_unavailable")?;
+        let uri = doc
+            .get("jwks_uri")
+            .and_then(Value::as_str)
+            .ok_or("jwks_unavailable")?;
         if !self.allow_http && !uri.starts_with("https://") {
             return Err("jwks_unavailable");
         }
         let response = self
             .client
-            .get(&uri)
+            .get(uri)
             .send()
             .await
             .map_err(|_| "jwks_unavailable")?;
@@ -223,19 +277,60 @@ impl JwtCheck {
         }
         response.json().await.map_err(|_| "jwks_unavailable")
     }
+}
 
-    /// The `jwks_uri` of the discovery document at `url`, if it is for this issuer.
-    async fn discover(&self, url: &str) -> Option<String> {
-        let response = self.client.get(url).send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let doc: Value = response.json().await.ok()?;
-        if doc.get("issuer").and_then(Value::as_str) != Some(self.issuer.as_str()) {
-            return None;
-        }
-        doc.get("jwks_uri")?.as_str().map(str::to_owned)
+/// An `https://` URL with a host and no whitespace, trimmed.
+pub fn validate_https(what: &'static str, raw: &str) -> Result<String, OAuthError> {
+    let url = raw.trim();
+    let host = url.strip_prefix("https://").unwrap_or_default();
+    if host.is_empty() || url.contains(char::is_whitespace) || host.starts_with('/') {
+        return Err(OAuthError::NotHttps {
+            what,
+            url: raw.to_owned(),
+        });
     }
+    Ok(url.to_owned())
+}
+
+/// A client that follows no redirects and gives up after `timeout`.
+pub fn http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// The issuer's discovery document and the URL it came from: OpenID configuration first, then
+/// the OAuth authorization-server metadata. The document's own `issuer` is not checked here.
+pub async fn fetch_discovery(
+    client: &reqwest::Client,
+    issuer: &str,
+) -> Result<(Value, String), String> {
+    let base = issuer.trim_end_matches('/');
+    let mut last = String::new();
+    for path in DISCOVERY_PATHS {
+        let url = format!("{base}{path}");
+        let attempt = async {
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|err| format!("{url}: {err}"))?;
+            if !response.status().is_success() {
+                return Err(format!("{url} returned {}", response.status()));
+            }
+            response
+                .json::<Value>()
+                .await
+                .map_err(|err| format!("{url}: {err}"))
+        };
+        match attempt.await {
+            Ok(body) if body.is_object() => return Ok((body, url)),
+            Ok(_) => last = format!("{url}: not a JSON object"),
+            Err(why) => last = why,
+        }
+    }
+    Err(last)
 }
 
 impl TokenCheck for JwtCheck {
@@ -245,7 +340,14 @@ impl TokenCheck for JwtCheck {
                 return Err(Denied);
             };
             self.verify(token).await.map_err(|reason| {
-                eprintln!("herdr-mcp: auth denied: {reason}");
+                let line = self
+                    .denials
+                    .lock()
+                    .ok()
+                    .and_then(|mut log| log.line(reason, Instant::now()));
+                if let Some(line) = line {
+                    eprintln!("{line}");
+                }
                 Denied
             })
         })

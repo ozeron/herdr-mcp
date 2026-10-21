@@ -276,6 +276,7 @@ async fn run_ngrok(command: &NgrokCommand) -> ExitCode {
         let options = ngrok::RunOptions {
             session: args.session.clone(),
             full: args.full,
+            full_confirmed: args.full_confirmed,
             expires_at: args.expires_at,
         };
         let code = ngrok::run(&env, &options).await;
@@ -293,7 +294,7 @@ async fn run_ngrok(command: &NgrokCommand) -> ExitCode {
         err: &mut err,
     };
     let code = match command {
-        NgrokCommand::Setup => ngrok::setup(&env, &mut io),
+        NgrokCommand::Setup => ngrok::setup(&env, &mut io, &ngrok::DoctorOptions::default()).await,
         NgrokCommand::Start(args) => {
             let duration = match args.duration.as_deref().map(tunnel::parse_duration) {
                 None => None,

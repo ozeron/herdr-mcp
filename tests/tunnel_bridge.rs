@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fake_herdr::FakeHerdr;
-use harness::{Harness, call, err_code, ok};
+use harness::{Harness, call, err, err_code, ok};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::log::Logger;
@@ -70,6 +70,23 @@ async fn serve(
     expires_at: Option<u64>,
     state_home: Option<PathBuf>,
 ) -> Rig {
+    serve_as(
+        mode,
+        tunnel,
+        expires_at,
+        state_home,
+        "herdr-mcp tunnel start",
+    )
+    .await
+}
+
+async fn serve_as(
+    mode: ToolMode,
+    tunnel: bool,
+    expires_at: Option<u64>,
+    state_home: Option<PathBuf>,
+    start_command: &'static str,
+) -> Rig {
     let fake = FakeHerdr::start().await;
     let log_dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -88,6 +105,7 @@ async fn serve(
         state_home: state_home.unwrap_or_else(|| state.path().to_path_buf()),
         expires_at,
         stopper: stopper.clone(),
+        start_command,
     };
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
     tokio::spawn(async move {
@@ -331,6 +349,16 @@ async fn after_expiry_calls_return_tunnel_expired_and_the_stop_helper_runs() {
         "{}",
         r.raw()
     );
+}
+
+#[tokio::test]
+async fn the_expiry_message_names_the_command_that_starts_this_service() {
+    for command in ["herdr-mcp tunnel start", "herdr-mcp tunnel ngrok start"] {
+        let r = serve_as(ToolMode::Read, true, Some(now() - 1), None, command).await;
+        let failure = err(&r.h, "herdr_sessions", json!({})).await;
+        let message = failure["message"].as_str().unwrap();
+        assert!(message.contains(&format!("`{command}`")), "{message}");
+    }
 }
 
 #[tokio::test]

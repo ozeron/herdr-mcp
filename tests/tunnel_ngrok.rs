@@ -5,14 +5,16 @@ use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use herdr_mcp::install::Io;
+use herdr_mcp::oauth;
 use herdr_mcp::tunnel::ngrok::{self, DoctorOptions};
-use herdr_mcp::tunnel::{Runner, StartOptions, TunnelEnv};
+use herdr_mcp::tunnel::{NGROK, Runner, ServiceStopper, StartOptions, Stopper, TunnelEnv};
 use serde_json::json;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 const NOW: u64 = 1_800_000_000;
 const DOMAIN: &str = "x.ngrok-free.dev";
@@ -157,9 +159,59 @@ fn plist_args(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// A discovery base nothing listens on, so setup tests never reach the network.
+const NO_ISSUER: &str = "http://127.0.0.1:1";
+
 fn setup(sandbox: &Sandbox, tty: bool, input: &str) -> Run {
+    setup_against(sandbox, tty, input, NO_ISSUER)
+}
+
+fn doctor_options(discovery_base: &str) -> DoctorOptions {
+    DoctorOptions {
+        http_timeout: Duration::from_millis(500),
+        discovery_base: Some(discovery_base.to_owned()),
+    }
+}
+
+fn setup_against(sandbox: &Sandbox, tty: bool, input: &str, discovery_base: &str) -> Run {
     let env = sandbox.env();
-    drive(tty, input, |io| ngrok::setup(&env, io))
+    let options = doctor_options(discovery_base);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    drive(tty, input, |io| {
+        runtime.block_on(ngrok::setup(&env, io, &options))
+    })
+}
+
+/// Serves a discovery document that names `named` as its issuer; returns its base URL.
+fn serve_discovery(named: &str) -> String {
+    use axum::Router;
+    use axum::routing::get;
+    let body = json!({
+        "issuer": named,
+        "registration_endpoint": "https://issuer.example.test/register",
+    })
+    .to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let app = Router::new().route(
+                    "/.well-known/openid-configuration",
+                    get(move || async move { ([("content-type", "application/json")], body) }),
+                );
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let _ = axum::serve(listener, app).await;
+            });
+    });
+    url
 }
 
 fn start(sandbox: &Sandbox, options: &StartOptions, tty: bool, input: &str) -> (Run, FakeRunner) {
@@ -275,6 +327,37 @@ fn setup_warns_when_ngrok_is_missing_and_passes_when_config_check_succeeds() {
     assert!(run.out.contains("config add-authtoken") || run.err.contains("config add-authtoken"));
 }
 
+const SETUP_INPUT: &str = "x.ngrok-free.dev\nhttps://issuer.example.test\nu\n\n";
+const SAVE_EXACTLY: &str = "save the issuer exactly as the provider's discovery document names it";
+
+#[test]
+fn setup_warns_when_the_issuer_differs_from_the_discovery_document() {
+    let sandbox = Sandbox::new();
+    let base = serve_discovery("https://issuer.example.test/");
+    let run = setup_against(&sandbox, true, SETUP_INPUT, &base);
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert!(sandbox.config_path().exists());
+    for want in [
+        "warning",
+        "https://issuer.example.test/",
+        "https://issuer.example.test",
+        SAVE_EXACTLY,
+    ] {
+        assert!(run.err.contains(want), "missing {want:?} in\n{}", run.err);
+    }
+}
+
+#[test]
+fn setup_is_quiet_when_the_issuer_matches_or_cannot_be_reached() {
+    let base = serve_discovery("https://issuer.example.test");
+    for base in [base.as_str(), NO_ISSUER] {
+        let sandbox = Sandbox::new();
+        let run = setup_against(&sandbox, true, SETUP_INPUT, base);
+        assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+        assert!(!run.err.contains(SAVE_EXACTLY), "{}", run.err);
+    }
+}
+
 // ---- start / stop / status ----
 
 #[cfg(target_os = "macos")]
@@ -350,7 +433,11 @@ fn start_full_needs_the_typed_phrase_then_reaches_the_plist() {
     let (run, _) = start(&sandbox, &full, true, "full access\n");
     assert_eq!(run.code, 0, "{}", run.err);
     let args = plist_args(&fs::read_to_string(sandbox.plist()).unwrap());
-    assert_eq!(args[1..], ["tunnel", "ngrok", "run", "--full"], "{args:?}");
+    assert_eq!(
+        args[1..],
+        ["tunnel", "ngrok", "run", "--full", "--full-confirmed"],
+        "{args:?}"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -461,9 +548,37 @@ fn status_shows_the_last_auth_denial_only_when_newer_than_the_last_start() {
     assert!(!status().contains("not_owner"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn status_reads_only_the_tail_of_the_error_log_and_shows_the_bare_reason() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    fs::create_dir_all(sandbox.state_dir()).unwrap();
+    let log = sandbox.state_dir().join("ngrok.err.log");
+    let status = || {
+        let env = sandbox.env();
+        let runner = FakeRunner::new(true);
+        drive(false, "", |io| ngrok::status(&env, &runner, io)).out
+    };
+    let filler = "ngrok: a log line that says nothing about auth\n".repeat(3000);
+    fs::write(&log, format!("herdr-mcp: auth denied: too_old\n{filler}")).unwrap();
+    assert!(!status().contains("too_old"));
+    fs::write(
+        &log,
+        format!("{filler}herdr-mcp: auth denied: not_owner (5 suppressed)\n"),
+    )
+    .unwrap();
+    let out = status();
+    assert!(out.contains("last denied: not_owner\n"), "{out}");
+}
+
 // ---- doctor ----
 
 fn run_doctor(sandbox: &Sandbox) -> Run {
+    run_doctor_with(sandbox, &DoctorOptions::default())
+}
+
+fn run_doctor_with(sandbox: &Sandbox, options: &DoctorOptions) -> Run {
     let env = sandbox.env();
     let runner = FakeRunner::new(false);
     let mut reader = Cursor::new(Vec::new());
@@ -475,7 +590,7 @@ fn run_doctor(sandbox: &Sandbox) -> Run {
         .block_on(ngrok::doctor(
             &env,
             &runner,
-            &DoctorOptions::default(),
+            options,
             &mut Io {
                 stdin_is_tty: false,
                 input: &mut reader,
@@ -514,6 +629,40 @@ fn doctor_flags_a_failing_ngrok_config_check() {
 }
 
 #[test]
+fn doctor_fails_when_the_saved_issuer_is_not_exactly_the_discovery_issuer() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.script("ngrok", "exit 0");
+    let base = serve_discovery("https://issuer.example.test/");
+    let run = run_doctor_with(&sandbox, &doctor_options(&base));
+    assert_ne!(run.code, 0, "{}", run.out);
+    let line = run
+        .out
+        .lines()
+        .find(|l| l.contains("FAIL") && l.contains("issuer discovery"))
+        .unwrap_or_else(|| panic!("no FAIL line in\n{}", run.out));
+    assert!(line.contains("https://issuer.example.test/"), "{line}");
+    assert!(line.contains(ISSUER), "{line}");
+    assert!(run.out.contains(SAVE_EXACTLY), "{}", run.out);
+}
+
+#[test]
+fn doctor_passes_an_exactly_matching_issuer() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.script("ngrok", "exit 0");
+    let base = serve_discovery(ISSUER);
+    let run = run_doctor_with(&sandbox, &doctor_options(&base));
+    assert!(!run.out.contains("FAIL"), "{}", run.out);
+    assert!(run.out.contains("PASS  issuer discovery"), "{}", run.out);
+    assert!(
+        run.out.contains("PASS  registration_endpoint"),
+        "{}",
+        run.out
+    );
+}
+
+#[test]
 fn registration_endpoint_is_read_from_the_discovery_body() {
     let with =
         json!({"issuer": ISSUER, "registration_endpoint": "https://issuer.example.test/register"});
@@ -545,9 +694,8 @@ async fn discovery_falls_back_to_the_authorization_server_document() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await });
-    let (body, found) = ngrok::fetch_discovery(&url, Duration::from_secs(5))
-        .await
-        .unwrap();
+    let client = oauth::http_client(Duration::from_secs(5)).unwrap();
+    let (body, found) = oauth::fetch_discovery(&client, &url).await.unwrap();
     assert!(
         found.ends_with("/.well-known/oauth-authorization-server"),
         "{found}"
@@ -556,7 +704,7 @@ async fn discovery_falls_back_to_the_authorization_server_document() {
         ngrok::registration_endpoint(&body),
         Some("https://i/register")
     );
-    let dead = ngrok::fetch_discovery("http://127.0.0.1:1", Duration::from_secs(2)).await;
+    let dead = oauth::fetch_discovery(&client, "http://127.0.0.1:1").await;
     assert!(dead.is_err());
 }
 
@@ -613,6 +761,36 @@ fn recorded(rec: &Path) -> String {
     fs::read_to_string(rec).unwrap_or_default()
 }
 
+fn http_get(port: u16, path: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    reply
+}
+
+#[test]
+fn run_full_without_the_disclosure_flag_is_refused() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    let rec = fake_ngrok(&sandbox, "exit 0");
+    let out = sandbox
+        .herdr_mcp(&["tunnel", "ngrok", "run", "--full"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("tunnel ngrok start --full"), "{err}");
+    assert!(!rec.exists(), "ngrok must not start");
+}
+
 #[test]
 fn run_binds_before_ngrok_starts_and_refuses_tokenless_requests() {
     let sandbox = Sandbox::new();
@@ -636,7 +814,9 @@ fn run_binds_before_ngrok_starts_and_refuses_tokenless_requests() {
         .unwrap_or_else(|| panic!("bad argv {argv}"));
     assert_eq!(
         argv,
-        format!("argv:http 127.0.0.1:{port} --url https://{DOMAIN} --log stdout --log-format json")
+        format!(
+            "argv:http 127.0.0.1:{port} --url https://{DOMAIN} --inspect=false --log stdout --log-format json --log-level warn"
+        )
     );
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -653,6 +833,13 @@ fn run_binds_before_ngrok_starts_and_refuses_tokenless_requests() {
     assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
     assert!(reply.to_lowercase().contains("www-authenticate"), "{reply}");
 
+    let reply = http_get(port, "/.well-known/oauth-protected-resource");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    let body: serde_json::Value =
+        serde_json::from_str(reply.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["resource"], format!("https://{DOMAIN}/mcp"));
+    assert_eq!(body["authorization_servers"], json!([ISSUER]));
+
     let pid: i32 = text
         .lines()
         .find_map(|l| l.strip_prefix("pid:"))
@@ -662,6 +849,34 @@ fn run_binds_before_ngrok_starts_and_refuses_tokenless_requests() {
     // SAFETY: signalling our own child process.
     unsafe { libc::kill(run.0.id() as i32, libc::SIGTERM) };
     wait_until("run to exit", || run.0.try_wait().unwrap().is_some());
+    assert!(run.0.try_wait().unwrap().unwrap().success());
+    // SAFETY: signal 0 only probes whether the pid exists.
+    wait_until("ngrok to be killed", || unsafe { libc::kill(pid, 0) } != 0);
+}
+
+#[test]
+fn expires_at_ends_a_foreground_run_and_kills_ngrok() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    // The stop helper asks launchctl first; this one says nothing is loaded.
+    sandbox.script("launchctl", "exit 1");
+    let rec = fake_ngrok(&sandbox, "exec /bin/sleep 60");
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 5;
+    let mut run = spawn_run(&sandbox, &["--expires-at", &at.to_string()]);
+    wait_until("ngrok to start", || recorded(&rec).contains("pid:"));
+    let pid: i32 = recorded(&rec)
+        .lines()
+        .find_map(|l| l.strip_prefix("pid:"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until("run to exit at the expiry", || {
+        run.0.try_wait().unwrap().is_some()
+    });
     assert!(run.0.try_wait().unwrap().unwrap().success());
     // SAFETY: signal 0 only probes whether the pid exists.
     wait_until("ngrok to be killed", || unsafe { libc::kill(pid, 0) } != 0);
@@ -688,4 +903,56 @@ fn run_without_config_exits_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("tunnel ngrok setup"));
+}
+
+// ---- supervise ----
+
+fn sleeper() -> tokio::process::Child {
+    tokio::process::Command::new("/bin/sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn supervise_returns_1_without_panicking_when_the_server_stops_first() {
+    let mut child = sleeper();
+    let mut serving = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
+    let shutdown = CancellationToken::new();
+    let code = ngrok::supervise(&mut child, &mut serving, &shutdown).await;
+    assert_eq!(code, 1);
+    assert!(shutdown.is_cancelled());
+    assert!(child.try_wait().unwrap().is_some(), "ngrok was not stopped");
+}
+
+#[tokio::test]
+async fn supervise_returns_0_on_shutdown_and_waits_for_the_server() {
+    let mut child = sleeper();
+    let shutdown = CancellationToken::new();
+    let token = shutdown.clone();
+    let mut serving = tokio::spawn(async move {
+        token.cancelled().await;
+        Ok::<(), std::io::Error>(())
+    });
+    shutdown.cancel();
+    let code = ngrok::supervise(&mut child, &mut serving, &shutdown).await;
+    assert_eq!(code, 0);
+    assert!(child.try_wait().unwrap().is_some());
+    assert!(serving.is_finished());
+}
+
+#[test]
+fn the_service_stopper_boots_out_a_loaded_job_and_always_cancels_the_run() {
+    for loaded in [true, false] {
+        let sandbox = Sandbox::new();
+        let runner = Arc::new(FakeRunner::new(loaded));
+        let cancel = CancellationToken::new();
+        let stopper =
+            ServiceStopper::new(sandbox.env(), NGROK, runner.clone(), Some(cancel.clone()));
+        stopper.stop();
+        assert!(cancel.is_cancelled(), "loaded={loaded}");
+        let booted_out = runner.calls().iter().any(|c| c[0] == "bootout");
+        assert_eq!(booted_out, loaded, "{:?}", runner.calls());
+    }
 }
