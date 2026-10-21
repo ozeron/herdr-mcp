@@ -136,7 +136,7 @@ async fn wait_cap_ms(opts: Opts) -> u64 {
 }
 
 #[tokio::test]
-async fn read_mode_lists_exactly_the_seven_read_tools() {
+async fn read_mode_lists_exactly_the_nine_read_tools() {
     let h = start(Opts::default()).await;
     let names: BTreeSet<String> = h
         .client
@@ -154,6 +154,8 @@ async fn read_mode_lists_exactly_the_seven_read_tools() {
         "herdr_mail_send",
         "herdr_mail_read",
         "herdr_mail_wait",
+        "herdr_sessions",
+        "herdr_use_session",
     ]
     .map(String::from)
     .into();
@@ -171,14 +173,14 @@ async fn read_mode_rejects_control_tool_calls() {
 }
 
 #[tokio::test]
-async fn control_mode_lists_all_twelve_with_annotations() {
+async fn control_mode_lists_all_fourteen_with_annotations() {
     let h = start(Opts {
         mode: ToolMode::Control,
         ..Opts::default()
     })
     .await;
     let tools = h.client.list_all_tools().await.unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 14);
     let read_only = [
         "herdr_capabilities",
         "herdr_list",
@@ -186,6 +188,7 @@ async fn control_mode_lists_all_twelve_with_annotations() {
         "herdr_wait",
         "herdr_mail_read",
         "herdr_mail_wait",
+        "herdr_sessions",
     ];
     let destructive = [
         "herdr_launch",
@@ -197,7 +200,7 @@ async fn control_mode_lists_all_twelve_with_annotations() {
     for tool in &tools {
         let name = tool.name.as_ref();
         let ann = tool.annotations.as_ref().expect(name);
-        if name == "herdr_mail_send" {
+        if name == "herdr_mail_send" || name == "herdr_use_session" {
             assert_eq!(ann.destructive_hint, Some(false), "{name}");
             assert_ne!(ann.read_only_hint, Some(true), "{name}");
         } else if read_only.contains(&name) {
@@ -317,7 +320,7 @@ async fn herdr_not_running_is_a_tool_error_and_the_server_stays_up() {
         result.structured_content.unwrap()["code"],
         "herdr_not_running"
     );
-    assert_eq!(h.client.list_all_tools().await.unwrap().len(), 7);
+    assert_eq!(h.client.list_all_tools().await.unwrap().len(), 9);
 }
 
 #[tokio::test]

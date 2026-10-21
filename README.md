@@ -55,11 +55,13 @@ A plugin update replaces the binary behind the shim. Every Claude and Codex sess
 
 ## Tools
 
-Read mode registers the four observe tools and the three mail tools.
+Read mode registers the four observe tools, the three mail tools and the two session tools.
 
 | Tool | Does | Key params | Returns |
 |---|---|---|---|
-| `herdr_capabilities` | Caller, tool mode, wait cap, agent kinds and MCP status | none | `caller`, `tool_mode`, `herdr{version, protocol}`, `agents[]`, `wait_cap_ms` |
+| `herdr_capabilities` | Caller, tool mode, wait cap, agent kinds and MCP status | none | `caller`, `tool_mode`, `session{name, socket, home}`, `herdr{version, protocol}`, `agents[]`, `wait_cap_ms` |
+| `herdr_sessions` | List Herdr sessions (`default`, named, and a custom start socket) | none | `sessions[{name, socket, running, active}]` |
+| `herdr_use_session` | Switch the session every tool uses. The caller pane exists only in the home session (the one the bridge started in) | `name` | `active`, `socket`, `previous` |
 | `herdr_list` | Workspace, tab and pane tree, with agents and plain processes | `scope`, `kind`, `status[]`, `label_contains` | tree of panes with status and foreground process |
 | `herdr_read` | Tail of a pane's output | `target`, `source`, `lines` (80, max 1000), `max_chars`, `raw` | `text`, `truncated`, `status`, `note` |
 | `herdr_wait` | Wait for one condition | `target`, then one of `turn`, `until[]`, `output{match, after_command?}`, `process_exit`; `timeout_ms` | `matched`, `timed_out`, `status`, `excerpt`; `process_exit` with nothing running returns `result: no_active_work` |

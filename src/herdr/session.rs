@@ -36,7 +36,7 @@ impl SessionEnv {
         }
     }
 
-    fn config_dir(&self) -> PathBuf {
+    pub fn config_dir(&self) -> PathBuf {
         if let Some(xdg) = &self.xdg_config_home {
             return xdg.join("herdr");
         }
@@ -64,7 +64,7 @@ pub fn resolve_socket_path(
     Ok(env.config_dir().join("herdr.sock"))
 }
 
-fn session_socket(name: &str, env: &SessionEnv) -> Result<PathBuf, SessionError> {
+pub fn session_socket(name: &str, env: &SessionEnv) -> Result<PathBuf, SessionError> {
     if name == DEFAULT_SESSION_NAME {
         return Ok(env.config_dir().join("herdr.sock"));
     }

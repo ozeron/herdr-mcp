@@ -51,7 +51,7 @@ struct State {
 }
 
 pub struct FakeHerdr {
-    _dir: TempDir,
+    _dir: Option<TempDir>,
     path: PathBuf,
     state: Arc<Mutex<State>>,
     disconnected: Arc<Notify>,
@@ -62,6 +62,15 @@ impl FakeHerdr {
     pub async fn start() -> Self {
         let dir = tempfile::Builder::new().prefix("hm").tempdir().unwrap();
         let path = dir.path().join("h.sock");
+        Self::bind(path, Some(dir))
+    }
+
+    /// Listens at `path`, whose directory must exist and which the caller cleans up.
+    pub async fn start_at(path: PathBuf) -> Self {
+        Self::bind(path, None)
+    }
+
+    fn bind(path: PathBuf, dir: Option<TempDir>) -> Self {
         let listener = UnixListener::bind(&path).unwrap();
         let state = Arc::new(Mutex::new(State::default()));
         let disconnected = Arc::new(Notify::new());

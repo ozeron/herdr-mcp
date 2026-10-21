@@ -2,7 +2,6 @@ use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::caller::resolve_caller;
 use crate::herdr::{
     AgentReadParams, ApiErrorCode, Client, HerdrError, PaneReadParams, PaneReadResult, ReadSource,
 };
@@ -47,10 +46,11 @@ pub struct ReadParams {
 }
 
 pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError> {
-    let client = inner.client()?;
+    let (client, active) = inner.session()?;
     let target = match params.target {
         Some(target) => target,
-        None => resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref())
+        None => inner
+            .resolve_caller(&client, &active)
             .await?
             .caller
             .map(|caller| caller.pane_id)

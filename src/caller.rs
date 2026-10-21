@@ -93,6 +93,17 @@ pub struct Resolution {
     pub guard_target: Option<String>,
 }
 
+impl Resolution {
+    /// No caller: the call comes from outside the session it talks to.
+    pub fn external() -> Self {
+        Self {
+            caller: None,
+            caller_verified: false,
+            guard_target: None,
+        }
+    }
+}
+
 /// Verifies `HERDR_PANE_ID` by checking that the pane's shell is an ancestor of the bridge,
 /// then falls back to scanning every pane for an ancestor shell.
 pub async fn resolve_caller(

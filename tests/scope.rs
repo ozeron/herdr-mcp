@@ -11,11 +11,12 @@ use harness::{count, process_info, snapshot};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
 use herdr_mcp::guard::TargetKind;
-use herdr_mcp::herdr::HerdrError;
+use herdr_mcp::herdr::{HerdrError, SessionEnv};
 use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::scope::{Scope, TargetRequest};
 use herdr_mcp::server::Inner;
+use herdr_mcp::sessions::Sessions;
 use herdr_mcp::tools::launch::LaunchTuning;
 use herdr_mcp::wait::Tuning;
 use serde_json::{Value, json};
@@ -32,7 +33,7 @@ struct Rig {
 
 fn inner(socket: &std::path::Path, env_pane: Option<&str>, dir: &TempDir) -> Inner {
     Inner {
-        socket_path: socket.to_path_buf(),
+        sessions: Sessions::new(socket.to_path_buf(), SessionEnv::default()),
         profile: Profile::new(None, None),
         mode: ToolMode::Control,
         ancestry: Arc::new(StaticAncestry(vec![9000, 4242, 1])),

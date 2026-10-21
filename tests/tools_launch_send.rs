@@ -196,7 +196,10 @@ async fn start(opts: Opts) -> Harness {
 fn direct_inner(fake: &FakeHerdr, mode: ToolMode, log_dir: &TempDir) -> Inner {
     let config = config(fake, &Opts::default(), log_dir, mode);
     Inner {
-        socket_path: config.socket_path,
+        sessions: herdr_mcp::sessions::Sessions::new(
+            config.socket_path,
+            herdr_mcp::herdr::SessionEnv::default(),
+        ),
         profile: config.profile,
         mode: config.mode,
         ancestry: config.ancestry,

@@ -8,13 +8,14 @@ use rmcp::model::{CallToolResult, Implementation, MetaObject, ServerCapabilities
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::caller::{Ancestry, CallerEnv};
+use crate::caller::{Ancestry, CallerEnv, Resolution, resolve_caller};
 use crate::cli::ToolMode;
-use crate::herdr::{Client, HerdrError};
+use crate::herdr::{Client, HerdrError, SessionEnv};
 use crate::install::InstallEnv;
 use crate::log::Logger;
 use crate::mailbox::Mailbox;
 use crate::profile::Profile;
+use crate::sessions::{ActiveSession, Sessions};
 use crate::tools;
 use crate::tools::launch::LaunchTuning;
 use crate::wait::Tuning;
@@ -46,7 +47,7 @@ pub struct BridgeConfig {
 }
 
 pub struct Inner {
-    pub socket_path: PathBuf,
+    pub sessions: Sessions,
     pub profile: Profile,
     pub mode: ToolMode,
     pub ancestry: Arc<dyn Ancestry>,
@@ -62,12 +63,30 @@ pub struct Inner {
 
 impl Inner {
     pub fn mailbox(&self) -> Mailbox {
-        Mailbox::new(&self.mailbox_state, &self.socket_path)
+        Mailbox::new(&self.mailbox_state, &self.sessions.active().socket_path)
     }
 
     /// Each tool call builds its own client, so calls share no connection state.
     pub fn client(&self) -> Result<Client, HerdrError> {
-        Client::new(&self.socket_path)
+        Ok(self.session()?.0)
+    }
+
+    /// A client and the session it talks to, read together so a switch cannot split them.
+    pub fn session(&self) -> Result<(Client, ActiveSession), HerdrError> {
+        let active = self.sessions.active();
+        Ok((Client::new(&active.socket_path)?, active))
+    }
+
+    /// The caller only exists in the home session; anywhere else the call is external.
+    pub async fn resolve_caller(
+        &self,
+        client: &Client,
+        active: &ActiveSession,
+    ) -> Result<Resolution, HerdrError> {
+        if !active.home {
+            return Ok(Resolution::external());
+        }
+        resolve_caller(client, &self.caller_env, self.ancestry.as_ref()).await
     }
 }
 
@@ -87,7 +106,7 @@ impl HerdrMcp {
         }
         Self {
             inner: Arc::new(Inner {
-                socket_path: config.socket_path,
+                sessions: Sessions::new(config.socket_path, SessionEnv::from_process()),
                 profile: config.profile,
                 mode: config.mode,
                 ancestry: config.ancestry,
@@ -124,6 +143,18 @@ impl HerdrMcp {
         Arc::get_mut(&mut self.inner)
             .expect("tuning is set before the server is shared")
             .launch = tuning;
+        self
+    }
+
+    /// Replaces where sessions are looked up; call right after `new`.
+    pub fn with_session_env(mut self, env: SessionEnv) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("the environment is set before the server is shared");
+        let sessions = std::mem::replace(
+            &mut inner.sessions,
+            Sessions::new(PathBuf::new(), SessionEnv::default()),
+        );
+        inner.sessions = sessions.with_env(env);
         self
     }
 
@@ -173,6 +204,29 @@ impl HerdrMcp {
         let started = Instant::now();
         let result = tools::capabilities::run(&self.inner, client_name(&ctx).as_deref()).await;
         self.finish("herdr_capabilities", started, result)
+    }
+
+    #[tool(
+        description = "List Herdr sessions: name, socket, whether it is running and whether it is the active one. Every other tool acts on the active session.",
+        annotations(read_only_hint = true)
+    )]
+    async fn herdr_sessions(&self) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let result = tools::sessions::list(&self.inner).await;
+        self.finish("herdr_sessions", started, result)
+    }
+
+    #[tool(
+        description = "Switch which Herdr session every tool uses. Call herdr_sessions to see them.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn herdr_use_session(
+        &self,
+        Parameters(params): Parameters<tools::sessions::UseParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let result = tools::sessions::use_session(&self.inner, params).await;
+        self.finish("herdr_use_session", started, result)
     }
 
     #[tool(

@@ -8,6 +8,7 @@ pub mod mail;
 pub mod read;
 pub mod run;
 pub mod send;
+pub mod sessions;
 pub mod wait;
 
 use rmcp::RoleServer;

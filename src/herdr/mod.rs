@@ -9,6 +9,6 @@ pub use error::{ApiErrorCode, HerdrError};
 pub use events::{Subscription, SubscriptionEvent};
 pub use session::{
     DEFAULT_SESSION_NAME, SESSION_ENV, SOCKET_PATH_ENV, SessionEnv, SessionError,
-    resolve_socket_path,
+    resolve_socket_path, session_socket,
 };
 pub use types::*;

@@ -17,6 +17,7 @@ pub mod providers;
 pub mod runtime_mode;
 pub mod scope;
 pub mod server;
+pub mod sessions;
 pub mod tools;
 pub mod tunnel;
 pub mod turn;

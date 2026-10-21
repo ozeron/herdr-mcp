@@ -8,7 +8,6 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::caller::resolve_caller;
 use crate::herdr::{
     AgentInfo, AgentStatus, Client, HerdrError, PaneInfo, PaneProcessInfo, TabInfo, WorkspaceInfo,
     WorktreeList, WorktreeListParams,
@@ -56,11 +55,11 @@ pub struct ListParams {
 }
 
 pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError> {
-    let client = inner.client()?;
+    let (client, active) = inner.session()?;
     let (snapshot, agents, resolution) = tokio::try_join!(
         client.session_snapshot(),
         client.agent_list(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
+        inner.resolve_caller(&client, &active),
     )?;
 
     let agent_by_pane: HashMap<&str, &AgentInfo> = agents
@@ -220,6 +219,7 @@ pub async fn run(inner: &Inner, params: ListParams) -> Result<Value, HerdrError>
     }
 
     Ok(json!({
+        "session": active.name,
         "caller": caller.map(|caller| json!({
             "pane_id": caller.pane_id,
             "verified": resolution.caller_verified,

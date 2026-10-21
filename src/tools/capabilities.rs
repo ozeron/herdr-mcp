@@ -2,18 +2,17 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::caller::resolve_caller;
 use crate::herdr::HerdrError;
 use crate::install::status;
 use crate::server::Inner;
 
 pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value, HerdrError> {
-    let client = inner.client()?;
+    let (client, active) = inner.session()?;
     // `join!`, not `try_join!`, so an error is chosen by order (compat, caller, manifests) and not
     // by whichever call fails first.
     let (compat, resolution, manifests) = tokio::join!(
         client.check_compat(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
+        inner.resolve_caller(&client, &active),
         client.agent_manifests(),
     );
     let (compat, resolution, manifests) = (compat?, resolution?, manifests?);
@@ -42,7 +41,7 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
         "caller_verified": resolution.caller_verified,
         "guard_target": resolution.guard_target,
         "tool_mode": inner.mode.as_str(),
-        "session": {"socket_path": inner.socket_path},
+        "session": {"name": active.name, "socket": active.socket_path, "home": active.home},
         "herdr": {"version": compat.version, "protocol": compat.protocol},
         "agents": agents,
         "wait_cap_ms": u64::try_from(wait_cap.as_millis()).unwrap_or(u64::MAX),

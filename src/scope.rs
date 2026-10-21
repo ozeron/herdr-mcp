@@ -45,6 +45,8 @@ pub struct Scope<'a> {
     client: ClientRef<'a>,
     env: CallerEnv,
     ancestry: Arc<dyn Ancestry>,
+    /// False when the active session is not the one the bridge started in: the caller is external.
+    home: bool,
     resolution: Option<Resolution>,
 }
 
@@ -146,10 +148,12 @@ pub struct PaneGuard {
 
 impl<'a> Scope<'a> {
     pub fn open(inner: &Inner) -> Result<Self, HerdrError> {
+        let (client, active) = inner.session()?;
         Ok(Self {
-            client: inner.client()?.into(),
+            client: client.into(),
             env: inner.caller_env.clone(),
             ancestry: Arc::clone(&inner.ancestry),
+            home: active.home,
             resolution: None,
         })
     }
@@ -160,6 +164,7 @@ impl<'a> Scope<'a> {
             client: client.into(),
             env: CallerEnv::default(),
             ancestry: Arc::new(crate::caller::StaticAncestry(Vec::new())),
+            home: true,
             resolution: Some(resolution),
         }
     }
@@ -168,11 +173,16 @@ impl<'a> Scope<'a> {
         &self.client
     }
 
+    async fn resolve(&self) -> Result<Resolution, HerdrError> {
+        if !self.home {
+            return Ok(Resolution::external());
+        }
+        resolve_caller(&self.client, &self.env, self.ancestry.as_ref()).await
+    }
+
     pub async fn caller(&mut self) -> Result<&Resolution, HerdrError> {
         if self.resolution.is_none() {
-            let resolution =
-                resolve_caller(&self.client, &self.env, self.ancestry.as_ref()).await?;
-            self.resolution = Some(resolution);
+            self.resolution = Some(self.resolve().await?);
         }
         Ok(self.resolution.as_ref().expect("resolved above"))
     }
@@ -184,10 +194,8 @@ impl<'a> Scope<'a> {
         match self.resolution.clone() {
             Some(resolution) => Ok((self.client.session_snapshot().await?, resolution)),
             None => {
-                let (snapshot, resolution) = tokio::try_join!(
-                    self.client.session_snapshot(),
-                    resolve_caller(&self.client, &self.env, self.ancestry.as_ref()),
-                )?;
+                let (snapshot, resolution) =
+                    tokio::try_join!(self.client.session_snapshot(), self.resolve(),)?;
                 self.resolution = Some(resolution.clone());
                 Ok((snapshot, resolution))
             }
@@ -243,10 +251,7 @@ impl<'a> Scope<'a> {
             let (resolution, taken) = match self.resolution.clone() {
                 Some(resolution) => (Ok(resolution), self.client.session_snapshot().await),
                 None => {
-                    tokio::join!(
-                        resolve_caller(&self.client, &self.env, self.ancestry.as_ref()),
-                        self.client.session_snapshot(),
-                    )
+                    tokio::join!(self.resolve(), self.client.session_snapshot(),)
                 }
             };
             let (resolution, taken) = (resolution?, taken?);
