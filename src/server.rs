@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -145,6 +145,8 @@ pub struct HerdrMcp {
     tool_router: ToolRouter<Self>,
     /// Tool calls running now, across every MCP session; a shutdown drains them first.
     in_flight: Arc<AtomicUsize>,
+    /// Set once a shutdown starts: new calls are refused while running ones finish.
+    draining: Arc<AtomicBool>,
 }
 
 /// Counts one tool call for as long as it runs.
@@ -183,7 +185,13 @@ impl HerdrMcp {
             }),
             tool_router,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag a shutdown sets so new calls are refused while running ones drain.
+    pub fn draining(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.draining)
     }
 
     /// The count of tool calls running now, for draining before a shutdown.
@@ -396,6 +404,8 @@ impl HerdrMcp {
     )]
     async fn herdr_tunnel_stop(&self) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        // Refuse new work now; the stop itself follows once this reply is out.
+        self.draining.store(true, Ordering::SeqCst);
         if let Some(tunnel) = &self.inner.tunnel {
             let stopper = tunnel.stopper.clone();
             tokio::spawn(async move {
@@ -628,29 +638,33 @@ impl ServerHandler for HerdrMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        if self.expired() {
-            let started = Instant::now();
-            self.audit(
-                &request.name,
-                "tunnel_expired",
-                started.elapsed(),
-                &Note::none(),
-            );
-            let start = self.inner.tunnel.as_ref().map_or("", |t| t.start_command);
-            return tools::failure_with(
-                "tunnel_expired",
-                &format!(
-                    "the tunnel has expired and is shutting down; restart it on the Mac with `{start}`"
-                ),
-                None,
-            )
-            .into_call_tool_result();
-        }
-        let _running = InFlight::enter(&self.in_flight);
         let caller = Caller {
             client: client_name(&context),
             mcp_session: mcp_session(&context),
         };
+        let refusal = if self.expired() {
+            let start = self.inner.tunnel.as_ref().map_or("", |t| t.start_command);
+            Some((
+                "tunnel_expired",
+                format!(
+                    "the tunnel has expired and is shutting down; restart it on the Mac with `{start}`"
+                ),
+            ))
+        } else if self.draining.load(Ordering::SeqCst) {
+            Some((
+                "shutting_down",
+                "the bridge is shutting down and takes no new calls; nothing was done".to_owned(),
+            ))
+        } else {
+            None
+        };
+        if let Some((code, message)) = refusal {
+            CALLER.sync_scope(caller, || {
+                self.audit(&request.name, code, Duration::ZERO, &Note::none());
+            });
+            return tools::failure_with(code, &message, None).into_call_tool_result();
+        }
+        let _running = InFlight::enter(&self.in_flight);
         let context = ToolCallContext::new(self, request, context);
         CALLER.scope(caller, self.tool_router.call(context)).await
     }

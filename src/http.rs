@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -178,10 +178,15 @@ pub async fn serve(
 /// restart drains before it kills.
 pub const DRAIN_MAX: Duration = Duration::from_secs(10);
 const DRAIN_POLL: Duration = Duration::from_millis(100);
+const FLUSH_GRACE: Duration = Duration::from_millis(300);
 
-/// On SIGTERM or SIGINT, drains running tool calls, then cancels `token`. A call still
-/// running at `DRAIN_MAX` is cut; a cut wait resumes with `herdr_wait` and its turn token.
-pub async fn drain_on_signal(token: CancellationToken, in_flight: Arc<AtomicUsize>) {
+/// On SIGTERM or SIGINT, refuses new calls, drains running ones, then cancels `token`. A call
+/// still running at `DRAIN_MAX` is cut; a cut wait resumes with `herdr_wait` and its turn token.
+pub async fn drain_on_signal(
+    token: CancellationToken,
+    in_flight: Arc<AtomicUsize>,
+    draining: Arc<AtomicBool>,
+) {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (
         signal(SignalKind::terminate()),
@@ -194,6 +199,7 @@ pub async fn drain_on_signal(token: CancellationToken, in_flight: Arc<AtomicUsiz
         _ = int.recv() => {}
         () = token.cancelled() => return,
     }
+    draining.store(true, Ordering::SeqCst);
     drain(&token, &in_flight, DRAIN_MAX, DRAIN_POLL).await;
 }
 
@@ -216,5 +222,7 @@ pub async fn drain(
     {
         tokio::time::sleep(poll).await;
     }
+    // A call's count drops when its result is built, a moment before it is written out.
+    tokio::time::sleep(FLUSH_GRACE.min(max)).await;
     token.cancel();
 }

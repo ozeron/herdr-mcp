@@ -721,6 +721,7 @@ async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelErr
     tokio::spawn(http::drain_on_signal(
         shutdown.clone(),
         server.in_flight.clone(),
+        server.draining.clone(),
     ));
     // `herdr_tunnel_stop` and the expiry reach a foreground run through this token.
     tokio::spawn({

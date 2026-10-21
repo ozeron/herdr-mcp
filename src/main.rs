@@ -95,6 +95,7 @@ async fn serve_http(args: &HttpServeArgs) -> Result<(), ServeError> {
     tokio::spawn(http::drain_on_signal(
         server.shutdown.clone(),
         server.in_flight.clone(),
+        server.draining.clone(),
     ));
     if let Ok(addr) = server.listener.local_addr() {
         eprintln!("herdr-mcp: serving MCP on http://{addr}{}", http::MCP_PATH);

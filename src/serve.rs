@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use axum::Router;
@@ -95,6 +95,8 @@ pub struct HttpServer {
     pub shutdown: CancellationToken,
     /// Tool calls running now, for draining on a signal.
     pub in_flight: Arc<AtomicUsize>,
+    /// Set when a shutdown starts, so new calls are refused.
+    pub draining: Arc<AtomicBool>,
 }
 
 pub async fn prepare_http(spec: HttpSpec) -> Result<HttpServer, ServeError> {
@@ -105,6 +107,7 @@ pub async fn prepare_http(spec: HttpSpec) -> Result<HttpServer, ServeError> {
         .map_err(ServeError::usage)?;
     let server = build_bridge(spec.bridge)?;
     let in_flight = server.in_flight();
+    let draining = server.draining();
     let shutdown = CancellationToken::new();
     let mut router = http::mcp_router(server, &options, spec.check, shutdown.clone())
         .map_err(ServeError::usage)?;
@@ -116,5 +119,6 @@ pub async fn prepare_http(spec: HttpSpec) -> Result<HttpServer, ServeError> {
         router,
         shutdown,
         in_flight,
+        draining,
     })
 }

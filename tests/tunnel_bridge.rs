@@ -357,6 +357,23 @@ async fn tunnel_stop_replies_first_then_calls_the_stop_helper_and_is_audited() {
 }
 
 #[tokio::test]
+async fn after_tunnel_stop_new_calls_are_refused_and_audited_with_the_client() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    ok(&r.h, "herdr_tunnel_stop", json!({})).await;
+
+    let out = err(&r.h, "herdr_sessions", json!({})).await;
+
+    assert_eq!(out["code"], "shutting_down");
+    let refused = r
+        .lines()
+        .into_iter()
+        .find(|line| line["outcome"] == "shutting_down")
+        .expect("a refused line");
+    assert_eq!(refused["tool"], "herdr_sessions");
+    assert_eq!(refused["client"], "test-client");
+}
+
+#[tokio::test]
 async fn after_expiry_calls_return_tunnel_expired_and_the_stop_helper_runs() {
     let r = serve(ToolMode::Read, true, Some(now() - 1), None).await;
     assert_eq!(
