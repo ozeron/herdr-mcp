@@ -13,6 +13,7 @@ use crate::caller::resolve_caller;
 use crate::guard::{self, TargetKind};
 use crate::herdr::{AgentPromptParams, AgentStatus, Client, HerdrError};
 use crate::mailbox::{self, Inbox, Mailbox, Message, Party, SenderFilter};
+use crate::scope::looks_like_herdr_id;
 use crate::server::Inner;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::wait::{PROGRESS_INTERVAL, Progress};
@@ -190,23 +191,6 @@ pub async fn send(
         None => out["nudged"] = json!(true),
     }
     Ok(out)
-}
-
-/// Whether `raw` has the shape of a Herdr pane, tab or workspace ID (`w1:p2`, `w1:t2`, `w1`), so
-/// a miss is a wrong ID, not an agent name that is not running.
-fn looks_like_herdr_id(raw: &str) -> bool {
-    let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
-    match raw.split_once(':') {
-        Some((scope, rest)) => {
-            !scope.is_empty()
-                && !scope.contains(char::is_whitespace)
-                && rest
-                    .strip_prefix('p')
-                    .or_else(|| rest.strip_prefix('t'))
-                    .is_some_and(digits)
-        }
-        None => raw.strip_prefix('w').is_some_and(digits),
-    }
 }
 
 /// `None` when the nudge was sent, else why it was not.

@@ -14,6 +14,7 @@ pub mod profile;
 pub mod provenance;
 pub mod providers;
 pub mod runtime_mode;
+pub mod scope;
 pub mod server;
 pub mod tools;
 pub mod turn;
