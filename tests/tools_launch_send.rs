@@ -210,6 +210,7 @@ fn direct_inner(fake: &FakeHerdr, mode: ToolMode, log_dir: &TempDir) -> Inner {
         interrupt_settle: Duration::from_millis(1),
         launch: launch_tuning(),
         mailbox_state: log_dir.path().join("state"),
+        tunnel: None,
     }
 }
 

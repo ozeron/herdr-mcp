@@ -3,11 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, MetaObject, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, MetaObject,
+    ServerCapabilities, ServerConfig,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
+use crate::audit::{Audit, Note, unix_now};
 use crate::caller::{Ancestry, CallerEnv, Resolution, resolve_caller};
 use crate::cli::ToolMode;
 use crate::herdr::{Client, HerdrError, SessionEnv};
@@ -18,9 +23,15 @@ use crate::profile::Profile;
 use crate::sessions::{ActiveSession, Sessions};
 use crate::tools;
 use crate::tools::launch::LaunchTuning;
+use crate::tunnel::{Stopper, TunnelConfig};
 use crate::wait::Tuning;
 
 const INSTRUCTIONS: &str = include_str!("instructions.md");
+
+const TUNNEL_TOOL: &str = "herdr_tunnel_stop";
+
+/// How long `herdr_tunnel_stop` waits so its reply reaches the client before the service goes.
+const STOP_DELAY: Duration = Duration::from_millis(300);
 
 const CONTROL_TOOLS: [&str; 5] = [
     "herdr_launch",
@@ -46,6 +57,13 @@ pub struct BridgeConfig {
     pub install_env: Option<InstallEnv>,
 }
 
+/// Tunnel-only state: the audit log, the expiry and the way to stop the service.
+pub struct TunnelRuntime {
+    pub audit: Audit,
+    pub expires_at: Option<u64>,
+    pub stopper: Arc<dyn Stopper>,
+}
+
 pub struct Inner {
     pub sessions: Sessions,
     pub profile: Profile,
@@ -59,6 +77,8 @@ pub struct Inner {
     pub launch: LaunchTuning,
     /// What `XDG_STATE_HOME` would be: the mailbox lives under it.
     pub mailbox_state: PathBuf,
+    /// `None` unless the bridge runs behind the tunnel (`--tunnel`).
+    pub tunnel: Option<TunnelRuntime>,
 }
 
 impl Inner {
@@ -98,12 +118,7 @@ pub struct HerdrMcp {
 
 impl HerdrMcp {
     pub fn new(config: BridgeConfig) -> Self {
-        let mut tool_router = Self::tool_router();
-        if config.mode == ToolMode::Read {
-            for name in CONTROL_TOOLS {
-                tool_router.remove_route(name);
-            }
-        }
+        let tool_router = Self::router(config.mode, false);
         Self {
             inner: Arc::new(Inner {
                 sessions: Sessions::new(config.socket_path, SessionEnv::from_process()),
@@ -117,9 +132,41 @@ impl HerdrMcp {
                 interrupt_settle: tools::interrupt::SETTLE,
                 launch: LaunchTuning::default(),
                 mailbox_state: crate::mailbox::default_state_home(),
+                tunnel: None,
             }),
             tool_router,
         }
+    }
+
+    fn router(mode: ToolMode, tunnel: bool) -> ToolRouter<Self> {
+        let mut tool_router = Self::tool_router();
+        if mode == ToolMode::Read {
+            for name in CONTROL_TOOLS {
+                tool_router.remove_route(name);
+            }
+        }
+        if !tunnel {
+            tool_router.remove_route(TUNNEL_TOOL);
+        }
+        tool_router
+    }
+
+    /// Turns on tunnel mode: the audit log, `herdr_tunnel_stop` and the expiry. Call right after
+    /// `new`, from inside the Tokio runtime.
+    pub fn with_tunnel(mut self, config: TunnelConfig) -> Self {
+        let audit = Audit::new(&config.state_home);
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("tunnel mode is set before the server is shared");
+        self.tool_router = Self::router(inner.mode, true);
+        if let Some(at) = config.expires_at {
+            tokio::spawn(stop_at(at, audit.clone(), config.stopper.clone()));
+        }
+        inner.tunnel = Some(TunnelRuntime {
+            audit,
+            expires_at: config.expires_at,
+            stopper: config.stopper,
+        });
+        self
     }
 
     /// Replaces the wait timings; call right after `new`.
@@ -174,21 +221,51 @@ impl HerdrMcp {
         &self,
         tool: &str,
         started: Instant,
+        note: Note,
         result: Result<serde_json::Value, HerdrError>,
     ) -> Result<CallToolResult, ErrorData> {
         let elapsed = started.elapsed();
-        let response = match result {
-            Ok(value) => {
-                self.inner.logger.call(tool, "ok", elapsed);
-                tools::success(value)
-            }
-            Err(err) => {
-                self.inner.logger.call(tool, err.code(), elapsed);
-                tools::failure_with(err.code(), &err.to_string(), err.details())
-            }
+        let (outcome, response) = match result {
+            Ok(value) => ("ok".to_owned(), tools::success(value)),
+            Err(err) => (
+                err.code().to_owned(),
+                tools::failure_with(err.code(), &err.to_string(), err.details()),
+            ),
         };
+        self.inner.logger.call(tool, &outcome, elapsed);
+        self.audit(tool, &outcome, elapsed, &note);
         Ok(response)
     }
+
+    fn audit(&self, tool: &str, outcome: &str, elapsed: Duration, note: &Note) {
+        if let Some(tunnel) = &self.inner.tunnel {
+            let session = self.inner.sessions.active().name;
+            tunnel.audit.record(tool, &session, outcome, elapsed, note);
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.inner
+            .tunnel
+            .as_ref()
+            .and_then(|tunnel| tunnel.expires_at)
+            .is_some_and(|at| unix_now() >= at)
+    }
+}
+
+/// Waits until `at` (Unix seconds), then stops the service.
+async fn stop_at(at: u64, audit: Audit, stopper: Arc<dyn Stopper>) {
+    while unix_now() < at {
+        tokio::time::sleep(Duration::from_secs((at - unix_now()).max(1))).await;
+    }
+    audit.record(
+        "tunnel_expiry",
+        "-",
+        "stopping",
+        Duration::ZERO,
+        &Note::none(),
+    );
+    let _ = tokio::task::spawn_blocking(move || stopper.stop()).await;
 }
 
 #[tool_router]
@@ -203,7 +280,7 @@ impl HerdrMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let result = tools::capabilities::run(&self.inner, client_name(&ctx).as_deref()).await;
-        self.finish("herdr_capabilities", started, result)
+        self.finish("herdr_capabilities", started, Note::none(), result)
     }
 
     #[tool(
@@ -213,7 +290,7 @@ impl HerdrMcp {
     async fn herdr_sessions(&self) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let result = tools::sessions::list(&self.inner).await;
-        self.finish("herdr_sessions", started, result)
+        self.finish("herdr_sessions", started, Note::none(), result)
     }
 
     #[tool(
@@ -225,8 +302,30 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::sessions::UseParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::use_session(&params);
         let result = tools::sessions::use_session(&self.inner, params).await;
-        self.finish("herdr_use_session", started, result)
+        self.finish("herdr_use_session", started, note, result)
+    }
+
+    #[tool(
+        description = "Stop the ChatGPT tunnel. The reply comes first, then the tunnel shuts down and this connection ends. Restart it on the Mac with `herdr-mcp tunnel start`.",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    async fn herdr_tunnel_stop(&self) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        if let Some(tunnel) = &self.inner.tunnel {
+            let stopper = tunnel.stopper.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(STOP_DELAY).await;
+                let _ = tokio::task::spawn_blocking(move || stopper.stop()).await;
+            });
+        }
+        self.finish(
+            "herdr_tunnel_stop",
+            started,
+            Note::none(),
+            Ok(serde_json::json!({"stopping": true})),
+        )
     }
 
     #[tool(
@@ -239,7 +338,7 @@ impl HerdrMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let result = tools::list::run(&self.inner, params).await;
-        self.finish("herdr_list", started, result)
+        self.finish("herdr_list", started, Note::none(), result)
     }
 
     #[tool(
@@ -252,8 +351,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::read::ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::read(&params);
         let result = tools::read::run(&self.inner, params).await;
-        self.finish("herdr_read", started, result)
+        self.finish("herdr_read", started, note, result)
     }
 
     #[tool(
@@ -266,8 +366,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::wait::WaitParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::wait(&params);
         let result = tools::wait::run(&self.inner, &ctx, params).await;
-        self.finish("herdr_wait", started, result)
+        self.finish("herdr_wait", started, note, result)
     }
 
     #[tool(
@@ -280,6 +381,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::launch::LaunchParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::launch(&params);
         let result = tools::launch::run(
             &self.inner,
             client_name(&ctx).as_deref(),
@@ -288,7 +390,7 @@ impl HerdrMcp {
             params,
         )
         .await;
-        self.finish("herdr_launch", started, result)
+        self.finish("herdr_launch", started, note, result)
     }
 
     #[tool(
@@ -301,8 +403,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::run::RunParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::run(&params);
         let result = tools::run::run(&self.inner, client_name(&ctx).as_deref(), params).await;
-        self.finish("herdr_run", started, result)
+        self.finish("herdr_run", started, note, result)
     }
 
     #[tool(
@@ -315,9 +418,10 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::send::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::send(&params);
         let result =
             tools::send::run(&self.inner, client_name(&ctx).as_deref(), &ctx.ct, params).await;
-        self.finish("herdr_send", started, result)
+        self.finish("herdr_send", started, note, result)
     }
 
     #[tool(
@@ -329,8 +433,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::interrupt::InterruptParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::interrupt(&params);
         let result = tools::interrupt::run(&self.inner, params).await;
-        self.finish("herdr_interrupt", started, result)
+        self.finish("herdr_interrupt", started, note, result)
     }
 
     #[tool(
@@ -342,8 +447,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::close::CloseParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::close(&params);
         let result = tools::close::run(&self.inner, params).await;
-        self.finish("herdr_close", started, result)
+        self.finish("herdr_close", started, note, result)
     }
 
     #[tool(
@@ -355,8 +461,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::mail::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::mail_send(&params);
         let result = tools::mail::send(&self.inner, &self.mailbox(), params).await;
-        self.finish("herdr_mail_send", started, result)
+        self.finish("herdr_mail_send", started, note, result)
     }
 
     #[tool(
@@ -368,8 +475,9 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::mail::ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::mail_read(params.from.as_deref());
         let result = tools::mail::read(&self.inner, &self.mailbox(), params).await;
-        self.finish("herdr_mail_read", started, result)
+        self.finish("herdr_mail_read", started, note, result)
     }
 
     #[tool(
@@ -382,6 +490,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::mail::WaitParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
+        let note = Note::mail_read(params.from.as_deref());
         let result = tools::mail::wait(
             &self.inner,
             &self.mailbox(),
@@ -391,12 +500,36 @@ impl HerdrMcp {
             params,
         )
         .await;
-        self.finish("herdr_mail_wait", started, result)
+        self.finish("herdr_mail_wait", started, note, result)
     }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for HerdrMcp {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if self.expired() {
+            let started = Instant::now();
+            self.audit(
+                &request.name,
+                "tunnel_expired",
+                started.elapsed(),
+                &Note::none(),
+            );
+            return tools::failure_with(
+                "tunnel_expired",
+                "the tunnel has expired and is shutting down; restart it on the Mac with `herdr-mcp tunnel start`",
+                None,
+            )
+            .into_call_tool_result();
+        }
+        let context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(context).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("herdr-mcp", env!("CARGO_PKG_VERSION")))

@@ -48,6 +48,7 @@ fn inner(socket: &std::path::Path, env_pane: Option<&str>, dir: &TempDir) -> Inn
         interrupt_settle: Duration::from_millis(1),
         launch: LaunchTuning::default(),
         mailbox_state: dir.path().join("state"),
+        tunnel: None,
     }
 }
 

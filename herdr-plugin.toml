@@ -43,13 +43,34 @@ command = ["sh", "-c", "bin/herdr-mcp install --remove; printf '\\nPress Enter t
 [[panes]]
 id = "tunnel-setup"
 title = "Herdr MCP: ChatGPT tunnel (setup)"
-description = "Save your tunnel ID and store the runtime key in the macOS Keychain. Read tools only."
+description = "Save your tunnel ID and store the runtime key in the macOS Keychain."
 placement = "split"
 command = ["sh", "-c", "bin/herdr-mcp tunnel setup; printf '\\nPress Enter to close. '; read _"]
 
 [[panes]]
-id = "tunnel"
-title = "Herdr MCP: ChatGPT tunnel"
-description = "Let ChatGPT use the read tools over OpenAI's tunnel. Read tools only; access lasts while this pane is open."
+id = "tunnel-start-full"
+title = "Herdr MCP: ChatGPT tunnel (start, full access)"
+description = "Start the background tunnel with control tools. ChatGPT can then run commands as you and type into your panes. Shows a disclosure and asks you to type 'full access' first."
 placement = "split"
-command = ["sh", "-c", "bin/herdr-mcp tunnel run; printf '\\nPress Enter to close. '; read _"]
+command = ["sh", "-c", "bin/herdr-mcp tunnel start --full; printf '\\nPress Enter to close. '; read _"]
+
+[[actions]]
+id = "tunnel-start"
+title = "Herdr MCP: ChatGPT tunnel (start, read)"
+description = "Start the background tunnel with read tools only. It keeps running until you stop it."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "start"]
+
+[[actions]]
+id = "tunnel-stop"
+title = "Herdr MCP: ChatGPT tunnel (stop)"
+description = "Stop the background tunnel and remove its LaunchAgent."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "stop"]
+
+[[actions]]
+id = "tunnel-status"
+title = "Herdr MCP: ChatGPT tunnel (status)"
+description = "Show whether the tunnel runs, its mode, expiry and the last audit lines. Writes nothing."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "status"]

@@ -12,7 +12,7 @@ use herdr_mcp::log::Logger;
 use herdr_mcp::print_config;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
-use herdr_mcp::tunnel::{self, TunnelEnv};
+use herdr_mcp::tunnel::{self, RunOptions, StartOptions, SystemRunner, TunnelConfig, TunnelEnv};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -38,7 +38,18 @@ async fn main() -> ExitCode {
         .map(|dir| dir.join("herdr-mcp"))
         .and_then(|dir| Logger::to_dir(dir).ok())
         .unwrap_or_else(Logger::stderr_only);
-    let server = HerdrMcp::new(BridgeConfig {
+    let tunnel = if args.tunnel {
+        match TunnelConfig::from_process(args.expires_at) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                eprintln!("herdr-mcp: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let mut server = HerdrMcp::new(BridgeConfig {
         socket_path,
         profile: Profile::new(args.client, args.max_wait_ms.map(Duration::from_millis)),
         mode: args.tools,
@@ -47,6 +58,9 @@ async fn main() -> ExitCode {
         logger,
         install_env: InstallEnv::from_process().ok(),
     });
+    if let Some(tunnel) = tunnel {
+        server = server.with_tunnel(tunnel);
+    }
     match server.serve(stdio()).await {
         Ok(running) => {
             let _ = running.waiting().await;
@@ -134,8 +148,34 @@ fn run_tunnel(command: &TunnelCommand) -> ExitCode {
     };
     let code = match command {
         TunnelCommand::Setup => tunnel::setup(&env, &mut io),
+        TunnelCommand::Start(args) => {
+            let duration = match args.duration.as_deref().map(tunnel::parse_duration) {
+                None => None,
+                Some(Ok(duration)) => Some(duration),
+                Some(Err(err)) => {
+                    eprintln!("herdr-mcp: {err}");
+                    return ExitCode::from(2);
+                }
+            };
+            let options = StartOptions {
+                full: args.full,
+                duration,
+                session: args.session.clone(),
+            };
+            let now = herdr_mcp::audit::unix_now();
+            tunnel::start(&env, &options, &SystemRunner, now, &mut io)
+        }
+        TunnelCommand::Stop => tunnel::stop(&env, &SystemRunner, &mut io),
+        TunnelCommand::Status => tunnel::status(&env, &SystemRunner, &mut io),
+        TunnelCommand::Log(args) => tunnel::log(&env, args.lines, &mut io),
         TunnelCommand::Run(args) => {
-            match tunnel::prepare_run(&env, args.session.as_deref(), &mut io) {
+            let options = RunOptions {
+                session: args.session.clone(),
+                full: args.full,
+                full_confirmed: args.full_confirmed,
+                expires_at: args.expires_at,
+            };
+            match tunnel::prepare_run(&env, &options, &mut io) {
                 Ok(mut child) => {
                     // exec replaces this process, so closing the pane kills tunnel-client directly.
                     let err = std::os::unix::process::CommandExt::exec(&mut child);
@@ -144,7 +184,7 @@ fn run_tunnel(command: &TunnelCommand) -> ExitCode {
                 }
                 Err(err) => {
                     eprintln!("herdr-mcp: {err}");
-                    1
+                    err.code()
                 }
             }
         }

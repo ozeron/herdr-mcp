@@ -42,6 +42,12 @@ pub struct Args {
     /// Tools to register
     #[arg(long, value_enum, default_value = "read")]
     pub tools: ToolMode,
+    /// Tunnel mode, set by `tunnel run`: audit log and `herdr_tunnel_stop`
+    #[arg(long)]
+    pub tunnel: bool,
+    /// Stop the tunnel at this Unix time (seconds); needs --tunnel
+    #[arg(long, requires = "tunnel")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -59,8 +65,16 @@ pub enum Command {
 pub enum TunnelCommand {
     /// Save the tunnel ID and store the runtime key in the macOS Keychain
     Setup,
-    /// Run tunnel-client with the read tools; access lasts until it exits
+    /// Run tunnel-client in the foreground; access lasts until it exits
     Run(TunnelRunArgs),
+    /// Run the tunnel in the background as a macOS LaunchAgent
+    Start(TunnelStartArgs),
+    /// Stop the background tunnel and remove its LaunchAgent
+    Stop,
+    /// Show whether the background tunnel runs, its mode, expiry and recent audit lines
+    Status,
+    /// Print the tunnel audit log
+    Log(TunnelLogArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -68,6 +82,35 @@ pub struct TunnelRunArgs {
     /// Herdr session name for the bridge
     #[arg(long)]
     pub session: Option<String>,
+    /// Register the control tools; `tunnel start --full` sets --full-confirmed after the disclosure
+    #[arg(long)]
+    pub full: bool,
+    /// Proof that `tunnel start --full` showed the disclosure; do not set by hand
+    #[arg(long, requires = "full")]
+    pub full_confirmed: bool,
+    /// Stop the tunnel at this Unix time (seconds)
+    #[arg(long)]
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct TunnelStartArgs {
+    /// Give ChatGPT the control tools; prints a disclosure and asks you to type `full access`
+    #[arg(long)]
+    pub full: bool,
+    /// Stop the tunnel after this long, like 30m, 8h or 2d
+    #[arg(long = "for", value_name = "DURATION")]
+    pub duration: Option<String>,
+    /// Herdr session name for the bridge
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct TunnelLogArgs {
+    /// How many of the last lines to print
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub lines: usize,
 }
 
 #[derive(Debug, ClapArgs)]

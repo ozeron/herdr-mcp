@@ -136,23 +136,58 @@ Desktop apps start the server without your shell's environment, so use the absol
 
 ### ChatGPT
 
-ChatGPT's Codex tab reads the Codex `config.toml`, so `print-config` covers it. ChatGPT chat reaches a local server through OpenAI's tunnel-client, which keeps an outbound connection to OpenAI and runs `herdr-mcp --tools read` as its child.
+ChatGPT's Codex tab reads the Codex `config.toml`, so `print-config` covers it. ChatGPT chat reaches this Mac through OpenAI's tunnel-client: it keeps an outbound connection to OpenAI and runs `herdr-mcp` as its child. `tunnel start` runs it in the background as a macOS LaunchAgent, so it survives Herdr restarts and restarts after a crash.
 
-One time, on the OpenAI Platform:
-- create a tunnel in your ChatGPT workspace and note its `tunnel_...` ID;
-- create a restricted runtime key with Tunnels Read and Use.
+**1. Install**
+```sh
+brew install openai/tools/tunnel-client
+herdr plugin update herdr-mcp
+```
 
-Then:
-1. `brew install openai/tools/tunnel-client`.
-2. Open the "Herdr MCP: ChatGPT tunnel (setup)" pane, or run `herdr-mcp tunnel setup`. It saves the ID to `~/.config/herdr-mcp/tunnel` (or under `$XDG_CONFIG_HOME`) and has the macOS Keychain prompt for the key. The key never passes through herdr-mcp.
-3. In ChatGPT: Plugins, +, Add custom MCP server, Connection: Tunnel, pick the tunnel, configure auth, accept the risk warning, Create as a plugin. A workspace admin must allow custom MCP servers, and check who in the workspace can use the connector.
-4. Open the "Herdr MCP: ChatGPT tunnel" pane, or run `herdr-mcp tunnel run [--session <name>]`. It reads `CONTROL_PLANE_API_KEY` if set, else the Keychain, and execs `tunnel-client run`.
+**2. One time, in the OpenAI Platform**
+- Create a tunnel in your ChatGPT workspace and note its `tunnel_...` ID.
+- Create a restricted runtime key with Tunnels Read and Use.
 
-Safety:
-- Pane output goes to OpenAI and to whoever can use the connector, human shells included.
-- Pane output is untrusted input, so prompt injection can steer the model, but only read tools exist.
-- Read mode is fixed; there is no flag to expose control tools through the tunnel.
-- Access ends when you close the pane or press Ctrl-C.
+**3. Save the ID and key**
+```sh
+herdr-mcp tunnel setup
+```
+The ID goes to `~/.config/herdr-mcp/tunnel` (or under `$XDG_CONFIG_HOME`). The Keychain prompts for the key; it never passes through herdr-mcp and never reaches the LaunchAgent file.
+
+**4. Start it**
+```sh
+herdr-mcp tunnel start                 # read tools
+herdr-mcp tunnel start --full          # control tools, after a typed disclosure
+herdr-mcp tunnel start --for 8h        # stop by itself after 30m, 8h, 2d...
+herdr-mcp tunnel start --session work  # begin in a named Herdr session
+```
+There is no time limit unless you pass `--for`. `--full` prints what ChatGPT will be able to do and starts only if you type `full access`. The mode is fixed at start; ChatGPT cannot change it. The plugin has the same entries: start (read), start (full access), stop and status.
+
+**5. Connect ChatGPT**
+Plugins, +, Add custom MCP server, Connection: Tunnel, pick your tunnel, keep it private to you. Accept the risk warning and create it as a plugin. A workspace admin must allow custom MCP servers first.
+
+**6. Daily use**
+Ask ChatGPT to call `herdr_sessions` to see your Herdr sessions and `herdr_use_session` to switch. Every tool then acts on the active session. Pane output is untrusted data, so tell ChatGPT what to do rather than what to read.
+
+**7. Stop, check, kill switches**
+```sh
+herdr-mcp tunnel status      # running or not, mode, started, expires, last 5 audit lines
+herdr-mcp tunnel log -n 100  # the audit log
+herdr-mcp tunnel stop        # boot out the LaunchAgent and remove it
+```
+Other ways to stop it:
+- ask ChatGPT to call `herdr_tunnel_stop` (present only behind the tunnel);
+- disable the plugin in ChatGPT;
+- revoke the runtime key in the OpenAI Platform.
+
+**8. Security notes**
+- Full access means ChatGPT can run shell commands as you, type into any pane, launch and close agents and switch sessions. Client sandboxes and approval modes do not contain it, and there are no per-action prompts.
+- Pane output goes to OpenAI, and anyone who can use your ChatGPT connector gets the access. Keep the connector private.
+- The audit log is `$XDG_STATE_HOME/herdr-mcp/tunnel-audit.log` (default `~/.local/state/herdr-mcp/`), mode 0600. Each line has time, tool, session, target, outcome and duration. Write tools also record the command, text or keys, and the instructions to a launched agent. Mail bodies and pane output are never logged. It is separate from `herdr-mcp.log`.
+- Pane output is untrusted input, so prompt injection can steer the model; in full mode that means commands.
+- `tunnel start` writes `~/Library/LaunchAgents/dev.herdr-mcp.tunnel.plist` and logs to `tunnel.out.log` and `tunnel.err.log` in the state directory. `tunnel run --full` refuses to start without the confirmation `start --full` records.
+- `tunnel run [--session <name>]` still works in the foreground for debugging; `herdr_tunnel_stop` and `tunnel stop` only manage the background service. It reads `CONTROL_PLANE_API_KEY` if set, else the Keychain.
+- The background service is macOS only. On Linux, use `tunnel run`.
 - The tunnel-client binary is not notarized: macOS may block it on first run. Allow it in System Settings, Privacy and Security.
 - Limits: 120 s per request, 10 MiB per message.
 

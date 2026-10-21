@@ -97,8 +97,8 @@ fn every_command_runs_bin_herdr_mcp_with_a_subcommand_it_accepts() {
         .chain(tables(&doc, "panes"))
         .collect();
     assert!(
-        entries.len() >= 6,
-        "status, install, install-control, remove, tunnel-setup, tunnel"
+        entries.len() >= 9,
+        "status, install, install-control, remove, tunnel-setup, tunnel-start-full, tunnel-start, tunnel-stop, tunnel-status"
     );
     for entry in entries {
         let id = text(entry, "id");
@@ -122,7 +122,7 @@ fn install_and_remove_open_a_pane_because_actions_have_no_tty() {
         "install-control",
         "remove",
         "tunnel-setup",
-        "tunnel",
+        "tunnel-start-full",
     ] {
         assert!(ids.contains(&id), "missing pane {id}");
     }
@@ -131,10 +131,15 @@ fn install_and_remove_open_a_pane_because_actions_have_no_tty() {
     }
     for action in tables(&doc, "actions") {
         let words = bridge_argv(&argv(action));
-        assert_eq!(
-            words,
-            ["bin/herdr-mcp", "install", "--status"],
-            "only status runs as a plain action"
+        let allowed: [&[&str]; 4] = [
+            &["install", "--status"],
+            &["tunnel", "start"],
+            &["tunnel", "stop"],
+            &["tunnel", "status"],
+        ];
+        assert!(
+            allowed.iter().any(|ok| words[1..] == **ok),
+            "{words:?} needs no terminal, so it may run as a plain action"
         );
     }
 }
@@ -149,27 +154,65 @@ fn install_panes_pass_the_right_flags() {
             "install-control" => assert_eq!(words[1..], ["install", "--control"]),
             "remove" => assert_eq!(words[1..], ["install", "--remove"]),
             "tunnel-setup" => assert_eq!(words[1..], ["tunnel", "setup"]),
-            "tunnel" => assert_eq!(words[1..], ["tunnel", "run"]),
+            "tunnel-start-full" => assert_eq!(words[1..], ["tunnel", "start", "--full"]),
             other => panic!("unexpected pane {other}"),
         }
     }
 }
 
 #[test]
-fn tunnel_panes_say_read_only_and_keep_errors_visible() {
+fn tunnel_entries_cover_start_full_start_read_stop_and_status() {
+    let doc = manifest();
+    let actions = tables(&doc, "actions");
+    let panes = tables(&doc, "panes");
+    let flags = |id: &str| {
+        let entry = actions
+            .iter()
+            .chain(panes.iter())
+            .find(|e| text(e, "id") == id)
+            .unwrap_or_else(|| panic!("missing {id}"));
+        bridge_argv(&argv(entry))[1..].to_vec()
+    };
+    assert_eq!(flags("tunnel-start"), ["tunnel", "start"]);
+    assert_eq!(flags("tunnel-stop"), ["tunnel", "stop"]);
+    assert_eq!(flags("tunnel-status"), ["tunnel", "status"]);
+    assert_eq!(flags("tunnel-start-full"), ["tunnel", "start", "--full"]);
+    assert!(
+        actions.iter().all(|a| text(a, "id") != "tunnel-start-full"),
+        "the disclosure needs a TTY, so full access runs in a pane"
+    );
+    assert!(
+        !actions
+            .iter()
+            .chain(panes.iter())
+            .any(|e| text(e, "id") == "tunnel"),
+        "the foreground run pane is gone"
+    );
+}
+
+#[test]
+fn tunnel_panes_keep_errors_visible_and_full_access_is_labelled() {
     let doc = manifest();
     let panes = tables(&doc, "panes");
     assert_eq!(panes.len(), 5);
     for pane in panes.iter().filter(|p| text(p, "id").starts_with("tunnel")) {
         assert!(text(pane, "title").starts_with("Herdr MCP: ChatGPT tunnel"));
-        assert!(text(pane, "description").contains("Read tools only"));
         assert!(
             argv(pane)[2].contains("read _"),
             "press Enter to close wrapper"
         );
     }
-    let run = panes.iter().find(|p| text(p, "id") == "tunnel").unwrap();
-    assert!(text(run, "description").contains("while this pane is open"));
+    let full = panes
+        .iter()
+        .find(|p| text(p, "id") == "tunnel-start-full")
+        .unwrap();
+    assert!(text(full, "title").contains("full access"));
+    assert!(text(full, "description").contains("full access"));
+    for action in tables(&doc, "actions") {
+        if text(action, "id") == "tunnel-start" {
+            assert!(text(action, "description").contains("read tools only"));
+        }
+    }
 }
 
 fn print_config(home: &std::path::Path, extra: &[&str]) -> String {

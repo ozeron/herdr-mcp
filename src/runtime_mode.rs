@@ -1,12 +1,12 @@
 use std::fmt;
 
 use rmcp::schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::herdr::{HerdrError, PaneProcessInfo, PaneProcessInfoProcess};
 
 /// How much a launched agent may do without asking, adapted from T3 Code's runtime modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeMode {

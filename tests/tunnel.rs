@@ -4,9 +4,13 @@ use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 
 use herdr_mcp::install::Io;
-use herdr_mcp::tunnel::{TunnelEnv, prepare_run, setup, validate_tunnel_id};
+use herdr_mcp::tunnel::{
+    RunOptions, Runner, StartOptions, TunnelEnv, log, parse_duration, prepare_run, setup, start,
+    status, stop, validate_tunnel_id,
+};
 use tempfile::TempDir;
 
 const KEY: &str = "sk-test-runtime-key-123";
@@ -21,7 +25,7 @@ impl Sandbox {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        for dir in ["home", "bin", "xdg"] {
+        for dir in ["home", "bin", "xdg", "state"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
         Self { _tmp: tmp, root }
@@ -66,6 +70,8 @@ impl Sandbox {
         TunnelEnv {
             home: self.home(),
             xdg_config_home: Some(self.root.join("xdg")),
+            xdg_state_home: Some(self.root.join("state")),
+            uid: 501,
             path: OsString::from(self.bin()),
             exe: PathBuf::from("/opt/herdr/bin/herdr-mcp"),
             api_key: None,
@@ -80,6 +86,7 @@ impl Sandbox {
             .env_clear()
             .env("HOME", self.home())
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
             .env("PATH", self.bin());
         if let Some(key) = key {
             command.env("CONTROL_PLANE_API_KEY", key);
@@ -118,12 +125,19 @@ fn args_of(command: &Command) -> Vec<String> {
 }
 
 fn prepared(env: &TunnelEnv, session: Option<&str>) -> Command {
+    let options = RunOptions {
+        session: session.map(str::to_owned),
+        ..RunOptions::default()
+    };
+    prepared_with(env, &options)
+}
+
+fn prepared_with(env: &TunnelEnv, options: &RunOptions) -> Command {
     let mut command = None;
-    let run = drive(false, "", |io| {
-        command = prepare_run(env, session, io).ok();
+    drive(false, "", |io| {
+        command = prepare_run(env, options, io).ok();
         0
     });
-    assert!(run.out.contains("Read tools only"), "{}", run.out);
     command.expect("prepare_run succeeds")
 }
 
@@ -163,7 +177,7 @@ fn command_has_the_documented_argv_and_the_key_only_in_the_child_env() {
             "--control-plane.tunnel-id",
             ID,
             "--mcp-command",
-            &format!("{} --tools read", env.exe.display()),
+            &format!("{} --tools read --tunnel", env.exe.display()),
             "--health.listen-addr",
             "127.0.0.1:0",
         ]
@@ -191,7 +205,7 @@ fn bridge_is_the_shim_when_it_exists_and_quoted_when_it_has_spaces() {
     let command = prepared(&env, None);
     assert_eq!(
         args_of(&command)[4],
-        format!("\"{}\" --tools read", shim.display())
+        format!("\"{}\" --tools read --tunnel", shim.display())
     );
 }
 
@@ -205,7 +219,7 @@ fn session_reaches_the_bridge_command() {
     let command = prepared(&env, Some("foo"));
     assert_eq!(
         args_of(&command)[4],
-        format!("{} --tools read --session foo", env.exe.display())
+        format!("{} --tools read --tunnel --session foo", env.exe.display())
     );
 }
 
@@ -216,7 +230,9 @@ fn missing_tunnel_client_names_the_brew_command() {
     let env = sandbox.env();
     let mut err = None;
     drive(false, "", |io| {
-        err = prepare_run(&env, None, io).err().map(|e| e.to_string());
+        err = prepare_run(&env, &RunOptions::default(), io)
+            .err()
+            .map(|e| e.to_string());
         0
     });
     let err = err.expect("fails");
@@ -233,7 +249,9 @@ fn missing_tunnel_id_points_at_setup() {
     let env = sandbox.env();
     let mut err = None;
     drive(false, "", |io| {
-        err = prepare_run(&env, None, io).err().map(|e| e.to_string());
+        err = prepare_run(&env, &RunOptions::default(), io)
+            .err()
+            .map(|e| e.to_string());
         0
     });
     assert!(err.unwrap().contains("herdr-mcp tunnel setup"));
@@ -260,7 +278,7 @@ fn end_to_end_run_execs_tunnel_client_with_its_exit_code_and_never_prints_the_ke
         rec.contains(&format!("--control-plane.tunnel-id {ID}")),
         "{rec}"
     );
-    assert!(rec.contains("--tools read --session foo"), "{rec}");
+    assert!(rec.contains("--tools read --tunnel --session foo"), "{rec}");
     assert!(rec.contains("--health.listen-addr 127.0.0.1:0"), "{rec}");
     assert!(!rec.contains(KEY), "{rec}");
     let security = sandbox.recorded("security");
@@ -353,4 +371,551 @@ fn setup_rejects_a_bad_id_before_touching_the_keychain() {
     assert_eq!(run.code, 1);
     assert!(run.err.contains("tunnel_"), "{}", run.err);
     assert_eq!(sandbox.recorded("security"), "");
+}
+
+// ---- U3: background service, full mode, status and log ----
+
+const LABEL: &str = "dev.herdr-mcp.tunnel";
+const NOW: u64 = 1_800_000_000;
+
+/// Records every launchctl call; `print` reports the agent as loaded when `loaded` is set.
+struct FakeRunner {
+    loaded: bool,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl FakeRunner {
+    fn new(loaded: bool) -> Self {
+        Self {
+            loaded,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn verbs(&self) -> Vec<String> {
+        self.calls().iter().map(|c| c[0].clone()).collect()
+    }
+}
+
+impl Runner for FakeRunner {
+    fn run(&self, _program: &Path, args: &[String]) -> std::io::Result<i32> {
+        self.calls.lock().unwrap().push(args.to_vec());
+        Ok(if args[0] == "print" && !self.loaded {
+            1
+        } else {
+            0
+        })
+    }
+}
+
+impl Sandbox {
+    fn ready(&self) {
+        self.fake("tunnel-client", "", 0);
+        self.fake("security", &format!("{KEY}\n"), 0);
+        self.save_id(ID);
+    }
+
+    fn plist(&self) -> PathBuf {
+        self.home()
+            .join(format!("Library/LaunchAgents/{LABEL}.plist"))
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.root.join("state/herdr-mcp")
+    }
+
+    fn audit(&self) -> PathBuf {
+        self.state_dir().join("tunnel-audit.log")
+    }
+
+    fn write_audit(&self, count: usize) {
+        fs::create_dir_all(self.state_dir()).unwrap();
+        let text: String = (1..=count)
+            .map(|n| format!("{{\"tool\":\"herdr_run\",\"n\":{n}}}\n"))
+            .collect();
+        fs::write(self.audit(), text).unwrap();
+    }
+
+    fn write_state(&self, mode: &str, expires_at: Option<u64>) {
+        fs::create_dir_all(self.state_dir()).unwrap();
+        let state = serde_json::json!({
+            "mode": mode, "started_at": NOW, "expires_at": expires_at, "session": "foo",
+        });
+        fs::write(self.state_dir().join("tunnel.state"), state.to_string()).unwrap();
+    }
+
+    fn fake_launchctl(&self, loaded: bool) {
+        let rec = self.record("launchctl");
+        let print_code = if loaded { 0 } else { 1 };
+        let script = format!(
+            "#!/bin/sh\necho \"argv:$*\" >> '{}'\n[ \"$1\" = print ] && exit {print_code}\nexit 0\n",
+            rec.display()
+        );
+        let path = self.bin().join("launchctl");
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn start_with(
+    sandbox: &Sandbox,
+    runner: &FakeRunner,
+    options: &StartOptions,
+    tty: bool,
+    input: &str,
+) -> Run {
+    let env = sandbox.env();
+    drive(tty, input, |io| start(&env, options, runner, NOW, io))
+}
+
+fn plist_args(text: &str) -> Vec<String> {
+    let section = text
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .and_then(|rest| rest.split("</array>").next())
+        .expect("ProgramArguments array");
+    section
+        .split("<string>")
+        .skip(1)
+        .map(|part| part.split("</string>").next().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn durations_parse_with_unit_suffixes() {
+    use std::time::Duration;
+    assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+    assert_eq!(parse_duration("8h").unwrap(), Duration::from_secs(8 * 3600));
+    assert_eq!(parse_duration("2d").unwrap(), Duration::from_secs(172_800));
+    assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
+    for bad in ["", "m", "30", "0m", "-5m", "1w", "abc", "1.5h", "5 m"] {
+        assert!(parse_duration(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn start_writes_the_read_plist_then_bootstraps() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let runner = FakeRunner::new(false);
+    let options = StartOptions {
+        full: false,
+        duration: Some(std::time::Duration::from_secs(8 * 3600)),
+        session: Some("foo".into()),
+    };
+    let run = start_with(&sandbox, &runner, &options, false, "");
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+
+    let text = fs::read_to_string(sandbox.plist()).unwrap();
+    assert_eq!(
+        plist_args(&text),
+        [
+            "/opt/herdr/bin/herdr-mcp",
+            "tunnel",
+            "run",
+            "--expires-at",
+            &(NOW + 8 * 3600).to_string(),
+            "--session",
+            "foo",
+        ]
+    );
+    for needle in [
+        &format!("<key>Label</key>\n  <string>{LABEL}</string>"),
+        "<key>RunAtLoad</key>\n  <true/>",
+        "<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>",
+        &format!(
+            "<key>StandardOutPath</key>\n  <string>{}</string>",
+            sandbox.state_dir().join("tunnel.out.log").display()
+        ),
+        &format!(
+            "<key>StandardErrorPath</key>\n  <string>{}</string>",
+            sandbox.state_dir().join("tunnel.err.log").display()
+        ),
+        &format!(
+            "<key>HOME</key>\n    <string>{}</string>",
+            sandbox.home().display()
+        ),
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in\n{text}");
+    }
+    assert!(!text.contains(KEY), "the key never reaches the plist");
+    assert!(!text.contains("--full"), "{text}");
+    assert!(!text.contains("control"), "{text}");
+
+    assert_eq!(runner.verbs(), ["print", "bootstrap"]);
+    assert_eq!(
+        runner.calls()[1],
+        [
+            "bootstrap".to_string(),
+            "gui/501".to_string(),
+            sandbox.plist().display().to_string()
+        ]
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.state_dir().join("tunnel.state")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["mode"], "read");
+    assert_eq!(state["started_at"], NOW);
+    assert_eq!(state["expires_at"], NOW + 8 * 3600);
+    assert_eq!(state["session"], "foo");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn start_boots_out_an_already_loaded_agent_first() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let runner = FakeRunner::new(true);
+    let run = start_with(&sandbox, &runner, &StartOptions::default(), false, "");
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert_eq!(runner.verbs(), ["print", "bootout", "bootstrap"]);
+    assert_eq!(runner.calls()[1][1], format!("gui/501/{LABEL}"));
+    let text = fs::read_to_string(sandbox.plist()).unwrap();
+    assert_eq!(
+        plist_args(&text),
+        ["/opt/herdr/bin/herdr-mcp", "tunnel", "run"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn start_full_needs_the_exact_typed_phrase() {
+    for (tty, input) in [
+        (false, ""),
+        (false, "full access\n"),
+        (true, "yes\n"),
+        (true, "Full Access\n"),
+        (true, "full access please\n"),
+        (true, ""),
+    ] {
+        let sandbox = Sandbox::new();
+        sandbox.ready();
+        let runner = FakeRunner::new(false);
+        let options = StartOptions {
+            full: true,
+            ..StartOptions::default()
+        };
+        let run = start_with(&sandbox, &runner, &options, tty, input);
+        assert_ne!(run.code, 0, "tty={tty} input={input:?}");
+        assert!(!sandbox.plist().exists(), "tty={tty} input={input:?}");
+        assert!(!sandbox.state_dir().join("tunnel.state").exists());
+        assert!(runner.calls().is_empty(), "launchctl must not run");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn start_full_shows_the_disclosure_then_writes_the_confirmed_plist() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let runner = FakeRunner::new(false);
+    let options = StartOptions {
+        full: true,
+        ..StartOptions::default()
+    };
+    let run = start_with(&sandbox, &runner, &options, true, "full access\n");
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    for needle in [
+        "run shell commands as you",
+        "type into any pane",
+        "launch and close agents",
+        "switch sessions",
+        "OpenAI",
+        "Anyone who can use your ChatGPT connector",
+        "herdr-mcp tunnel stop",
+        "herdr_tunnel_stop",
+        "disable the plugin in ChatGPT",
+        "revoke the runtime key",
+        "full access",
+        sandbox.audit().to_str().unwrap(),
+    ] {
+        assert!(run.out.contains(needle), "missing {needle:?}:\n{}", run.out);
+    }
+    let text = fs::read_to_string(sandbox.plist()).unwrap();
+    assert_eq!(
+        plist_args(&text),
+        [
+            "/opt/herdr/bin/herdr-mcp",
+            "tunnel",
+            "run",
+            "--full",
+            "--full-confirmed"
+        ]
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.state_dir().join("tunnel.state")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["mode"], "full");
+    assert!(state["expires_at"].is_null());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn start_without_setup_points_at_setup_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("tunnel-client", "", 0);
+    sandbox.fake("security", "", 44);
+    let runner = FakeRunner::new(false);
+    let run = start_with(&sandbox, &runner, &StartOptions::default(), false, "");
+    assert_ne!(run.code, 0);
+    assert!(run.err.contains("herdr-mcp tunnel setup"), "{}", run.err);
+    assert!(!sandbox.plist().exists());
+    assert!(runner.calls().is_empty());
+
+    sandbox.save_id(ID);
+    let run = start_with(&sandbox, &runner, &StartOptions::default(), false, "");
+    assert_ne!(run.code, 0);
+    assert!(run.err.contains("herdr-mcp tunnel setup"), "{}", run.err);
+    assert!(!sandbox.plist().exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn start_without_tunnel_client_names_the_brew_command() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("security", KEY, 0);
+    sandbox.save_id(ID);
+    let runner = FakeRunner::new(false);
+    let run = start_with(&sandbox, &runner, &StartOptions::default(), false, "");
+    assert_ne!(run.code, 0);
+    assert!(
+        run.err.contains("brew install openai/tools/tunnel-client"),
+        "{}",
+        run.err
+    );
+    assert!(!sandbox.plist().exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_boots_the_agent_out_and_removes_the_plist_and_state() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let runner = FakeRunner::new(true);
+    start_with(&sandbox, &runner, &StartOptions::default(), false, "");
+    assert!(sandbox.plist().exists());
+
+    let runner = FakeRunner::new(true);
+    let env = sandbox.env();
+    let run = drive(false, "", |io| stop(&env, &runner, io));
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert_eq!(runner.verbs(), ["print", "bootout"]);
+    assert_eq!(runner.calls()[1], ["bootout", &format!("gui/501/{LABEL}")]);
+    assert!(!sandbox.plist().exists());
+    assert!(!sandbox.state_dir().join("tunnel.state").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_when_nothing_runs_is_fine() {
+    let sandbox = Sandbox::new();
+    let runner = FakeRunner::new(false);
+    let env = sandbox.env();
+    let run = drive(false, "", |io| stop(&env, &runner, io));
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert!(run.out.contains("not running"), "{}", run.out);
+    assert!(!runner.verbs().contains(&"bootout".to_string()));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn status_reports_running_mode_times_session_audit_path_and_the_last_five_lines() {
+    let sandbox = Sandbox::new();
+    sandbox.write_state("full", Some(NOW + 3600));
+    sandbox.write_audit(7);
+    let runner = FakeRunner::new(true);
+    let env = sandbox.env();
+    let run = drive(false, "", |io| status(&env, &runner, io));
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert_eq!(runner.calls()[0], ["print", &format!("gui/501/{LABEL}")]);
+    for needle in [
+        "running",
+        "full",
+        "2027-01-15T08:00:00Z",
+        "2027-01-15T09:00:00Z",
+        "foo",
+        sandbox.audit().to_str().unwrap(),
+        "\"n\":3",
+        "\"n\":7",
+    ] {
+        assert!(run.out.contains(needle), "missing {needle:?}:\n{}", run.out);
+    }
+    assert!(
+        !run.out.contains("\"n\":2}"),
+        "only the last five:\n{}",
+        run.out
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn status_when_not_loaded_says_so() {
+    let sandbox = Sandbox::new();
+    let runner = FakeRunner::new(false);
+    let env = sandbox.env();
+    let run = drive(false, "", |io| status(&env, &runner, io));
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert!(run.out.contains("not running"), "{}", run.out);
+    assert!(run.out.contains(sandbox.audit().to_str().unwrap()));
+}
+
+#[test]
+fn log_prints_the_last_n_lines_default_fifty() {
+    let sandbox = Sandbox::new();
+    sandbox.write_audit(60);
+    let env = sandbox.env();
+    let run = drive(false, "", |io| log(&env, 3, io));
+    assert_eq!(run.code, 0);
+    assert_eq!(run.out.lines().count(), 3, "{}", run.out);
+    assert!(run.out.contains("\"n\":60") && run.out.contains("\"n\":58"));
+    let run = drive(false, "", |io| log(&env, 50, io));
+    assert_eq!(run.out.lines().count(), 50);
+    assert!(run.out.lines().next().unwrap().contains("\"n\":11"));
+}
+
+#[test]
+fn log_without_a_file_says_so() {
+    let sandbox = Sandbox::new();
+    let env = sandbox.env();
+    let run = drive(false, "", |io| log(&env, 50, io));
+    assert_eq!(run.code, 0);
+    assert!(run.out.contains("no audit log"), "{}", run.out);
+}
+
+#[test]
+fn run_full_without_confirmation_refuses_with_exit_2() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let output = sandbox.herdr_mcp(&["tunnel", "run", "--full"], None);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("herdr-mcp tunnel start --full"));
+    assert_eq!(sandbox.recorded("tunnel-client"), "", "must not exec");
+}
+
+#[test]
+fn run_full_confirmed_passes_control_tools_and_tunnel_mode() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let output = sandbox.herdr_mcp(
+        &[
+            "tunnel",
+            "run",
+            "--full",
+            "--full-confirmed",
+            "--expires-at",
+            "1800000000",
+            "--session",
+            "foo",
+        ],
+        None,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let rec = sandbox.recorded("tunnel-client");
+    assert!(
+        rec.contains("--tools control --tunnel --expires-at 1800000000 --session foo"),
+        "{rec}"
+    );
+}
+
+#[test]
+fn read_run_never_mentions_control() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let env = sandbox.env();
+    let command = prepared_with(
+        &env,
+        &RunOptions {
+            session: Some("foo".into()),
+            expires_at: Some(1_800_000_000),
+            ..RunOptions::default()
+        },
+    );
+    let line = &args_of(&command)[4];
+    assert_eq!(
+        *line,
+        format!(
+            "{} --tools read --tunnel --expires-at 1800000000 --session foo",
+            env.exe.display()
+        )
+    );
+    assert!(!line.contains("control"));
+    // --full-confirmed alone does not turn on control.
+    let command = prepared_with(
+        &env,
+        &RunOptions {
+            full_confirmed: true,
+            ..RunOptions::default()
+        },
+    );
+    assert!(!args_of(&command)[4].contains("control"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn end_to_end_start_status_stop_with_fake_launchctl() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    sandbox.fake_launchctl(false);
+    let output = sandbox.herdr_mcp(&["tunnel", "start", "--for", "30m"], None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(sandbox.plist().exists());
+    let text = fs::read_to_string(sandbox.plist()).unwrap();
+    let args = plist_args(&text);
+    assert_eq!(&args[1..3], ["tunnel", "run"]);
+    assert!(args.contains(&"--expires-at".to_string()), "{args:?}");
+    let rec = sandbox.recorded("launchctl");
+    assert!(rec.contains("bootstrap gui/"), "{rec}");
+    assert!(
+        rec.contains(&sandbox.plist().display().to_string()),
+        "{rec}"
+    );
+
+    sandbox.fake_launchctl(true);
+    let output = sandbox.herdr_mcp(&["tunnel", "status"], None);
+    assert!(output.status.success(), "{output:?}");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("running") && out.contains("read"), "{out}");
+
+    let output = sandbox.herdr_mcp(&["tunnel", "stop"], None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!sandbox.plist().exists());
+    assert!(sandbox.recorded("launchctl").contains("bootout gui/"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn end_to_end_start_full_without_a_tty_writes_nothing() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    sandbox.fake_launchctl(false);
+    let output = sandbox.herdr_mcp(&["tunnel", "start", "--full"], None);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(!sandbox.plist().exists());
+    assert_eq!(sandbox.recorded("launchctl"), "");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn background_commands_say_macos_only_on_other_platforms() {
+    let sandbox = Sandbox::new();
+    for command in ["start", "stop", "status"] {
+        let output = sandbox.herdr_mcp(&["tunnel", command], None);
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            all.contains("macOS only") && all.contains("tunnel run"),
+            "{all}"
+        );
+    }
 }
