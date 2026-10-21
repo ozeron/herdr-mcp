@@ -14,6 +14,7 @@ Rules of use:
 - A `steer` message to a working agent has no turn: there is no completion to wait for, so read the pane to see the effect.
 - One owner per child. Only the pane that launched an agent or command waits on it or answers for it.
 - Startup dialogs (hook review, folder trust) of agents you launch are handled by `herdr_launch` `dialogs`: the default `skip` takes the option that grants nothing. Use `trust` only when the user asked.
+- `herdr_launch` `runtime_mode` gives a codex or claude child known permissions and never more than yours. Set `allow_full_access` only when the user asked for full access.
 - Never approve a command, tool or permission request on your own initiative. Surface a blocked prompt unless the user told you to answer it.
 - Never target your own pane, its tab or its workspace. Self-targeting is refused unless `allow_self` is set; do not set it without being asked.
 - Close only what you launched. `herdr_close` refuses other panes unless `force` is set; do not force it without being asked.

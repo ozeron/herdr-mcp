@@ -197,7 +197,7 @@ impl HerdrMcp {
     }
 
     #[tool(
-        description = "Launch an agent in a new pane, tab or workspace. The name must be unique. The child gets read tools unless control is set. Startup dialogs (hook review, folder trust) are handled by dialogs: skip (default) takes the option that grants nothing, surface stops with agent_needs_input, trust grants it (only when the user asked). Blocks up to start_timeout_ms and, with wait turn, the rest of the wait cap. Returns a turn token for herdr_wait.",
+        description = "Launch an agent in a new pane, tab or workspace. The name must be unique. The child gets read tools unless control is set. Startup dialogs (hook review, folder trust) are handled by dialogs: skip (default) takes the option that grants nothing, surface stops with agent_needs_input, trust grants it (only when the user asked). runtime_mode (approval-required, auto-accept-edits, full-access; default inherit adds no flags) sets the child's permissions for codex and claude and never exceeds the caller's own mode; full-access from an unknown caller needs allow_full_access, only when the user asked. Blocks up to start_timeout_ms and, with wait turn, the rest of the wait cap. Returns a turn token for herdr_wait.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn herdr_launch(

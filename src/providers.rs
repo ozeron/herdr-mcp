@@ -3,6 +3,7 @@ use serde_json::json;
 use crate::cli::ToolMode;
 use crate::herdr::{AgentInfo, AgentStatus};
 use crate::install::codex;
+use crate::runtime_mode::Level;
 
 pub struct Provider {
     pub kind: &'static str,
@@ -15,6 +16,8 @@ pub struct Provider {
     /// Per-launch arguments that change only the tool mode of an existing user-scope entry,
     /// for kinds whose overrides merge over it.
     pub mode_args: Option<fn(mode: ToolMode) -> Vec<String>>,
+    /// Per-launch arguments that fix the agent's permissions.
+    pub runtime_args: Option<fn(level: Level) -> Vec<String>>,
     /// Startup dialogs that Herdr does not report as `blocked`.
     pub dialogs: &'static [Dialog],
 }
@@ -90,6 +93,7 @@ const FALLBACK: Provider = Provider {
     ready_at_unknown: false,
     mcp_args: None,
     mode_args: None,
+    runtime_args: None,
     dialogs: &[],
 };
 
@@ -101,6 +105,7 @@ const PROVIDERS: &[Provider] = &[
         ready_at_unknown: false,
         mcp_args: Some(claude_mcp_args),
         mode_args: None,
+        runtime_args: Some(claude_runtime_args),
         dialogs: CLAUDE_DIALOGS,
     },
     Provider {
@@ -110,6 +115,7 @@ const PROVIDERS: &[Provider] = &[
         ready_at_unknown: true,
         mcp_args: Some(codex_mcp_args),
         mode_args: Some(codex_mode_args),
+        runtime_args: Some(codex_runtime_args),
         dialogs: CODEX_DIALOGS,
     },
 ];
@@ -138,6 +144,11 @@ pub fn mcp_args(kind: &str, bin: &str, mode: ToolMode) -> Option<Vec<String>> {
 /// `kind` cannot override it that way.
 pub fn mode_args(kind: &str, mode: ToolMode) -> Option<Vec<String>> {
     provider(Some(kind)).mode_args.map(|build| build(mode))
+}
+
+/// Per-launch permission arguments for `kind` at `level`, or `None` when the kind has none.
+pub fn runtime_args(kind: &str, level: Level) -> Option<Vec<String>> {
+    provider(Some(kind)).runtime_args.map(|build| build(level))
 }
 
 pub(crate) fn server_args(client: &str, mode: ToolMode) -> [&str; 4] {
@@ -177,4 +188,22 @@ fn codex_mcp_args(bin: &str, mode: ToolMode) -> Vec<String> {
         .into_iter()
         .flat_map(|value| ["-c".to_string(), value])
         .collect()
+}
+
+fn codex_runtime_args(level: Level) -> Vec<String> {
+    let (approval, sandbox) = match level {
+        Level::ApprovalRequired => ("on-request", "read-only"),
+        Level::AutoAcceptEdits => ("on-request", "workspace-write"),
+        Level::FullAccess => ("never", "danger-full-access"),
+    };
+    ["-a", approval, "-s", sandbox].map(String::from).to_vec()
+}
+
+fn claude_runtime_args(level: Level) -> Vec<String> {
+    let mode = match level {
+        Level::ApprovalRequired => "manual",
+        Level::AutoAcceptEdits => "acceptEdits",
+        Level::FullAccess => "bypassPermissions",
+    };
+    vec!["--permission-mode".into(), mode.into()]
 }

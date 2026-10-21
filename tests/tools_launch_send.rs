@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use fake_herdr::{FakeHerdr, Script, StreamEnd};
 use harness::{
-    AGENT_PARENT, Harness, PARENT, count, err, err_code, ok, ok_reply, pane, process_info,
+    AGENT_PARENT, Harness, PARENT, call, count, err, err_code, ok, ok_reply, pane, process_info,
     requests, tab, workspace,
 };
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
@@ -2073,4 +2073,257 @@ fn readiness_follows_ktd7() {
             "{kind} {status} ready={ready} pending={pending}"
         );
     }
+}
+
+// ---- runtime_mode ----
+
+fn flags(start: &Value) -> Vec<String> {
+    start["args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .map(|a| a.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn has_run(args: &[String], expected: &[&str]) -> bool {
+    args.windows(expected.len())
+        .any(|w| w.iter().map(String::as_str).eq(expected.iter().copied()))
+}
+
+/// The caller pane runs `cmdline` in the foreground; its shell is still the bridge's ancestor.
+fn caller_runs(fake: &FakeHerdr, name: &str, argv: &[&str]) {
+    fake.reply_params(
+        "pane.process_info",
+        json!({"pane_id": "w1:p1"}),
+        json!({"type": "pane_process_info", "process_info": {
+            "pane_id": "w1:p1", "shell_pid": 4242, "foreground_process_group_id": 5000,
+            "tty": "/dev/ttys001",
+            "foreground_processes": [{"pid": 5000, "name": name, "argv": argv}]}}),
+    );
+}
+
+async fn launch_with_mode(
+    kind: &str,
+    extra: Value,
+    caller: Option<(&str, &[&str])>,
+) -> (Harness, Result<Value, Value>) {
+    let h = start(Opts::default()).await;
+    if let Some((name, argv)) = caller {
+        caller_runs(&h.fake, name, argv);
+    }
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    let mut args = json!({"kind": kind, "name": "kid"});
+    for (key, value) in extra.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    let result = call(&h, "herdr_launch", args).await;
+    let out = if result.is_error == Some(true) {
+        Err(result.structured_content.unwrap())
+    } else {
+        Ok(result.structured_content.unwrap())
+    };
+    (h, out)
+}
+
+fn assert_nothing_created(h: &Harness) {
+    for method in [
+        "tab.create",
+        "workspace.create",
+        "pane.split",
+        "agent.start",
+    ] {
+        assert_eq!(count(&h.fake, method), 0, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn runtime_mode_maps_to_codex_flags() {
+    for (mode, expected) in [
+        ("approval-required", ["-a", "on-request", "-s", "read-only"]),
+        (
+            "auto-accept-edits",
+            ["-a", "on-request", "-s", "workspace-write"],
+        ),
+        ("full-access", ["-a", "never", "-s", "danger-full-access"]),
+    ] {
+        let (h, out) = launch_with_mode(
+            "codex",
+            json!({"runtime_mode": mode, "allow_full_access": true}),
+            None,
+        )
+        .await;
+        let out = out.unwrap();
+        let args = flags(&start_params(&h));
+        assert!(has_run(&args, &expected), "{mode}: {args:?}");
+        assert_eq!(out["runtime_mode"], mode);
+        assert_eq!(out["caller_runtime_mode"], "unknown");
+    }
+}
+
+#[tokio::test]
+async fn runtime_mode_maps_to_claude_permission_mode() {
+    for (mode, value) in [
+        ("approval-required", "manual"),
+        ("auto-accept-edits", "acceptEdits"),
+        ("full-access", "bypassPermissions"),
+    ] {
+        let (h, out) = launch_with_mode(
+            "claude",
+            json!({"runtime_mode": mode, "allow_full_access": true}),
+            None,
+        )
+        .await;
+        out.unwrap();
+        let args = flags(&start_params(&h));
+        assert!(
+            has_run(&args, &["--permission-mode", value]),
+            "{mode}: {args:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inherit_and_an_omitted_runtime_mode_add_no_flags() {
+    for extra in [json!({}), json!({"runtime_mode": "inherit"})] {
+        let (h, out) = launch_with_mode("codex", extra, None).await;
+        let out = out.unwrap();
+        let args = flags(&start_params(&h));
+        assert!(!args.iter().any(|a| a == "-a" || a == "-s"), "{args:?}");
+        assert_eq!(out["runtime_mode"], "inherit");
+    }
+    let (h, out) = launch_with_mode("claude", json!({}), None).await;
+    out.unwrap();
+    assert!(!flags(&start_params(&h)).contains(&"--permission-mode".to_string()));
+}
+
+#[tokio::test]
+async fn runtime_mode_and_the_mcp_args_are_both_present() {
+    let (h, out) = launch_with_mode(
+        "codex",
+        json!({"runtime_mode": "auto-accept-edits", "control": false}),
+        None,
+    )
+    .await;
+    out.unwrap();
+    let args = flags(&start_params(&h));
+    assert!(has_run(
+        &args,
+        &["-a", "on-request", "-s", "workspace-write"]
+    ));
+    assert!(
+        args.iter()
+            .any(|a| a.starts_with("mcp_servers.herdr.command="))
+    );
+
+    let (h, out) =
+        launch_with_mode("claude", json!({"runtime_mode": "approval-required"}), None).await;
+    out.unwrap();
+    let args = flags(&start_params(&h));
+    assert!(has_run(&args, &["--permission-mode", "manual"]));
+    assert!(args.contains(&"--mcp-config".to_string()));
+}
+
+#[tokio::test]
+async fn a_known_read_only_caller_cannot_launch_auto_accept_edits() {
+    let (h, out) = launch_with_mode(
+        "claude",
+        json!({"runtime_mode": "auto-accept-edits"}),
+        Some(("codex", &["codex", "-s", "read-only"])),
+    )
+    .await;
+    let err = out.unwrap_err();
+    assert_eq!(err["code"], "runtime_mode_escalation_denied");
+    assert_eq!(err["caller_runtime_mode"], "known: approval-required");
+    assert_nothing_created(&h);
+}
+
+#[tokio::test]
+async fn a_known_full_access_caller_may_launch_full_access() {
+    for (name, argv) in [
+        (
+            "codex",
+            vec!["codex", "-a", "never", "-s", "danger-full-access"],
+        ),
+        (
+            "codex",
+            vec!["codex", "--dangerously-bypass-approvals-and-sandbox"],
+        ),
+        (
+            "claude",
+            vec!["claude", "--permission-mode", "bypassPermissions"],
+        ),
+        ("claude", vec!["claude", "--dangerously-skip-permissions"]),
+    ] {
+        let (_h, out) = launch_with_mode(
+            "codex",
+            json!({"runtime_mode": "full-access"}),
+            Some((name, &argv)),
+        )
+        .await;
+        let out = out.unwrap();
+        assert_eq!(out["caller_runtime_mode"], "known: full-access", "{argv:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_caller_cannot_launch_full_access_without_the_flag() {
+    let (h, out) = launch_with_mode("codex", json!({"runtime_mode": "full-access"}), None).await;
+    let err = out.unwrap_err();
+    assert_eq!(err["code"], "runtime_mode_escalation_denied");
+    assert_eq!(err["caller_runtime_mode"], "unknown");
+    assert_nothing_created(&h);
+}
+
+#[tokio::test]
+async fn an_unknown_caller_may_launch_full_access_with_allow_full_access() {
+    let (_h, out) = launch_with_mode(
+        "codex",
+        json!({"runtime_mode": "full-access", "allow_full_access": true}),
+        None,
+    )
+    .await;
+    assert_eq!(out.unwrap()["caller_runtime_mode"], "unknown");
+}
+
+#[tokio::test]
+async fn an_unknown_caller_may_launch_auto_accept_edits() {
+    let (_h, out) =
+        launch_with_mode("codex", json!({"runtime_mode": "auto-accept-edits"}), None).await;
+    out.unwrap();
+}
+
+#[tokio::test]
+async fn a_known_caller_is_not_widened_by_allow_full_access() {
+    let (h, out) = launch_with_mode(
+        "codex",
+        json!({"runtime_mode": "full-access", "allow_full_access": true}),
+        Some(("claude", &["claude", "--permission-mode", "acceptEdits"])),
+    )
+    .await;
+    assert_eq!(out.unwrap_err()["code"], "runtime_mode_escalation_denied");
+    assert_nothing_created(&h);
+}
+
+#[tokio::test]
+async fn a_kind_without_runtime_flags_refuses_a_runtime_mode() {
+    let (h, out) = launch_with_mode(
+        "opencode",
+        json!({"runtime_mode": "approval-required"}),
+        None,
+    )
+    .await;
+    assert_eq!(out.unwrap_err()["code"], "runtime_mode_unsupported");
+    assert_nothing_created(&h);
+
+    let (_h, out) = launch_with_mode("opencode", json!({"runtime_mode": "inherit"}), None).await;
+    out.unwrap();
 }

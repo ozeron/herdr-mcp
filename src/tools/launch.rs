@@ -20,7 +20,8 @@ use crate::install::status::{McpStatus, global_mode, mcp_status_for};
 use crate::matcher::{read_text, tail};
 use crate::place::{self, Options, Placed, Where};
 use crate::provenance;
-use crate::providers::{Dialog, is_ready, match_dialog, mcp_args, mode_args};
+use crate::providers::{Dialog, is_ready, match_dialog, mcp_args, mode_args, runtime_args};
+use crate::runtime_mode::{self, RuntimeMode};
 use crate::server::Inner;
 use crate::tools::send::{gated_prompt, prompt_error, turn_for};
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
@@ -120,6 +121,10 @@ pub struct LaunchParams {
     pub start_timeout_ms: Option<u64>,
     /// Startup dialogs (hook review, folder trust) the agent shows before its prompt. skip (default) takes the option that grants nothing; surface stops with agent_needs_input; trust takes the permissive option, only when the user asked.
     pub dialogs: Option<Dialogs>,
+    /// Permissions the child starts with: inherit (default, no flags), approval-required, auto-accept-edits or full-access. Never above the caller's own mode. Codex and claude only.
+    pub runtime_mode: Option<RuntimeMode>,
+    /// Lets full-access through when the caller's own mode is unknown. Only when the user asked.
+    pub allow_full_access: Option<bool>,
 }
 
 /// What this call made, reported with every phase so a timeout or cancel never leads to a repeat.
@@ -171,6 +176,20 @@ pub async fn run(
             "this bridge is in read mode, so it cannot hand control tools to a child",
         ));
     }
+    let requested_mode = params.runtime_mode.unwrap_or_default();
+    let mode_args = match requested_mode.level() {
+        None => Vec::new(),
+        Some(level) => runtime_args(&params.kind, level).ok_or_else(|| {
+            HerdrError::tool(
+                "runtime_mode_unsupported",
+                format!(
+                    "kind {:?} has no known permission flags, so runtime_mode {} cannot be applied; use inherit",
+                    params.kind,
+                    requested_mode.as_str()
+                ),
+            )
+        })?,
+    };
     let options = Options {
         cwd: params.cwd,
         env: params.env.unwrap_or_default(),
@@ -196,6 +215,19 @@ pub async fn run(
             ),
         ));
     }
+    let caller_mode = match (&resolution.caller, resolution.caller_verified) {
+        (Some(caller), true) if requested_mode != RuntimeMode::Inherit => client
+            .pane_process_info(&caller.pane_id)
+            .await
+            .ok()
+            .and_then(|info| runtime_mode::caller_level(&info)),
+        _ => None,
+    };
+    runtime_mode::check_escalation(
+        requested_mode,
+        caller_mode,
+        params.allow_full_access.unwrap_or(false),
+    )?;
     let placed = place::place(&client, &resolution, params.placement.as_ref(), &options).await?;
 
     let injected = match injection(inner, &params.kind, control) {
@@ -206,7 +238,7 @@ pub async fn run(
         }
     };
     let mut start = AgentStartParams::new(&params.name, &params.kind, &placed.pane_id);
-    start.args = injected.args;
+    start.args = mode_args.into_iter().chain(injected.args).collect();
     let cap = inner.profile.wait_cap(client_info_name);
     let (timeout, cap_note) = clamp_timeout(params.start_timeout_ms, cap, DEFAULT_TIMEOUT);
     let started = tokio::select! {
@@ -295,6 +327,8 @@ pub async fn run(
         }
     }
     out["kind"] = json!(params.kind);
+    out["runtime_mode"] = json!(requested_mode.as_str());
+    out["caller_runtime_mode"] = json!(runtime_mode::describe(caller_mode));
     out["mcp"] = json!(injected.mcp);
     out["child_tools"] = json!(injected.child_tools.as_str());
     if let Some(note) = &injected.note {
