@@ -4,10 +4,10 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::caller::resolve_caller;
-use crate::guard::{self, TargetKind};
+use crate::guard::TargetKind;
 use crate::herdr::{AgentInfo, AgentStatus, Client, HerdrError, PaneProcessInfo};
 use crate::providers::{PROCESS_INTERRUPT_KEY, provider};
+use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 
 pub const SETTLE: Duration = Duration::from_millis(500);
@@ -65,32 +65,27 @@ fn no_active_work(pane: &str, method: &str, status_after: impl Serialize) -> Val
 }
 
 pub async fn run(inner: &Inner, params: InterruptParams) -> Result<Value, HerdrError> {
-    let client = inner.client()?;
-    let (snapshot, resolution) = tokio::try_join!(
-        client.session_snapshot(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
-    )?;
-    let target = guard::resolve_target(&client, &snapshot, &params.target).await?;
-    if target.kind != TargetKind::Pane {
-        return Err(HerdrError::tool(
-            "unsupported_target",
-            "herdr_interrupt takes a pane ID or an agent name",
-        ));
-    }
-    guard::self_guard(
-        resolution.guard_target.as_deref(),
-        &target,
-        params.allow_self.unwrap_or(false),
-    )?;
-
-    let pane = target.id.as_str();
-    let agent = snapshot.agents.iter().find(|agent| agent.pane_id == pane);
+    let mut scope = Scope::open(inner)?;
+    let request = TargetRequest::new(
+        &params.target,
+        &[TargetKind::Pane],
+        "herdr_interrupt takes a pane ID or an agent name",
+    )
+    .allow_self(params.allow_self.unwrap_or(false));
+    let scoped = scope.target(request).await?;
+    let pane = scoped
+        .target
+        .as_ref()
+        .expect("target is required")
+        .id
+        .as_str();
+    let agent = scoped.agent();
     let action = Action {
         method: params.method,
         keys: params.keys,
         signal: params.signal,
     };
-    interrupt_pane(&client, inner.interrupt_settle, pane, agent, action).await
+    interrupt_pane(scope.client(), inner.interrupt_settle, pane, agent, action).await
 }
 
 /// How to interrupt, apart from where.

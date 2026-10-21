@@ -63,7 +63,7 @@ fn pane(id: &str) -> Resolved {
 }
 
 /// `resolve`, then Herdr's own alias lookup for a moved pane or an agent not in the snapshot.
-pub async fn resolve_target(
+pub(crate) async fn resolve_target(
     client: &Client,
     snapshot: &SessionSnapshot,
     target: &str,
@@ -86,7 +86,7 @@ pub async fn resolve_target(
 
 /// Refuse a target that is, or contains, the pane the guards protect.
 /// `guard_pane` is `Resolution::guard_target`, which fails closed for an unverified caller.
-pub fn self_guard(
+pub(crate) fn self_guard(
     guard_pane: Option<&str>,
     target: &Resolved,
     allow_self: bool,
@@ -107,7 +107,7 @@ pub fn self_guard(
 }
 
 /// Refuse a target with any pane no bridge launched, unless `force`.
-pub fn provenance_guard(
+pub(crate) fn provenance_guard(
     snapshot: &SessionSnapshot,
     target: &Resolved,
     force: bool,

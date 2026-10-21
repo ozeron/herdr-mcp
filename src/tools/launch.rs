@@ -9,7 +9,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::caller::resolve_caller;
 use crate::cli::ToolMode;
 use crate::herdr::{
     AgentInfo, AgentReadParams, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError,
@@ -23,6 +22,7 @@ use crate::place::{self, Options, Placed, Where};
 use crate::provenance;
 use crate::providers::{Dialog, is_ready, match_dialog, mcp_args, mode_args, runtime_args};
 use crate::runtime_mode::{self, RuntimeMode};
+use crate::scope::Scope;
 use crate::server::Inner;
 use crate::tools::send::{gated_prompt, prompt_error, turn_for};
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
@@ -227,11 +227,9 @@ pub async fn run(
     };
     place::validate(params.placement.as_ref(), &options)?;
 
-    let client = inner.client()?;
-    let (snapshot, resolution) = tokio::try_join!(
-        client.session_snapshot(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
-    )?;
+    let mut scope = Scope::open(inner)?;
+    let (snapshot, resolution) = scope.snapshot_and_caller().await?;
+    let client = scope.client();
     if snapshot
         .agents
         .iter()
@@ -268,12 +266,12 @@ pub async fn run(
         caller_mode,
         params.allow_full_access.unwrap_or(false),
     )?;
-    let placed = place::place(&client, &resolution, params.placement.as_ref(), &options).await?;
+    let placed = place::place(client, &resolution, params.placement.as_ref(), &options).await?;
 
     let injected = match injection(inner, &params.kind, control) {
         Ok(found) => found,
         Err(err) => {
-            placed.cleanup(&client).await;
+            placed.cleanup(client).await;
             return Err(err);
         }
     };
@@ -282,7 +280,7 @@ pub async fn run(
     let cap = inner.profile.wait_cap(client_info_name);
     let (timeout, cap_note) = clamp_timeout(params.start_timeout_ms, cap, DEFAULT_TIMEOUT);
     let started = tokio::select! {
-        started = start_agent(&client, &inner.launch, &placed.pane_id, &start) => started,
+        started = start_agent(client, &inner.launch, &placed.pane_id, &start) => started,
         () = cancel.cancelled() => {
             return Err(cancelled(
                 "the client cancelled the launch before the agent started. The pane is kept: read it, then continue with herdr_send or close it",
@@ -291,18 +289,18 @@ pub async fn run(
         }
     };
     if let Err(err) = started {
-        placed.cleanup(&client).await;
+        placed.cleanup(client).await;
         return Err(err);
     }
 
     if let Err(err) = provenance::tag_agent(
-        &client,
+        client,
         &placed.pane_id,
         provenance::parent_value(&resolution),
     )
     .await
     {
-        placed.cleanup(&client).await;
+        placed.cleanup(client).await;
         return Err(HerdrError::detailed(
             "provenance_failed",
             format!(
@@ -314,7 +312,7 @@ pub async fn run(
 
     let ready = tokio::select! {
         ready = await_ready(
-            &client,
+            client,
             &inner.launch,
             &placed,
             &params.kind,
@@ -330,13 +328,13 @@ pub async fn run(
     };
     if let Err(failure) = ready {
         if failure.cleanup {
-            placed.cleanup(&client).await;
+            placed.cleanup(client).await;
         }
         return Err(failure.err);
     }
 
     let handled = handle_dialogs(
-        &client,
+        client,
         &inner.launch,
         &placed,
         &params.kind,
@@ -391,7 +389,7 @@ pub async fn run(
         None => base_instructions,
     };
 
-    let agent = gated_prompt(&client, &placed.pane_id, instructions)
+    let agent = gated_prompt(client, &placed.pane_id, instructions)
         .await
         .map_err(|err| {
             let phase = if matches!(
@@ -407,7 +405,7 @@ pub async fn run(
             };
             prompt_error(err, &placed.pane_id, progress(&placed, &params.name, phase))
         })?;
-    let turn = turn_for(&client, &agent).await;
+    let turn = turn_for(client, &agent).await;
     out["phase"] = json!("prompted");
     out["status"] = json!(agent.agent_status);
     out["turn"] = json!(turn);
@@ -444,7 +442,7 @@ pub async fn run(
             out["reply"] = Value::Null;
         }
         out["excerpt"] = json!(
-            read_text(&client, &placed.pane_id)
+            read_text(client, &placed.pane_id)
                 .await
                 .map(|text| tail(&text))
                 .unwrap_or_default()
@@ -467,7 +465,7 @@ pub async fn run(
     let result = match &mail_plan {
         Some(plan) => {
             await_reply(ReplyWait {
-                client: &client,
+                client,
                 inner,
                 plan,
                 filter: &filter,
@@ -483,7 +481,7 @@ pub async fn run(
         None => {
             tokio::select! {
                 result = wait::wait(
-                    &client,
+                    client,
                     &inner.wait,
                     Request { pane: turn.pane.clone(), condition: Condition::Turn(turn.clone()), cap: remaining },
                     ticks,

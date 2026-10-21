@@ -6,13 +6,14 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::caller::{Resolution, resolve_caller};
-use crate::guard::{self, TargetKind};
+use crate::caller::Resolution;
+use crate::guard::TargetKind;
 use crate::herdr::{
     AgentInfo, AgentPromptParams, AgentStatus, ApiErrorCode, Client, HerdrError, Outcome,
     PaneSendInputParams, PromptWait,
 };
 use crate::provenance;
+use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 use crate::tools::interrupt;
 use crate::tools::launch::visible_dialog;
@@ -95,25 +96,23 @@ pub async fn run(
     params: SendParams,
 ) -> Result<Value, HerdrError> {
     validate(&params)?;
-    let client = inner.client()?;
-    let (snapshot, resolution) = tokio::try_join!(
-        client.session_snapshot(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
-    )?;
-    let target = guard::resolve_target(&client, &snapshot, &params.target).await?;
-    if target.kind != TargetKind::Pane {
-        return Err(HerdrError::tool(
-            "unsupported_target",
-            "herdr_send takes a pane ID or an agent name",
-        ));
-    }
-    guard::self_guard(
-        resolution.guard_target.as_deref(),
-        &target,
-        params.allow_self.unwrap_or(false),
-    )?;
-    let pane = target.id.as_str();
-    let agent = snapshot.agents.iter().find(|agent| agent.pane_id == pane);
+    let mut scope = Scope::open(inner)?;
+    let request = TargetRequest::new(
+        &params.target,
+        &[TargetKind::Pane],
+        "herdr_send takes a pane ID or an agent name",
+    )
+    .allow_self(params.allow_self.unwrap_or(false));
+    let scoped = scope.target(request).await?;
+    let client = scope.client();
+    let resolution = &scoped.resolution;
+    let pane = scoped
+        .target
+        .as_ref()
+        .expect("target is required")
+        .id
+        .as_str();
+    let agent = scoped.agent();
     let is_agent = agent.is_some();
 
     match params.prompt.as_deref() {
@@ -132,9 +131,9 @@ pub async fn run(
                 settle: inner.interrupt_settle,
                 timeout,
             };
-            send_prompt(&client, pane, agent, prompt, mode, pacing, ct).await
+            send_prompt(client, pane, agent, prompt, mode, pacing, ct).await
         }
-        None => send_raw(&client, &resolution, pane, is_agent, &params).await,
+        None => send_raw(client, resolution, pane, is_agent, &params).await,
     }
 }
 

@@ -9,10 +9,10 @@ use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::caller::resolve_caller;
 use crate::herdr::{Client, HerdrError, PaneProcessInfo, PaneSendInputParams};
 use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, read_text, tail, wait_for_match};
 use crate::place::{self, Options, Placed, Where};
+use crate::scope::Scope;
 use crate::server::Inner;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 
@@ -68,19 +68,20 @@ pub async fn run(
         label: params.label,
     };
     place::validate(params.placement.as_ref(), &options)?;
-    let client = inner.client()?;
-    let resolution = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()).await?;
-    let placed = place::place(&client, &resolution, params.placement.as_ref(), &options).await?;
+    let mut scope = Scope::open(inner)?;
+    let resolution = scope.caller().await?.clone();
+    let client = scope.client();
+    let placed = place::place(client, &resolution, params.placement.as_ref(), &options).await?;
 
     let needle = params
         .ready
         .as_ref()
         .map_or("", |ready| ready.pattern.as_str());
-    let sent = send(&client, &placed, &params.command, needle).await;
+    let sent = send(client, &placed, &params.command, needle).await;
     let matcher = match sent {
         Ok(matcher) => matcher,
         Err(err) => {
-            placed.cleanup(&client).await;
+            placed.cleanup(client).await;
             return Err(err);
         }
     };
@@ -107,7 +108,7 @@ pub async fn run(
     let abort = observer.abort_handle();
     let (ready_matched, timed_out, excerpt) = if params.ready.is_some() {
         let outcome = wait_for_match(&matcher, timeout, POLL_INTERVAL, || {
-            read_text(&client, &placed.pane_id)
+            read_text(client, &placed.pane_id)
         })
         .await?;
         match outcome {
@@ -116,9 +117,7 @@ pub async fn run(
         }
     } else {
         let _ = observer.await;
-        let text = read_text(&client, &placed.pane_id)
-            .await
-            .unwrap_or_default();
+        let text = read_text(client, &placed.pane_id).await.unwrap_or_default();
         (None, false, tail(&text))
     };
     abort.abort();

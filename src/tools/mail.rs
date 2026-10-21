@@ -10,10 +10,10 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::caller::resolve_caller;
-use crate::guard::{self, TargetKind};
+use crate::guard::TargetKind;
 use crate::herdr::{AgentPromptParams, AgentStatus, Client, HerdrError};
 use crate::mailbox::{self, Inbox, Mailbox, Message, Party, SenderFilter};
-use crate::scope::looks_like_herdr_id;
+use crate::scope::{Scope, Scoped, TargetRequest};
 use crate::server::Inner;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::wait::{PROGRESS_INTERVAL, Progress};
@@ -92,29 +92,20 @@ pub async fn send(
     params: SendParams,
 ) -> Result<Value, HerdrError> {
     mailbox::check_body(&params.body)?;
-    let client = inner.client()?;
-    let (snapshot, resolution) = tokio::try_join!(
-        client.session_snapshot(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
-    )?;
-    let target = match guard::resolve_target(&client, &snapshot, &params.to).await {
-        Ok(target) => Some(target),
-        Err(err) if err.code() == "target_not_found" && !looks_like_herdr_id(&params.to) => None,
-        Err(err) => return Err(err),
-    };
-    if let Some(target) = &target {
-        if target.kind != TargetKind::Pane {
-            return Err(HerdrError::tool(
-                "unsupported_target",
-                "herdr_mail_send takes a pane ID or an agent name",
-            ));
-        }
-        guard::self_guard(
-            resolution.guard_target.as_deref(),
-            target,
-            params.allow_self.unwrap_or(false),
-        )?;
-    }
+    let mut scope = Scope::open(inner)?;
+    let request = TargetRequest::new(
+        &params.to,
+        &[TargetKind::Pane],
+        "herdr_mail_send takes a pane ID or an agent name",
+    )
+    .allow_self(params.allow_self.unwrap_or(false))
+    .tolerant();
+    let Scoped {
+        resolution,
+        snapshot,
+        target,
+    } = scope.target(request).await?;
+    let client = scope.client();
     let agent_name = |pane: &str| {
         snapshot
             .agents
@@ -182,7 +173,7 @@ pub async fn send(
             } else if !is_agent {
                 Some("not_an_agent".to_string())
             } else {
-                nudge(&client, mailbox, pane, &key, &sender_label).await
+                nudge(client, mailbox, pane, &key, &sender_label).await
             }
         }
     };

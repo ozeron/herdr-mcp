@@ -2,9 +2,9 @@ use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::caller::resolve_caller;
-use crate::guard::{self, TargetKind};
+use crate::guard::TargetKind;
 use crate::herdr::HerdrError;
+use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -19,24 +19,17 @@ pub struct CloseParams {
 }
 
 pub async fn run(inner: &Inner, params: CloseParams) -> Result<Value, HerdrError> {
-    let client = inner.client()?;
-    let (snapshot, resolution) = tokio::try_join!(
-        client.session_snapshot(),
-        resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
-    )?;
-    let target = guard::resolve_target(&client, &snapshot, &params.target).await?;
-    if target.kind == TargetKind::Workspace {
-        return Err(HerdrError::tool(
-            "unsupported_target",
-            "herdr_close closes a pane or a tab, not a workspace",
-        ));
-    }
-    guard::self_guard(
-        resolution.guard_target.as_deref(),
-        &target,
-        params.allow_self.unwrap_or(false),
-    )?;
-    guard::provenance_guard(&snapshot, &target, params.force.unwrap_or(false))?;
+    let mut scope = Scope::open(inner)?;
+    let request = TargetRequest::new(
+        &params.target,
+        &[TargetKind::Pane, TargetKind::Tab],
+        "herdr_close closes a pane or a tab, not a workspace",
+    )
+    .allow_self(params.allow_self.unwrap_or(false))
+    .provenance(params.force.unwrap_or(false));
+    let scoped = scope.target(request).await?;
+    let client = scope.client();
+    let target = scoped.target.expect("target is required");
 
     let kind = match target.kind {
         TargetKind::Pane => {

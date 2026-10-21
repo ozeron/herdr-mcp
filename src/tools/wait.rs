@@ -4,9 +4,9 @@ use rmcp::service::RequestContext;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::caller::resolve_caller;
-use crate::guard::{self, Resolved, TargetKind};
+use crate::guard::TargetKind;
 use crate::herdr::{AgentStatus, HerdrError};
+use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 use crate::tools::DEFAULT_TIMEOUT;
 use crate::turn::Turn;
@@ -108,56 +108,26 @@ pub async fn run(
     let cap = inner.profile.wait_cap(client_name);
     let (timeout, note) = super::clamp_timeout(params.timeout_ms, cap, DEFAULT_TIMEOUT);
 
-    let client = inner.client()?;
+    let mut scope = Scope::open(inner)?;
+    let allow_self = params.allow_self.unwrap_or(false);
     let pane = match &params.turn {
         Some(turn) => {
-            let caller = resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref());
-            let resolution = match &params.target {
-                Some(target) => {
-                    // Both run at once, but a caller error is reported before a snapshot error.
-                    let (resolution, snapshot) = tokio::join!(caller, client.session_snapshot());
-                    let (resolution, snapshot) = (resolution?, snapshot?);
-                    let named = guard::resolve_target(&client, &snapshot, target).await?;
-                    if named.id != turn.pane {
-                        return Err(HerdrError::invalid_params(
-                            "target is not the pane this turn token belongs to",
-                        ));
-                    }
-                    resolution
-                }
-                None => caller.await?,
-            };
-            let own = Resolved {
-                kind: TargetKind::Pane,
-                id: turn.pane.clone(),
-                pane_ids: vec![turn.pane.clone()],
-            };
-            guard::self_guard(
-                resolution.guard_target.as_deref(),
-                &own,
-                params.allow_self.unwrap_or(false),
-            )?;
+            scope
+                .guard_pane(&turn.pane, allow_self, params.target.as_deref())
+                .await?;
             turn.pane.clone()
         }
         None => {
             let target = params.target.as_deref().unwrap_or_default();
-            let (snapshot, resolution) = tokio::try_join!(
-                client.session_snapshot(),
-                resolve_caller(&client, &inner.caller_env, inner.ancestry.as_ref()),
-            )?;
-            let resolved = guard::resolve_target(&client, &snapshot, target).await?;
-            guard::self_guard(
-                resolution.guard_target.as_deref(),
-                &resolved,
-                params.allow_self.unwrap_or(false),
-            )?;
-            if resolved.kind != TargetKind::Pane {
-                return Err(HerdrError::tool(
-                    "unsupported_target",
-                    "herdr_wait waits on a pane or an agent, not a tab or workspace",
-                ));
-            }
-            resolved.id
+            let request = TargetRequest::new(
+                target,
+                &[TargetKind::Pane],
+                "herdr_wait waits on a pane or an agent, not a tab or workspace",
+            )
+            .allow_self(allow_self)
+            .self_guard_first();
+            let scoped = scope.target(request).await?;
+            scoped.target.expect("target is required").id
         }
     };
 
@@ -166,7 +136,12 @@ pub async fn run(
         condition,
         cap: timeout,
     };
-    let work = wait::wait(&client, &inner.wait, request, super::progress_sink(ctx));
+    let work = wait::wait(
+        scope.client(),
+        &inner.wait,
+        request,
+        super::progress_sink(ctx),
+    );
     tokio::pin!(work);
     let mut out = tokio::select! {
         out = &mut work => out?,

@@ -12,8 +12,37 @@ use crate::guard::{self, Resolved, TargetKind};
 use crate::herdr::{AgentInfo, Client, HerdrError, SessionSnapshot};
 use crate::server::Inner;
 
-pub struct Scope {
-    client: Client,
+/// The scope owns the client it opened, or borrows one a caller already holds.
+pub enum ClientRef<'a> {
+    Owned(Client),
+    Borrowed(&'a Client),
+}
+
+impl From<Client> for ClientRef<'_> {
+    fn from(client: Client) -> Self {
+        Self::Owned(client)
+    }
+}
+
+impl<'a> From<&'a Client> for ClientRef<'a> {
+    fn from(client: &'a Client) -> Self {
+        Self::Borrowed(client)
+    }
+}
+
+impl std::ops::Deref for ClientRef<'_> {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        match self {
+            Self::Owned(client) => client,
+            Self::Borrowed(client) => client,
+        }
+    }
+}
+
+pub struct Scope<'a> {
+    client: ClientRef<'a>,
     env: CallerEnv,
     ancestry: Arc<dyn Ancestry>,
     resolution: Option<Resolution>,
@@ -106,10 +135,10 @@ pub struct PaneGuard {
     pub snapshot: Option<SessionSnapshot>,
 }
 
-impl Scope {
+impl<'a> Scope<'a> {
     pub fn open(inner: &Inner) -> Result<Self, HerdrError> {
         Ok(Self {
-            client: inner.client()?,
+            client: inner.client()?.into(),
             env: inner.caller_env.clone(),
             ancestry: Arc::clone(&inner.ancestry),
             resolution: None,
@@ -117,9 +146,9 @@ impl Scope {
     }
 
     /// A scope whose caller is already resolved, so a target request takes only a snapshot.
-    pub fn with_caller(client: Client, resolution: Resolution) -> Self {
+    pub fn with_caller(client: impl Into<ClientRef<'a>>, resolution: Resolution) -> Self {
         Self {
-            client,
+            client: client.into(),
             env: CallerEnv::default(),
             ancestry: Arc::new(crate::caller::StaticAncestry(Vec::new())),
             resolution: Some(resolution),
@@ -139,9 +168,10 @@ impl Scope {
         Ok(self.resolution.as_ref().expect("resolved above"))
     }
 
-    /// Fetches the snapshot and the caller together (the first error wins), then resolves and
-    /// guards the target.
-    pub async fn target(&mut self, request: TargetRequest<'_>) -> Result<Scoped, HerdrError> {
+    /// The snapshot and the caller, fetched together (the first error wins).
+    pub async fn snapshot_and_caller(
+        &mut self,
+    ) -> Result<(SessionSnapshot, Resolution), HerdrError> {
         let (snapshot, resolution) = match self.resolution.clone() {
             Some(resolution) => (self.client.session_snapshot().await?, resolution),
             None => tokio::try_join!(
@@ -150,6 +180,13 @@ impl Scope {
             )?,
         };
         self.resolution = Some(resolution.clone());
+        Ok((snapshot, resolution))
+    }
+
+    /// Fetches the snapshot and the caller together (the first error wins), then resolves and
+    /// guards the target.
+    pub async fn target(&mut self, request: TargetRequest<'_>) -> Result<Scoped, HerdrError> {
+        let (snapshot, resolution) = self.snapshot_and_caller().await?;
 
         let target = match guard::resolve_target(&self.client, &snapshot, request.target).await {
             Ok(target) => Some(target),

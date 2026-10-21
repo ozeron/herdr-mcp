@@ -5,12 +5,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::caller::Resolution;
-use crate::guard::{self, TargetKind};
+use crate::guard::TargetKind;
 use crate::herdr::{
     Client, HerdrError, PaneSplitParams, SplitDirection, TabCreateParams, WorkspaceCreateParams,
     WorktreeCreateParams,
 };
 use crate::provenance;
+use crate::scope::{Scope, Scoped, TargetRequest};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -279,14 +280,19 @@ async fn existing(
     resolution: &Resolution,
     target: &str,
 ) -> Result<Placed, HerdrError> {
-    let snapshot = client.session_snapshot().await?;
-    let resolved = guard::resolve_target(client, &snapshot, target).await?;
-    if resolved.kind != TargetKind::Pane {
-        return Err(HerdrError::invalid_params(
-            "where.pane takes a pane ID or an agent name",
-        ));
-    }
-    guard::self_guard(resolution.guard_target.as_deref(), &resolved, false)?;
+    let mut scope = Scope::with_caller(client, resolution.clone());
+    let request = TargetRequest::new(
+        target,
+        &[TargetKind::Pane],
+        "where.pane takes a pane ID or an agent name",
+    )
+    .refusal_code("invalid_params");
+    let Scoped {
+        snapshot,
+        target: resolved,
+        ..
+    } = scope.target(request).await?;
+    let resolved = resolved.expect("target is required");
     let info = client.pane_process_info(&resolved.id).await?;
     if !info.shell_in_front_strict() {
         return Err(HerdrError::tool(
