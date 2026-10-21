@@ -168,7 +168,7 @@ pub async fn run(
             .await?;
             if params.wait == Some(SendWait::Turn) {
                 let remaining = cap.saturating_sub(started.elapsed());
-                await_turn(client, inner, &mut out, remaining, ct, progress).await?;
+                await_turn(client, inner, &mut out, remaining, ct, progress).await;
             }
             Ok(out)
         }
@@ -316,8 +316,9 @@ async fn send_prompt(
     Ok(out)
 }
 
-/// Waits for the turn in `out` to settle and merges the outcome in. Without a turn (queued,
-/// steered, or a prompt that started nothing) there is nothing to wait on, so `out` is kept.
+/// Waits for the turn in `out` to settle and merges the outcome in. The prompt is already
+/// delivered, so nothing here fails the call: a wait that cannot finish says why, keeps the
+/// turn, and adds to any earlier note.
 async fn await_turn(
     client: &Client,
     inner: &Inner,
@@ -325,16 +326,21 @@ async fn await_turn(
     remaining: Duration,
     ct: &CancellationToken,
     progress: Option<UnboundedSender<Progress>>,
-) -> Result<(), HerdrError> {
+) {
     let Some(turn) = serde_json::from_value::<Turn>(out["turn"].clone()).ok() else {
-        return Ok(());
+        add_note(
+            out,
+            "no turn started, so there was nothing to wait on; read the pane",
+        );
+        return;
     };
     if remaining.is_zero() {
         out["timed_out"] = json!(true);
-        out["note"] = json!(
-            "the wait cap was used up before the turn could be waited on; call herdr_wait with the turn"
+        add_note(
+            out,
+            "the wait cap was used up before the turn could be waited on; call herdr_wait with the turn",
         );
-        return Ok(());
+        return;
     }
     let request = Request {
         pane: turn.pane.clone(),
@@ -342,21 +348,41 @@ async fn await_turn(
         cap: remaining,
     };
     let outcome = tokio::select! {
-        outcome = wait::wait(client, &inner.wait, request, progress) => outcome?,
-        // The prompt is already delivered; a cancelled wait only stops waiting.
+        outcome = wait::wait(client, &inner.wait, request, progress) => outcome,
         () = ct.cancelled() => {
             out["timed_out"] = json!(true);
-            return Ok(());
+            return;
         }
     };
-    if let (Some(fields), Some(target)) = (outcome.to_json().as_object(), out.as_object_mut()) {
-        for (key, value) in fields {
-            if key != "pane" {
-                target.insert(key.clone(), value.clone());
+    match outcome {
+        Ok(outcome) => {
+            if let (Some(fields), Some(target)) =
+                (outcome.to_json().as_object(), out.as_object_mut())
+            {
+                for (key, value) in fields {
+                    if key != "pane" && key != "note" {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
             }
         }
+        Err(err) => {
+            out["wait_error"] = json!({"code": err.code(), "message": err.to_string()});
+            add_note(
+                out,
+                "the prompt was delivered but the wait failed; do not resend. Retry herdr_wait with the turn, or read the pane",
+            );
+        }
     }
-    Ok(())
+}
+
+/// Appends `text` to the note in `out`, keeping any earlier one.
+fn add_note(out: &mut Value, text: &str) {
+    let note = match out["note"].as_str() {
+        Some(earlier) => format!("{earlier}; {text}"),
+        None => text.to_owned(),
+    };
+    out["note"] = json!(note);
 }
 
 fn no_send_now_note(kind: Option<&str>) -> String {

@@ -1681,6 +1681,34 @@ async fn wait_turn_returns_the_settled_turn_with_its_excerpt() {
 }
 
 #[tokio::test]
+async fn a_wait_that_fails_after_delivery_keeps_the_turn_and_says_not_to_resend() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+    // The prompt lands; then the agent vanishes while the wait polls it.
+    h.fake.on_after(
+        "agent.get",
+        "agent.prompt",
+        Script::error("agent_not_found", "gone"),
+    );
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "wait": "turn"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "started");
+    assert_eq!(out["turn"]["after"], 5);
+    assert!(out["wait_error"]["code"].is_string(), "{out}");
+    assert!(
+        out["note"].as_str().unwrap().contains("do not resend"),
+        "{out}"
+    );
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+}
+
+#[tokio::test]
 async fn wait_turn_on_a_queued_prompt_returns_at_once() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
