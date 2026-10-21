@@ -1393,3 +1393,52 @@ async fn move_refuses_the_callers_own_pane_and_an_unknown_workspace() {
     assert_eq!(unknown, "target_not_found");
     assert_eq!(count(&h.fake, "pane.move"), 0);
 }
+
+#[tokio::test]
+async fn a_cwd_that_climbs_out_of_the_worktree_is_warned() {
+    let h = start(remote()).await;
+    script_external_tab(&h.fake, "w2");
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "cwd": "/repo/w2/../other", "where": {"workspace_id": "w2"}}),
+    )
+    .await;
+
+    assert!(
+        out["warning"].as_str().unwrap().contains("/repo/w2"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_lookup_only_skips_the_cwd_warning_for_the_callers_own_workspace() {
+    let h = start(Opts::default()).await;
+    script_caller(&h.fake);
+    h.fake.on_params(
+        "session.snapshot",
+        json!({}),
+        Script::error("internal_error", "snapshot failed"),
+    );
+    h.fake
+        .reply("tab.create", tab_created("w1:t9", "w1", "w1:p9"));
+    h.fake.reply("pane.report_metadata", ok_reply());
+    h.fake.reply("pane.send_input", ok_reply());
+    reads(&h.fake, &["$ "]);
+    h.fake
+        .reply_seq("pane.process_info", vec![process_info("w1:p9", 200, 200)]);
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "cwd": "/anywhere"}),
+    )
+    .await;
+
+    assert_eq!(
+        requests(&h.fake, "tab.create")[0]["params"]["workspace_id"],
+        "w1"
+    );
+    assert!(out.get("warning").is_none(), "{out}");
+}

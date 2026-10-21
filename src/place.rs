@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, PathBuf};
 
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
@@ -370,13 +370,39 @@ impl Destination {
     /// A warning when `cwd` lies outside this workspace's worktree. The tab still opens.
     pub fn cwd_warning(&self, cwd: Option<&str>) -> Option<String> {
         let (cwd, root) = (cwd?, self.worktree_path.as_deref()?);
-        (!Path::new(cwd).starts_with(root)).then(|| {
+        (!real_path(cwd).starts_with(real_path(root))).then(|| {
             format!(
                 "cwd {cwd} is outside workspace {}'s worktree {root}; the tab opened there anyway",
                 self.workspace_id
             )
         })
     }
+}
+
+/// `path` as the file system sees it: `~` expanded, symlinks such as `/tmp` resolved, and `..`
+/// folded, so the cwd check compares real locations. A path that does not exist is only
+/// expanded and folded.
+fn real_path(path: &str) -> PathBuf {
+    let expanded = match (path.strip_prefix('~'), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            PathBuf::from(home).join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(path),
+    };
+    if let Ok(real) = std::fs::canonicalize(&expanded) {
+        return real;
+    }
+    let mut folded = PathBuf::new();
+    for part in expanded.components() {
+        match part {
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::CurDir => {}
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 /// Resolves where a new tab or worktree goes: `requested` (a workspace ID or label, matched
@@ -398,7 +424,18 @@ pub async fn destination(
             note: None,
         });
     }
-    let snapshot = client.session_snapshot().await?;
+    let snapshot = match client.session_snapshot().await {
+        Ok(snapshot) => snapshot,
+        // The caller's own workspace needs the snapshot only for the cwd warning: skip it.
+        Err(_) if requested.is_none() && caller_workspace.is_some() => {
+            return Ok(Destination {
+                workspace_id: caller_workspace.unwrap_or_default().to_string(),
+                worktree_path: None,
+                note: None,
+            });
+        }
+        Err(err) => return Err(err),
+    };
     let workspaces = &snapshot.workspaces;
     let listing = || {
         json!(
