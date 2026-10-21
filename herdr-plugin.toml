@@ -81,3 +81,31 @@ title = "Herdr MCP: ChatGPT tunnel (doctor)"
 description = "Check the tunnel client, ID, key, bridge, OpenAI auth and service. Writes nothing."
 contexts = ["global"]
 command = ["bin/herdr-mcp", "tunnel", "doctor"]
+
+[[panes]]
+id = "ngrok-start-full"
+title = "Herdr MCP: ChatGPT over ngrok (start, full access)"
+description = "Start the ngrok remote with control tools. Signed-in owners can then run commands as you and type into your panes through ChatGPT. Shows a disclosure and asks you to type 'full access' first."
+placement = "split"
+command = ["sh", "-c", "bin/herdr-mcp tunnel ngrok start --full; printf '\\nPress Enter to close. '; read _"]
+
+[[actions]]
+id = "ngrok-start"
+title = "Herdr MCP: ChatGPT over ngrok (start, read)"
+description = "Start the ngrok remote with read tools only. It keeps running until you stop it."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "ngrok", "start"]
+
+[[actions]]
+id = "ngrok-stop"
+title = "Herdr MCP: ChatGPT over ngrok (stop)"
+description = "Stop the ngrok remote and remove its LaunchAgent."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "ngrok", "stop"]
+
+[[actions]]
+id = "ngrok-status"
+title = "Herdr MCP: ChatGPT over ngrok (status)"
+description = "Show whether the ngrok remote runs, its mode, URL, owners, expiry and the last auth denial. Writes nothing."
+contexts = ["global"]
+command = ["bin/herdr-mcp", "tunnel", "ngrok", "status"]

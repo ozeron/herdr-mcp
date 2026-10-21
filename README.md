@@ -200,6 +200,27 @@ Other ways to stop it:
 - The tunnel-client binary is not notarized: macOS may block it on first run. Allow it in System Settings, Privacy and Security.
 - Limits: 120 s per request, 10 MiB per message.
 
+### ChatGPT over ngrok (OAuth)
+
+An alternative to OpenAI's tunnel: ChatGPT reaches `https://<domain>/mcp` over an ngrok static domain. A hosted OAuth provider logs you in, and `herdr-mcp` accepts only its JWTs for the owners you name.
+
+```sh
+brew install ngrok && ngrok config add-authtoken <token>
+herdr-mcp tunnel ngrok setup                 # domain, issuer, owners, audience -> ~/.config/herdr-mcp/ngrok.toml
+herdr-mcp tunnel ngrok start [--full] [--for 8h] [--session work]
+herdr-mcp tunnel ngrok status | doctor | stop
+```
+
+In ChatGPT: Plugins, +, custom MCP server, URL `https://<domain>/mcp`, Authentication OAuth.
+
+The provider must support:
+- dynamic client registration (`registration_endpoint` in its discovery document) and PKCE;
+- the redirect `https://chatgpt.com/connector/oauth/*`;
+- an audience equal to the resource URL (default `https://<domain>/mcp`);
+- restricting sign-in to you, since the owner list is the only check after a token verifies.
+
+`start` runs `tunnel ngrok run` as the LaunchAgent `dev.herdr-mcp.ngrok`: it binds a loopback port, then starts ngrok on it. `--full` needs the same typed disclosure as the OpenAI tunnel. To revoke, end the sessions or rotate the signing keys at the provider; `tunnel ngrok stop` is the local kill switch. Logs are `ngrok.out.log` and `ngrok.err.log`; `status` shows the last `auth denied:` reason.
+
 ## Logs
 
 The bridge writes `herdr-mcp.log` in `herdr-mcp/` next to the Herdr socket, with mode 0600. Lines hold the tool name, an outcome code and a duration. They never hold pane output, prompts or commands.

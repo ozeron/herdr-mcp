@@ -1,25 +1,24 @@
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
-use herdr_mcp::caller::{CallerEnv, ProcessAncestry};
 use herdr_mcp::cli::ToolMode;
-use herdr_mcp::cli::{Args, Command, HttpServeArgs, InstallArgs, PrintConfigArgs, TunnelCommand};
-use herdr_mcp::herdr::{SessionEnv, resolve_socket_path};
-use herdr_mcp::http::{self, DenyAll, HttpOptions, TokenCheck};
+use herdr_mcp::cli::{
+    Args, Command, HttpServeArgs, InstallArgs, NgrokCommand, PrintConfigArgs, TunnelCommand,
+};
+use herdr_mcp::http::{self, DenyAll, TokenCheck};
 use herdr_mcp::install::{self, Action, InstallEnv, Io, Options};
-use herdr_mcp::log::Logger;
-use herdr_mcp::oauth::{self, JwtCheck};
+use herdr_mcp::oauth::JwtCheck;
 use herdr_mcp::print_config;
 use herdr_mcp::profile::ClientKind;
-use herdr_mcp::profile::Profile;
-use herdr_mcp::server::{BridgeConfig, HerdrMcp};
-use herdr_mcp::tunnel::{self, RunOptions, StartOptions, SystemRunner, TunnelConfig, TunnelEnv};
+use herdr_mcp::serve::{self, BridgeOptions, HttpSpec, ServeError};
+use herdr_mcp::server::HerdrMcp;
+use herdr_mcp::tunnel::{
+    self, RunOptions, StartOptions, SystemRunner, TunnelConfig, TunnelEnv, ngrok,
+};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -27,6 +26,9 @@ async fn main() -> ExitCode {
     match &args.command {
         Some(Command::Install(install_args)) => return run_install(install_args),
         Some(Command::PrintConfig(print_args)) => return run_print_config(print_args),
+        Some(Command::Tunnel(TunnelCommand::Ngrok(ngrok_command))) => {
+            return run_ngrok(ngrok_command).await;
+        }
         Some(Command::Tunnel(tunnel_command)) => return run_tunnel(tunnel_command),
         Some(Command::HttpServe(http_args)) => return run_http_serve(http_args).await,
         None => {}
@@ -55,73 +57,61 @@ async fn main() -> ExitCode {
 }
 
 async fn run_http_serve(args: &HttpServeArgs) -> ExitCode {
-    let options = match HttpOptions::new(args.bind, args.public_url.as_deref()) {
-        Ok(options) => options,
-        Err(err) => {
-            eprintln!("herdr-mcp: {err}");
-            return ExitCode::from(2);
-        }
-    };
-    let check = match build_check(args) {
-        Ok(check) => check,
-        Err(err) => {
-            eprintln!("herdr-mcp: {err}");
-            return ExitCode::from(2);
-        }
-    };
-    let listener = match http::bind_loopback(args.bind).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("herdr-mcp: {err}");
-            return ExitCode::from(2);
-        }
-    };
-    let server = match build_server(
-        args.session.as_deref(),
-        args.client,
-        args.max_wait_ms,
-        args.tools,
-        args.tunnel,
-        args.expires_at,
-    ) {
-        Ok(server) => server,
-        Err(code) => return code,
-    };
-    let shutdown = CancellationToken::new();
-    let router = match http::mcp_router(server, &options, check, shutdown.clone()) {
-        Ok(router) => match (&args.oauth_issuer, &args.oauth_audience) {
-            (Some(issuer), Some(audience)) => {
-                router.merge(oauth::metadata_router(audience, issuer))
-            }
-            _ => router,
-        },
-        Err(err) => {
-            eprintln!("herdr-mcp: {err}");
-            return ExitCode::from(2);
-        }
-    };
-    tokio::spawn(http::cancel_on_signal(shutdown.clone()));
-    if let Ok(addr) = listener.local_addr() {
-        eprintln!("herdr-mcp: serving MCP on http://{addr}{}", http::MCP_PATH);
-    }
-    match http::serve(listener, router, shutdown).await {
+    match serve_http(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("herdr-mcp: http server failed: {err}");
-            ExitCode::FAILURE
+            eprintln!("herdr-mcp: {err}");
+            ExitCode::from(err.code)
         }
     }
 }
 
-fn build_check(args: &HttpServeArgs) -> Result<Arc<dyn TokenCheck>, oauth::OAuthError> {
-    match (&args.oauth_issuer, &args.oauth_audience) {
-        (Some(issuer), Some(audience)) => Ok(Arc::new(JwtCheck::new(
-            issuer,
-            audience,
-            args.owners.clone(),
-        )?)),
-        _ => Ok(Arc::new(DenyAll)),
+async fn serve_http(args: &HttpServeArgs) -> Result<(), ServeError> {
+    let (check, metadata): (Arc<dyn TokenCheck>, _) =
+        match (&args.oauth_issuer, &args.oauth_audience) {
+            (Some(issuer), Some(audience)) => (
+                Arc::new(
+                    JwtCheck::new(issuer, audience, args.owners.clone())
+                        .map_err(ServeError::usage)?,
+                ),
+                Some((audience.clone(), issuer.clone())),
+            ),
+            _ => (Arc::new(DenyAll), None),
+        };
+    let server = serve::prepare_http(HttpSpec {
+        bind: args.bind,
+        public_url: args.public_url.clone(),
+        check,
+        metadata,
+        bridge: BridgeOptions {
+            session: args.session.clone(),
+            client: args.client,
+            max_wait_ms: args.max_wait_ms,
+            tools: args.tools,
+            tunnel: tunnel_config(args.tunnel, args.expires_at)?,
+        },
+    })
+    .await?;
+    tokio::spawn(http::cancel_on_signal(server.shutdown.clone()));
+    if let Ok(addr) = server.listener.local_addr() {
+        eprintln!("herdr-mcp: serving MCP on http://{addr}{}", http::MCP_PATH);
     }
+    http::serve(server.listener, server.router, server.shutdown)
+        .await
+        .map_err(|err| ServeError {
+            message: format!("http server failed: {err}"),
+            code: 1,
+        })
+}
+
+fn tunnel_config(
+    tunnel: bool,
+    expires_at: Option<u64>,
+) -> Result<Option<TunnelConfig>, ServeError> {
+    tunnel
+        .then(|| TunnelConfig::from_process(expires_at))
+        .transpose()
+        .map_err(ServeError::usage)
 }
 
 fn build_server(
@@ -132,42 +122,19 @@ fn build_server(
     tunnel: bool,
     expires_at: Option<u64>,
 ) -> Result<HerdrMcp, ExitCode> {
-    let socket_path = match resolve_socket_path(session, &SessionEnv::from_process()) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("herdr-mcp: {err}");
-            return Err(ExitCode::from(2));
-        }
+    let build = || {
+        serve::build_bridge(BridgeOptions {
+            session: session.map(str::to_owned),
+            client,
+            max_wait_ms,
+            tools,
+            tunnel: tunnel_config(tunnel, expires_at)?,
+        })
     };
-    let logger = socket_path
-        .parent()
-        .map(|dir| dir.join("herdr-mcp"))
-        .and_then(|dir| Logger::to_dir(dir).ok())
-        .unwrap_or_else(Logger::stderr_only);
-    let tunnel = if tunnel {
-        match TunnelConfig::from_process(expires_at) {
-            Ok(config) => Some(config),
-            Err(err) => {
-                eprintln!("herdr-mcp: {err}");
-                return Err(ExitCode::from(2));
-            }
-        }
-    } else {
-        None
-    };
-    let mut server = HerdrMcp::new(BridgeConfig {
-        socket_path,
-        profile: Profile::new(client, max_wait_ms.map(Duration::from_millis)),
-        mode: tools,
-        ancestry: Arc::new(ProcessAncestry),
-        caller_env: CallerEnv::from_process(),
-        logger,
-        install_env: InstallEnv::from_process().ok(),
-    });
-    if let Some(tunnel) = tunnel {
-        server = server.with_tunnel(tunnel);
-    }
-    Ok(server)
+    build().map_err(|err| {
+        eprintln!("herdr-mcp: {err}");
+        ExitCode::from(err.code)
+    })
 }
 
 fn run_print_config(args: &PrintConfigArgs) -> ExitCode {
@@ -271,6 +238,7 @@ fn run_tunnel(command: &TunnelCommand) -> ExitCode {
             &mut io,
         ),
         TunnelCommand::Log(args) => tunnel::log(&env, args.lines, &mut io),
+        TunnelCommand::Ngrok(_) => unreachable!("main routes ngrok commands to run_ngrok"),
         TunnelCommand::Run(args) => {
             let options = RunOptions {
                 session: args.session.clone(),
@@ -291,6 +259,70 @@ fn run_tunnel(command: &TunnelCommand) -> ExitCode {
                 }
             }
         }
+    };
+    let _ = out.flush();
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+async fn run_ngrok(command: &NgrokCommand) -> ExitCode {
+    let env = match TunnelEnv::from_process() {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let NgrokCommand::Run(args) = command {
+        let options = ngrok::RunOptions {
+            session: args.session.clone(),
+            full: args.full,
+            expires_at: args.expires_at,
+        };
+        let code = ngrok::run(&env, &options).await;
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
+    let stdin = std::io::stdin();
+    let stdin_is_tty = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let mut io = Io {
+        stdin_is_tty,
+        input: &mut input,
+        out: &mut out,
+        err: &mut err,
+    };
+    let code = match command {
+        NgrokCommand::Setup => ngrok::setup(&env, &mut io),
+        NgrokCommand::Start(args) => {
+            let duration = match args.duration.as_deref().map(tunnel::parse_duration) {
+                None => None,
+                Some(Ok(duration)) => Some(duration),
+                Some(Err(err)) => {
+                    eprintln!("herdr-mcp: {err}");
+                    return ExitCode::from(2);
+                }
+            };
+            let options = StartOptions {
+                full: args.full,
+                duration,
+                session: args.session.clone(),
+            };
+            let now = herdr_mcp::audit::unix_now();
+            ngrok::start(&env, &options, &SystemRunner, now, &mut io)
+        }
+        NgrokCommand::Stop => ngrok::stop(&env, &SystemRunner, &mut io),
+        NgrokCommand::Status => ngrok::status(&env, &SystemRunner, &mut io),
+        NgrokCommand::Doctor => {
+            ngrok::doctor(
+                &env,
+                &SystemRunner,
+                &ngrok::DoctorOptions::default(),
+                &mut io,
+            )
+            .await
+        }
+        NgrokCommand::Run(_) => unreachable!("handled above"),
     };
     let _ = out.flush();
     ExitCode::from(u8::try_from(code).unwrap_or(1))

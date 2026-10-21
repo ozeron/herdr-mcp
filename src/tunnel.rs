@@ -15,6 +15,7 @@ use crate::env::{env_nonempty, env_nonempty_string};
 use crate::install::{Io, shim_path_in};
 
 mod doctor;
+pub mod ngrok;
 pub use doctor::{DoctorOptions, doctor};
 
 pub const KEYCHAIN_SERVICE: &str = "herdr-mcp-tunnel";
@@ -26,16 +27,47 @@ const FALLBACK_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 pub const LABEL: &str = "dev.herdr-mcp.tunnel";
 const AGENT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 const LAUNCHCTL: &str = "/bin/launchctl";
-const STATE_FILE: &str = "tunnel.state";
 /// How long `start` watches a new job before trusting that it stays up.
 const START_SETTLE: Duration = Duration::from_secs(3);
+/// One LaunchAgent this module manages: the OpenAI tunnel or the ngrok remote.
+#[derive(Debug, Clone, Copy)]
+pub struct Service {
+    pub label: &'static str,
+    /// Names the state file and the `<stem>.out.log` and `<stem>.err.log` files.
+    stem: &'static str,
+    /// The command that starts it, for messages.
+    start_command: &'static str,
+}
+
+pub const OPENAI: Service = Service {
+    label: LABEL,
+    stem: "tunnel",
+    start_command: "herdr-mcp tunnel start",
+};
+
+pub const NGROK: Service = Service {
+    label: "dev.herdr-mcp.ngrok",
+    stem: "ngrok",
+    start_command: "herdr-mcp tunnel ngrok start",
+};
+
+impl Service {
+    fn state_name(&self) -> String {
+        format!("{}.state", self.stem)
+    }
+
+    fn log_name(&self, stream: &str) -> String {
+        format!("{}.{stream}.log", self.stem)
+    }
+}
+
 pub const CONFIRM_PHRASE: &str = "full access";
 
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct TunnelError {
-    message: String,
-    code: i32,
+    pub message: String,
+    pub code: i32,
 }
 
 impl TunnelError {
@@ -138,12 +170,13 @@ pub trait Stopper: Send + Sync {
 
 pub struct ServiceStopper {
     env: TunnelEnv,
+    service: Service,
     runner: Arc<dyn Runner>,
 }
 
 impl Stopper for ServiceStopper {
     fn stop(&self) {
-        if let Err(err) = stop_service(&self.env, self.runner.as_ref()) {
+        if let Err(err) = stop_service_for(&self.env, &self.service, self.runner.as_ref()) {
             eprintln!("herdr-mcp: cannot stop the tunnel: {err}");
         }
     }
@@ -160,12 +193,18 @@ pub struct TunnelConfig {
 
 impl TunnelConfig {
     pub fn from_process(expires_at: Option<u64>) -> Result<Self, TunnelError> {
+        Self::for_service(OPENAI, expires_at)
+    }
+
+    /// Tunnel mode where `herdr_tunnel_stop` and the expiry stop `service`.
+    pub fn for_service(service: Service, expires_at: Option<u64>) -> Result<Self, TunnelError> {
         let env = TunnelEnv::from_process()?;
         Ok(Self {
             state_home: env.state_home(),
             expires_at,
             stopper: Arc::new(ServiceStopper {
                 env,
+                service,
                 runner: Arc::new(SystemRunner),
             }),
         })
@@ -228,14 +267,23 @@ impl TunnelEnv {
         audit::log_path(&self.state_home())
     }
 
-    fn state_file(&self) -> PathBuf {
-        self.state_dir().join(STATE_FILE)
+    fn state_file(&self, service: &Service) -> PathBuf {
+        self.state_dir().join(service.state_name())
     }
 
-    fn plist_path(&self) -> PathBuf {
+    fn plist_path(&self, service: &Service) -> PathBuf {
         self.home
             .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"))
+            .join(format!("{}.plist", service.label))
+    }
+
+    /// Where the ngrok remote keeps its settings.
+    pub fn ngrok_config_path(&self) -> PathBuf {
+        let base = match &self.xdg_config_home {
+            Some(dir) => dir.clone(),
+            None => self.home.join(".config"),
+        };
+        base.join("herdr-mcp/ngrok.toml")
     }
 
     fn domain(&self) -> String {
@@ -254,10 +302,14 @@ impl TunnelEnv {
     }
 
     fn find_client(&self) -> Option<PathBuf> {
-        self.on_path(CLIENT).or_else(|| {
+        self.find_program(CLIENT)
+    }
+
+    fn find_program(&self, program: &str) -> Option<PathBuf> {
+        self.on_path(program).or_else(|| {
             self.fallback_dirs
                 .iter()
-                .map(|dir| dir.join(CLIENT))
+                .map(|dir| dir.join(program))
                 .find(|candidate| candidate.is_file())
         })
     }
@@ -633,12 +685,9 @@ fn xml(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn plist(env: &TunnelEnv, run_args: &[String]) -> String {
-    let mut args = vec![
-        env.bridge().display().to_string(),
-        "tunnel".into(),
-        "run".into(),
-    ];
+fn plist(env: &TunnelEnv, service: &Service, command: &[&str], run_args: &[String]) -> String {
+    let mut args = vec![env.bridge().display().to_string()];
+    args.extend(command.iter().map(|word| (*word).to_owned()));
     args.extend(run_args.iter().cloned());
     let program: String = args
         .iter()
@@ -670,7 +719,7 @@ fn plist(env: &TunnelEnv, run_args: &[String]) -> String {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>{LABEL}</string>
+  <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
 {program}  </array>
@@ -691,8 +740,9 @@ fn plist(env: &TunnelEnv, run_args: &[String]) -> String {
 </dict>
 </plist>
 "#,
-        out = xml(&state.join("tunnel.out.log").display().to_string()),
-        err = xml(&state.join("tunnel.err.log").display().to_string()),
+        label = service.label,
+        out = xml(&state.join(service.log_name("out")).display().to_string()),
+        err = xml(&state.join(service.log_name("err")).display().to_string()),
     )
 }
 
@@ -720,16 +770,15 @@ Every call is logged to {}
     )
 }
 
-fn confirm_full(env: &TunnelEnv, io: &mut Io) -> Result<(), TunnelError> {
+fn confirm_full(disclosure: &str, command: &str, io: &mut Io) -> Result<(), TunnelError> {
     if !io.stdin_is_tty {
-        return Err(TunnelError::usage(
-            "full access needs a terminal for the typed disclosure; run `herdr-mcp tunnel start --full` in one",
-        ));
+        return Err(TunnelError::usage(format!(
+            "full access needs a terminal for the typed disclosure; run `{command} --full` in one"
+        )));
     }
     let _ = write!(
         io.out,
-        "{}\nType `{CONFIRM_PHRASE}` to continue: ",
-        disclosure(env)
+        "{disclosure}\nType `{CONFIRM_PHRASE}` to continue: "
     );
     let _ = io.out.flush();
     let mut line = String::new();
@@ -777,16 +826,20 @@ fn launchctl(env: &TunnelEnv, runner: &dyn Runner, args: &[&str]) -> Result<i32,
         .map_err(|err| TunnelError::new(format!("launchctl: {err}")))
 }
 
-fn agent_target(env: &TunnelEnv) -> String {
-    format!("{}/{LABEL}", env.domain())
+fn agent_target(env: &TunnelEnv, service: &Service) -> String {
+    format!("{}/{}", env.domain(), service.label)
 }
 
-fn is_loaded(env: &TunnelEnv, runner: &dyn Runner) -> Result<bool, TunnelError> {
-    Ok(launchctl(env, runner, &["print", &agent_target(env)])? == 0)
+fn is_loaded(env: &TunnelEnv, service: &Service, runner: &dyn Runner) -> Result<bool, TunnelError> {
+    Ok(launchctl(env, runner, &["print", &agent_target(env, service)])? == 0)
 }
 
-fn job_state(env: &TunnelEnv, runner: &dyn Runner) -> Result<JobState, TunnelError> {
-    let args = vec!["print".to_owned(), agent_target(env)];
+fn job_state(
+    env: &TunnelEnv,
+    service: &Service,
+    runner: &dyn Runner,
+) -> Result<JobState, TunnelError> {
+    let args = vec!["print".to_owned(), agent_target(env, service)];
     let (code, out) = runner
         .run_output(&env.launchctl(), &args)
         .map_err(|err| TunnelError::new(format!("launchctl: {err}")))?;
@@ -798,8 +851,8 @@ fn job_state(env: &TunnelEnv, runner: &dyn Runner) -> Result<JobState, TunnelErr
 }
 
 /// The last line the service wrote to its error log, which names why it exited.
-fn last_error(env: &TunnelEnv) -> Option<String> {
-    tail(&env.state_dir().join("tunnel.err.log"), 1)?
+fn last_error(env: &TunnelEnv, service: &Service) -> Option<String> {
+    tail(&env.state_dir().join(service.log_name("err")), 1)?
         .pop()
         .filter(|line| !line.trim().is_empty())
 }
@@ -840,8 +893,8 @@ fn auth_in_log(lines: &[String]) -> Auth {
     }
 }
 
-fn err_log_lines(env: &TunnelEnv) -> Vec<String> {
-    fs::read(env.state_dir().join("tunnel.err.log"))
+fn err_log_lines(env: &TunnelEnv, service: &Service) -> Vec<String> {
+    fs::read(env.state_dir().join(service.log_name("err")))
         .map(|bytes| {
             String::from_utf8_lossy(&bytes)
                 .lines()
@@ -876,44 +929,23 @@ pub fn start(
     report(io, result)
 }
 
-fn try_start(
+/// Writes the plist and boots the job in, replacing a loaded one. If the job dies within
+/// `START_SETTLE`, stops it again and says why.
+fn launch(
     env: &TunnelEnv,
-    options: &StartOptions,
+    service: &Service,
+    plist_text: &str,
     runner: &dyn Runner,
-    now: u64,
-    io: &mut Io,
-) -> Result<i32, TunnelError> {
-    ready(env)?;
-    if env.api_key.is_some() {
-        let _ = writeln!(
-            io.err,
-            "note: the background service cannot see {KEY_ENV}; it reads the Keychain, so run `herdr-mcp tunnel setup` if you have not."
-        );
-    }
-    if options.full {
-        confirm_full(env, io)?;
-    }
-    let expires_at = options.duration.map(|d| now + d.as_secs());
-    let mut run_args = Vec::new();
-    if options.full {
-        run_args.extend(["--full".to_owned(), "--full-confirmed".to_owned()]);
-    }
-    if let Some(at) = expires_at {
-        run_args.extend(["--expires-at".to_owned(), at.to_string()]);
-    }
-    if let Some(name) = &options.session {
-        run_args.extend(["--session".to_owned(), name.clone()]);
-    }
-
+) -> Result<(), TunnelError> {
     private_dir(&env.state_dir())?;
     // A fresh error log, so a failure reported below belongs to this start.
-    let _ = fs::remove_file(env.state_dir().join("tunnel.err.log"));
-    let plist_path = env.plist_path();
-    write_file(&plist_path, &plist(env, &run_args))?;
+    let _ = fs::remove_file(env.state_dir().join(service.log_name("err")));
+    let plist_path = env.plist_path(service);
+    write_file(&plist_path, plist_text)?;
 
-    let was_loaded = is_loaded(env, runner)?;
+    let was_loaded = is_loaded(env, service, runner)?;
     if was_loaded {
-        launchctl(env, runner, &["bootout", &agent_target(env)])?;
+        launchctl(env, runner, &["bootout", &agent_target(env, service)])?;
     }
     let plist_arg = plist_path.display().to_string();
     let mut code = launchctl(env, runner, &["bootstrap", &env.domain(), &plist_arg])?;
@@ -931,13 +963,52 @@ fn try_start(
             "launchctl bootstrap failed (exit {code}); nothing is running"
         )));
     }
-    if let Some(exit) = died_on_start(env, runner)? {
-        let _ = stop_service(env, runner);
-        let why = last_error(env).unwrap_or_else(|| "no error output".to_owned());
+    if let Some(exit) = died_on_start(env, service, runner)? {
+        let _ = stop_service_for(env, service, runner);
+        let why = last_error(env, service).unwrap_or_else(|| "no error output".to_owned());
         return Err(TunnelError::new(format!(
-            "the tunnel exited right away (exit {exit}): {why}\nNothing is left running; fix that and run `herdr-mcp tunnel start` again."
+            "the tunnel exited right away (exit {exit}): {why}\nNothing is left running; fix that and run `{}` again.",
+            service.start_command
         )));
     }
+    Ok(())
+}
+
+fn try_start(
+    env: &TunnelEnv,
+    options: &StartOptions,
+    runner: &dyn Runner,
+    now: u64,
+    io: &mut Io,
+) -> Result<i32, TunnelError> {
+    ready(env)?;
+    if env.api_key.is_some() {
+        let _ = writeln!(
+            io.err,
+            "note: the background service cannot see {KEY_ENV}; it reads the Keychain, so run `herdr-mcp tunnel setup` if you have not."
+        );
+    }
+    if options.full {
+        confirm_full(&disclosure(env), "herdr-mcp tunnel start", io)?;
+    }
+    let expires_at = options.duration.map(|d| now + d.as_secs());
+    let mut run_args = Vec::new();
+    if options.full {
+        run_args.extend(["--full".to_owned(), "--full-confirmed".to_owned()]);
+    }
+    if let Some(at) = expires_at {
+        run_args.extend(["--expires-at".to_owned(), at.to_string()]);
+    }
+    if let Some(name) = &options.session {
+        run_args.extend(["--session".to_owned(), name.clone()]);
+    }
+
+    launch(
+        env,
+        &OPENAI,
+        &plist(env, &OPENAI, &["tunnel", "run"], &run_args),
+        runner,
+    )?;
 
     let mode = if options.full { "full" } else { "read" };
     let state = json!({
@@ -946,7 +1017,7 @@ fn try_start(
         "expires_at": expires_at,
         "session": options.session,
     });
-    write_file(&env.state_file(), &state.to_string())?;
+    write_file(&env.state_file(&OPENAI), &state.to_string())?;
     let expiry = match expires_at {
         Some(at) => format!("stops at {}", iso8601(at)),
         None => "no time limit".to_owned(),
@@ -961,10 +1032,14 @@ fn try_start(
 
 /// Watches the new job for `START_SETTLE`; returns its exit code if it is already failing.
 /// A runner that cannot read `launchctl print` (`Loaded`) is not watched.
-fn died_on_start(env: &TunnelEnv, runner: &dyn Runner) -> Result<Option<i32>, TunnelError> {
+fn died_on_start(
+    env: &TunnelEnv,
+    service: &Service,
+    runner: &dyn Runner,
+) -> Result<Option<i32>, TunnelError> {
     let deadline = std::time::Instant::now() + START_SETTLE;
     loop {
-        match job_state(env, runner)? {
+        match job_state(env, service, runner)? {
             JobState::Failing(code) => return Ok(Some(code)),
             JobState::Loaded | JobState::NotLoaded => return Ok(None),
             JobState::Running | JobState::Starting if std::time::Instant::now() >= deadline => {
@@ -980,8 +1055,16 @@ fn died_on_start(env: &TunnelEnv, runner: &dyn Runner) -> Result<Option<i32>, Tu
 /// Removes the plist and the state file, then boots the agent out. The bridge calls this from
 /// inside the agent, and the bootout ends that process, so the files go first.
 pub fn stop_service(env: &TunnelEnv, runner: &dyn Runner) -> Result<bool, TunnelError> {
-    let loaded = is_loaded(env, runner)?;
-    for path in [env.plist_path(), env.state_file()] {
+    stop_service_for(env, &OPENAI, runner)
+}
+
+fn stop_service_for(
+    env: &TunnelEnv,
+    service: &Service,
+    runner: &dyn Runner,
+) -> Result<bool, TunnelError> {
+    let loaded = is_loaded(env, service, runner)?;
+    for path in [env.plist_path(service), env.state_file(service)] {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -989,7 +1072,7 @@ pub fn stop_service(env: &TunnelEnv, runner: &dyn Runner) -> Result<bool, Tunnel
         }
     }
     if loaded {
-        let target = agent_target(env);
+        let target = agent_target(env, service);
         let code = launchctl(env, runner, &["bootout", &target])?;
         if code != 0 {
             return Err(TunnelError::new(format!(
@@ -1042,8 +1125,8 @@ pub fn status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> i32 {
 }
 
 fn try_status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> Result<i32, TunnelError> {
-    let job = job_state(env, runner)?;
-    let state: Option<Value> = fs::read_to_string(env.state_file())
+    let job = job_state(env, &OPENAI, runner)?;
+    let state: Option<Value> = fs::read_to_string(env.state_file(&OPENAI))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
     let service = match job {
@@ -1052,12 +1135,12 @@ fn try_status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> Result<i32, 
         JobState::Starting => "starting".to_owned(),
         JobState::Failing(code) => format!(
             "failing (last exit {code}; launchd keeps restarting it): {}",
-            last_error(env).unwrap_or_else(|| "no error output".to_owned())
+            last_error(env, &OPENAI).unwrap_or_else(|| "no error output".to_owned())
         ),
     };
     let _ = writeln!(io.out, "service:   {service}");
     if matches!(job, JobState::Running | JobState::Loaded)
-        && auth_in_log(&err_log_lines(env)) == Auth::Rejected
+        && auth_in_log(&err_log_lines(env, &OPENAI)) == Auth::Rejected
     {
         let _ = writeln!(
             io.out,

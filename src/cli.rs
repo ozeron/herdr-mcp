@@ -126,6 +126,51 @@ pub enum TunnelCommand {
     Doctor,
     /// Print the tunnel audit log
     Log(TunnelLogArgs),
+    /// Reach the tools from ChatGPT over an ngrok domain, behind a hosted OAuth login
+    #[command(subcommand)]
+    Ngrok(NgrokCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NgrokCommand {
+    /// Save the domain, OAuth issuer, audience and owners
+    Setup,
+    /// Run the bridge and ngrok in the background as a macOS LaunchAgent
+    Start(NgrokStartArgs),
+    /// Run the bridge and ngrok in the foreground; access lasts until it exits
+    Run(NgrokRunArgs),
+    /// Stop the background service and remove its LaunchAgent
+    Stop,
+    /// Show whether it runs, its mode, URL, owners, expiry and the last auth denial
+    Status,
+    /// Check ngrok, the saved settings, the OAuth issuer and the service
+    Doctor,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct NgrokStartArgs {
+    /// Give ChatGPT the control tools; prints a disclosure and asks you to type `full access`
+    #[arg(long)]
+    pub full: bool,
+    /// Stop after this long, like 30m, 8h or 2d
+    #[arg(long = "for", value_name = "DURATION")]
+    pub duration: Option<String>,
+    /// Herdr session name for the bridge
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct NgrokRunArgs {
+    /// Herdr session name for the bridge
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Register the control tools; `tunnel ngrok start --full` shows the disclosure first
+    #[arg(long)]
+    pub full: bool,
+    /// Stop at this Unix time (seconds)
+    #[arg(long)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, ClapArgs)]

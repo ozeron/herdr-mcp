@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::{
-    Auth, CLIENT, JobState, KEY_ENV, Runner, TunnelEnv, auth_in_log, err_log_lines,
+    Auth, CLIENT, JobState, KEY_ENV, OPENAI, Runner, TunnelEnv, auth_in_log, err_log_lines,
     has_status_code, is_auth_failure, is_auth_success, job_state, keychain_key, last_error,
     read_tunnel_id,
 };
@@ -34,20 +34,20 @@ impl Default for DoctorOptions {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Level {
+pub(super) enum Level {
     Pass,
     Warn,
     Fail,
 }
 
-struct Report<'a, 'io> {
-    io: &'a mut Io<'io>,
-    fails: usize,
-    warns: usize,
+pub(super) struct Report<'a, 'io> {
+    pub(super) io: &'a mut Io<'io>,
+    pub(super) fails: usize,
+    pub(super) warns: usize,
 }
 
 impl Report<'_, '_> {
-    fn line(&mut self, level: Level, text: impl AsRef<str>, fix: Option<&str>) {
+    pub(super) fn line(&mut self, level: Level, text: impl AsRef<str>, fix: Option<&str>) {
         let tag = match level {
             Level::Pass => "PASS",
             Level::Warn => {
@@ -65,7 +65,7 @@ impl Report<'_, '_> {
         }
     }
 
-    fn note(&mut self, text: &str) {
+    pub(super) fn note(&mut self, text: &str) {
         let _ = writeln!(self.io.out, "      note: {text}");
     }
 }
@@ -82,7 +82,7 @@ pub fn doctor(env: &TunnelEnv, runner: &dyn Runner, options: &DoctorOptions, io:
     let key = check_key(env, &mut report);
     check_bridge(env, options, &mut report);
 
-    let job = job_state(env, runner).unwrap_or(JobState::NotLoaded);
+    let job = job_state(env, &OPENAI, runner).unwrap_or(JobState::NotLoaded);
     match (&client, &id, &key) {
         (Some(client), Some(id), Some(key)) => {
             if job == JobState::NotLoaded {
@@ -321,7 +321,7 @@ fn check_bridge(env: &TunnelEnv, options: &DoctorOptions, report: &mut Report) {
 }
 
 fn check_log_auth(env: &TunnelEnv, report: &mut Report) {
-    match auth_in_log(&err_log_lines(env)) {
+    match auth_in_log(&err_log_lines(env, &OPENAI)) {
         Auth::Rejected => report.line(
             Level::Fail,
             "OpenAI key: OpenAI rejected the key (401)",
@@ -469,7 +469,7 @@ fn check_service(env: &TunnelEnv, job: &JobState, report: &mut Report) {
             Level::Warn,
             format!(
                 "service: failing (last exit {code}): {}",
-                last_error(env).unwrap_or_else(|| "no error output".to_owned())
+                last_error(env, &OPENAI).unwrap_or_else(|| "no error output".to_owned())
             ),
             start,
         ),
@@ -515,7 +515,7 @@ fn http_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), S
 }
 
 fn check_health(env: &TunnelEnv, options: &DoctorOptions, report: &mut Report) {
-    let Some(port) = health_port(&err_log_lines(env)) else {
+    let Some(port) = health_port(&err_log_lines(env, &OPENAI)) else {
         report.line(
             Level::Warn,
             "tunnel health: no http://127.0.0.1:<port> in tunnel.err.log yet",

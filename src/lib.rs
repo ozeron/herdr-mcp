@@ -19,6 +19,7 @@ pub mod provenance;
 pub mod providers;
 pub mod runtime_mode;
 pub mod scope;
+pub mod serve;
 pub mod server;
 pub mod sessions;
 pub mod tools;

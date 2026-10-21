@@ -97,7 +97,7 @@ fn every_command_runs_bin_herdr_mcp_with_a_subcommand_it_accepts() {
         .chain(tables(&doc, "panes"))
         .collect();
     assert!(
-        entries.len() >= 10,
+        entries.len() >= 14,
         "status, install, install-control, remove, tunnel-setup, tunnel-start-full, tunnel-start, tunnel-stop, tunnel-status, tunnel-doctor"
     );
     for entry in entries {
@@ -123,6 +123,7 @@ fn install_and_remove_open_a_pane_because_actions_have_no_tty() {
         "remove",
         "tunnel-setup",
         "tunnel-start-full",
+        "ngrok-start-full",
     ] {
         assert!(ids.contains(&id), "missing pane {id}");
     }
@@ -131,12 +132,15 @@ fn install_and_remove_open_a_pane_because_actions_have_no_tty() {
     }
     for action in tables(&doc, "actions") {
         let words = bridge_argv(&argv(action));
-        let allowed: [&[&str]; 5] = [
+        let allowed: [&[&str]; 8] = [
             &["install", "--status"],
             &["tunnel", "start"],
             &["tunnel", "stop"],
             &["tunnel", "status"],
             &["tunnel", "doctor"],
+            &["tunnel", "ngrok", "start"],
+            &["tunnel", "ngrok", "stop"],
+            &["tunnel", "ngrok", "status"],
         ];
         assert!(
             allowed.iter().any(|ok| words[1..] == **ok),
@@ -156,6 +160,9 @@ fn install_panes_pass_the_right_flags() {
             "remove" => assert_eq!(words[1..], ["install", "--remove"]),
             "tunnel-setup" => assert_eq!(words[1..], ["tunnel", "setup"]),
             "tunnel-start-full" => assert_eq!(words[1..], ["tunnel", "start", "--full"]),
+            "ngrok-start-full" => {
+                assert_eq!(words[1..], ["tunnel", "ngrok", "start", "--full"]);
+            }
             other => panic!("unexpected pane {other}"),
         }
     }
@@ -179,8 +186,17 @@ fn tunnel_entries_cover_start_full_start_read_stop_and_status() {
     assert_eq!(flags("tunnel-status"), ["tunnel", "status"]);
     assert_eq!(flags("tunnel-doctor"), ["tunnel", "doctor"]);
     assert_eq!(flags("tunnel-start-full"), ["tunnel", "start", "--full"]);
+    assert_eq!(flags("ngrok-start"), ["tunnel", "ngrok", "start"]);
+    assert_eq!(flags("ngrok-stop"), ["tunnel", "ngrok", "stop"]);
+    assert_eq!(flags("ngrok-status"), ["tunnel", "ngrok", "status"]);
+    assert_eq!(
+        flags("ngrok-start-full"),
+        ["tunnel", "ngrok", "start", "--full"]
+    );
     assert!(
-        actions.iter().all(|a| text(a, "id") != "tunnel-start-full"),
+        actions
+            .iter()
+            .all(|a| !text(a, "id").ends_with("start-full")),
         "the disclosure needs a TTY, so full access runs in a pane"
     );
     assert!(
@@ -196,22 +212,24 @@ fn tunnel_entries_cover_start_full_start_read_stop_and_status() {
 fn tunnel_panes_keep_errors_visible_and_full_access_is_labelled() {
     let doc = manifest();
     let panes = tables(&doc, "panes");
-    assert_eq!(panes.len(), 5);
-    for pane in panes.iter().filter(|p| text(p, "id").starts_with("tunnel")) {
-        assert!(text(pane, "title").starts_with("Herdr MCP: ChatGPT tunnel"));
+    assert_eq!(panes.len(), 6);
+    for pane in panes
+        .iter()
+        .filter(|p| text(p, "id").starts_with("tunnel") || text(p, "id").starts_with("ngrok"))
+    {
+        assert!(text(pane, "title").starts_with("Herdr MCP: ChatGPT"));
         assert!(
             argv(pane)[2].contains("read _"),
             "press Enter to close wrapper"
         );
     }
-    let full = panes
-        .iter()
-        .find(|p| text(p, "id") == "tunnel-start-full")
-        .unwrap();
-    assert!(text(full, "title").contains("full access"));
-    assert!(text(full, "description").contains("full access"));
+    for id in ["tunnel-start-full", "ngrok-start-full"] {
+        let full = panes.iter().find(|p| text(p, "id") == id).unwrap();
+        assert!(text(full, "title").contains("full access"));
+        assert!(text(full, "description").contains("full access"));
+    }
     for action in tables(&doc, "actions") {
-        if text(action, "id") == "tunnel-start" {
+        if matches!(text(action, "id"), "tunnel-start" | "ngrok-start") {
             assert!(text(action, "description").contains("read tools only"));
         }
     }
