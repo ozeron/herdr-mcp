@@ -33,6 +33,8 @@ pub struct SendParams {
     pub notify: Option<bool>,
     /// Allow mailing your own pane. Only when the user asked for it.
     pub allow_self: Option<bool>,
+    /// Remote callers only: the inbox replies should go to, a slug of lowercase letters, digits and dashes. Default: one per client (`chatgpt`, `claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
+    pub inbox: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -44,6 +46,8 @@ pub struct ReadParams {
     pub mark_read: Option<bool>,
     /// At most this many messages, oldest first (default 50).
     pub limit: Option<u32>,
+    /// Remote callers only: the inbox to use, a slug of lowercase letters, digits and dashes. Default: one per client (`chatgpt`, `claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
+    pub inbox: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -53,6 +57,8 @@ pub struct WaitParams {
     pub from: Option<String>,
     /// How long to wait, in milliseconds. Default 30000, capped at the wait cap.
     pub timeout_ms: Option<u64>,
+    /// Remote callers only: the inbox to use, a slug of lowercase letters, digits and dashes. Default: one per client (`chatgpt`, `claude`), shown by herdr_capabilities as `inbox`. Pick another to keep separate work apart.
+    pub inbox: Option<String>,
 }
 
 #[derive(Debug)]
@@ -62,9 +68,77 @@ pub enum WaitEnd {
     Cancelled,
 }
 
-/// The name inbox a remote client reads, and the sender name its mail carries. Workers reply
-/// with `herdr_mail_send {to: "remote"}`.
-pub const REMOTE_INBOX: &str = "remote";
+const MAX_SLUG: usize = 40;
+
+/// The name inbox a remote client reads, and the sender name its mail carries: `requested` when
+/// given, else one per client product, so ChatGPT and a remote Claude never share one. Name
+/// inboxes are files, so the inbox outlives the bridge and the chat.
+pub fn remote_inbox(client: Option<&str>, requested: Option<&str>) -> Result<String, HerdrError> {
+    if let Some(slug) = requested {
+        let valid = !slug.is_empty()
+            && slug.len() <= MAX_SLUG
+            && slug.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        return if valid {
+            Ok(slug.to_owned())
+        } else {
+            Err(HerdrError::invalid_params(
+                "inbox is a slug: lowercase letters, digits and dashes, at most 40, starting with a letter or digit",
+            ))
+        };
+    }
+    let client = client.unwrap_or_default().to_lowercase();
+    if client.contains("openai") || client.contains("chatgpt") {
+        return Ok("chatgpt".into());
+    }
+    if client.contains("claude") || client.contains("anthropic") {
+        return Ok("claude".into());
+    }
+    let slug: String = client
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug: String = slug.chars().take(MAX_SLUG).collect();
+    Ok(if slug.is_empty() {
+        "remote".into()
+    } else {
+        slug
+    })
+}
+
+/// The remote inbox for this call, refused when a live local agent already has that name: its
+/// name inbox would be shared.
+async fn checked_remote_inbox(
+    inner: &Inner,
+    client: Option<&str>,
+    requested: Option<&str>,
+) -> Result<String, HerdrError> {
+    let slug = remote_inbox(client, requested)?;
+    let (herdr, _) = inner.session()?;
+    match herdr.agent_get(&slug).await {
+        Ok(agent) => Err(HerdrError::detailed(
+            "inbox_taken",
+            format!(
+                "a local agent is named {slug:?}, so that inbox is its own; pass another inbox"
+            ),
+            json!({"inbox": slug, "pane": agent.pane_id}),
+        )),
+        Err(err) if err.is_target_gone() => Ok(slug),
+        Err(err) => Err(err),
+    }
+}
+
+fn local_inbox_param(requested: Option<&str>) -> Result<(), HerdrError> {
+    match requested {
+        Some(_) => Err(HerdrError::invalid_params(
+            "inbox is for remote callers; a local caller's inbox is its pane and agent name",
+        )),
+        None => Ok(()),
+    }
+}
 
 fn no_caller(tool: &str) -> HerdrError {
     HerdrError::tool(
@@ -92,9 +166,16 @@ fn label(raw: &str) -> String {
 pub async fn send(
     inner: &Inner,
     mailbox: &Mailbox,
+    client: Option<&str>,
     params: SendParams,
 ) -> Result<Value, HerdrError> {
     mailbox::check_body(&params.body)?;
+    let remote_from = if inner.is_remote() {
+        Some(checked_remote_inbox(inner, client, params.inbox.as_deref()).await?)
+    } else {
+        local_inbox_param(params.inbox.as_deref())?;
+        None
+    };
     let mut scope = Scope::open(inner)?;
     let request = TargetRequest::new(
         &params.to,
@@ -126,14 +207,7 @@ pub async fn send(
         },
         None => Party {
             pane: None,
-            name: Some(
-                if inner.is_remote() {
-                    REMOTE_INBOX
-                } else {
-                    "external"
-                }
-                .into(),
-            ),
+            name: Some(remote_from.unwrap_or_else(|| "external".into())),
         },
     };
     let sender_label = label(
@@ -228,10 +302,18 @@ async fn nudge(
 
 /// The verified caller's pane, with the inbox it reads: its pane inbox plus its name inbox when
 /// `agent.get` says the pane holds a named agent.
-async fn caller_inbox(inner: &Inner, tool: &str) -> Result<Inbox, HerdrError> {
+async fn caller_inbox(
+    inner: &Inner,
+    tool: &str,
+    client: Option<&str>,
+    requested: Option<&str>,
+) -> Result<Inbox, HerdrError> {
     if inner.is_remote() {
-        return Ok(Inbox::named(REMOTE_INBOX));
+        return Ok(Inbox::named(
+            &checked_remote_inbox(inner, client, requested).await?,
+        ));
     }
+    local_inbox_param(requested)?;
     let mut scope = Scope::open(inner)?;
     let resolution = scope.caller().await?;
     let pane = match &resolution.caller {
@@ -254,9 +336,10 @@ fn sender_filter(from: Option<String>) -> Option<SenderFilter> {
 pub async fn read(
     inner: &Inner,
     mailbox: &Mailbox,
+    client: Option<&str>,
     params: ReadParams,
 ) -> Result<Value, HerdrError> {
-    let inbox = caller_inbox(inner, "herdr_mail_read").await?;
+    let inbox = caller_inbox(inner, "herdr_mail_read", client, params.inbox.as_deref()).await?;
     let limit = params.limit.unwrap_or(DEFAULT_READ_LIMIT).max(1) as usize;
     let filter = sender_filter(params.from);
     let (messages, remaining) = mailbox.take(
@@ -276,7 +359,13 @@ pub async fn wait(
     progress: Option<UnboundedSender<Progress>>,
     params: WaitParams,
 ) -> Result<Value, HerdrError> {
-    let inbox = caller_inbox(inner, "herdr_mail_wait").await?;
+    let inbox = caller_inbox(
+        inner,
+        "herdr_mail_wait",
+        client_name,
+        params.inbox.as_deref(),
+    )
+    .await?;
     let cap = inner.profile.wait_cap(client_name);
     let (timeout, note) = clamp_timeout(params.timeout_ms, cap, DEFAULT_TIMEOUT);
     let filter = sender_filter(params.from);

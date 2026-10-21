@@ -561,11 +561,18 @@ impl HerdrMcp {
     )]
     async fn herdr_mail_send(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<tools::mail::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let note = Note::mail_send(&params);
-        let result = tools::mail::send(&self.inner, &self.mailbox(), params).await;
+        let result = tools::mail::send(
+            &self.inner,
+            &self.mailbox(),
+            client_name(&ctx).as_deref(),
+            params,
+        )
+        .await;
         self.finish("herdr_mail_send", started, note, result)
     }
 
@@ -575,11 +582,18 @@ impl HerdrMcp {
     )]
     async fn herdr_mail_read(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<tools::mail::ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let note = Note::mail_read(params.from.as_deref());
-        let result = tools::mail::read(&self.inner, &self.mailbox(), params).await;
+        let result = tools::mail::read(
+            &self.inner,
+            &self.mailbox(),
+            client_name(&ctx).as_deref(),
+            params,
+        )
+        .await;
         self.finish("herdr_mail_read", started, note, result)
     }
 

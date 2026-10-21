@@ -37,7 +37,7 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
     });
     let wait_cap: Duration = inner.profile.wait_cap(client_info_name);
 
-    Ok(json!({
+    let mut out = json!({
         "caller": caller,
         "caller_verified": resolution.caller_verified,
         "guard_target": resolution.guard_target,
@@ -47,5 +47,10 @@ pub async fn run(inner: &Inner, client_info_name: Option<&str>) -> Result<Value,
         "herdr": {"version": compat.version, "protocol": compat.protocol},
         "agents": agents,
         "wait_cap_ms": u64::try_from(wait_cap.as_millis()).unwrap_or(u64::MAX),
-    }))
+    });
+    if inner.is_remote() {
+        // The default inbox; a call can still pick another with `inbox`.
+        out["inbox"] = json!(crate::tools::mail::remote_inbox(client_info_name, None)?);
+    }
+    Ok(out)
 }

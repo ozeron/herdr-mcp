@@ -470,9 +470,7 @@ fn a_tunnel_bridge_ignores_an_inherited_caller_pane() {
     assert!(!text(&local).contains("You have no caller pane"), "{local}");
 }
 
-#[tokio::test]
-async fn a_remote_caller_reads_mail_sent_to_the_remote_inbox() {
-    let r = serve(ToolMode::Read, true, None, None).await;
+fn script_no_agents(r: &Rig) {
     r.h.fake.on_params(
         "session.snapshot",
         json!({}),
@@ -481,20 +479,98 @@ async fn a_remote_caller_reads_mail_sent_to_the_remote_inbox() {
     r.h.fake.on_params(
         "agent.get",
         json!({}),
-        Script::error("agent_not_found", "no agent named remote"),
+        Script::error("agent_not_found", "no such agent"),
     );
+}
 
-    let sent = ok(
+#[tokio::test]
+async fn each_remote_inbox_is_separate_and_persists_by_slug() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    script_no_agents(&r);
+
+    for (to, body) in [("chatgpt", "for chatgpt"), ("claude", "for claude")] {
+        let sent = ok(
+            &r.h,
+            "herdr_mail_send",
+            json!({"to": to, "body": body, "inbox": "worker-sim"}),
+        )
+        .await;
+        assert_eq!(sent["to"]["name"], to, "{sent}");
+    }
+
+    let chatgpt = ok(&r.h, "herdr_mail_read", json!({"inbox": "chatgpt"})).await;
+    let claude = ok(&r.h, "herdr_mail_read", json!({"inbox": "claude"})).await;
+    let bodies = |read: &Value| -> Vec<String> {
+        read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(bodies(&chatgpt), ["for chatgpt"]);
+    assert_eq!(bodies(&claude), ["for claude"]);
+    assert_eq!(chatgpt["messages"][0]["from"]["name"], "worker-sim");
+}
+
+#[tokio::test]
+async fn the_default_inbox_comes_from_the_client() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    script_no_agents(&r);
+
+    ok(
         &r.h,
         "herdr_mail_send",
-        json!({"to": "remote", "body": "result: 42"}),
+        json!({"to": "test-client", "body": "hi"}),
     )
     .await;
-    assert_eq!(sent["to"]["name"], "remote", "{sent}");
-
     let read = ok(&r.h, "herdr_mail_read", json!({})).await;
-    let messages = read["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 1, "{read}");
-    assert_eq!(messages[0]["body"], "result: 42");
-    assert_eq!(messages[0]["from"]["name"], "remote");
+
+    assert_eq!(read["messages"][0]["body"], "hi", "{read}");
+    assert_eq!(read["messages"][0]["from"]["name"], "test-client");
+}
+
+#[tokio::test]
+async fn a_remote_inbox_named_like_a_live_agent_is_refused() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    r.h.fake.on_params(
+        "agent.get",
+        json!({}),
+        Script::Reply(
+            json!({"type": "agent_info", "agent": harness::agent("w1:p4", "w1:t2", "w1", "rev")}),
+        ),
+    );
+
+    let out = err(&r.h, "herdr_mail_read", json!({"inbox": "rev"})).await;
+
+    assert_eq!(out["code"], "inbox_taken");
+    assert_eq!(out["pane"], "w1:p4");
+}
+
+#[tokio::test]
+async fn a_bad_inbox_slug_is_invalid() {
+    let r = serve(ToolMode::Read, true, None, None).await;
+    for slug in ["", "Has Caps", "-lead", "a/b"] {
+        let out = err(&r.h, "herdr_mail_read", json!({"inbox": slug})).await;
+        assert!(out.to_string().contains("slug"), "{slug}: {out}");
+    }
+}
+
+#[test]
+fn remote_inbox_names_come_from_the_client_product() {
+    use herdr_mcp::tools::mail::remote_inbox;
+    assert_eq!(remote_inbox(Some("openai-mcp"), None).unwrap(), "chatgpt");
+    assert_eq!(
+        remote_inbox(Some("Anthropic/ClaudeAI"), None).unwrap(),
+        "claude"
+    );
+    assert_eq!(
+        remote_inbox(Some("Cursor IDE 2.0"), None).unwrap(),
+        "cursor-ide-2-0"
+    );
+    assert_eq!(remote_inbox(None, None).unwrap(), "remote");
+    assert_eq!(
+        remote_inbox(Some("openai-mcp"), Some("kenwoo")).unwrap(),
+        "kenwoo"
+    );
 }
