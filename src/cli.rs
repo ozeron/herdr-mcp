@@ -73,4 +73,7 @@ pub struct InstallArgs {
     /// Apply without prompting
     #[arg(long)]
     pub yes: bool,
+    /// Re-point an installed shim at this build; the plugin's build step runs it after updates
+    #[arg(long, conflicts_with_all = ["control", "status", "remove"])]
+    pub relink_shim: bool,
 }

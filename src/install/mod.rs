@@ -116,6 +116,7 @@ pub enum Action {
     Install,
     Status,
     Remove,
+    RelinkShim,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,7 +138,27 @@ pub fn run(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
         Action::Status => status_report(env, io),
         Action::Install => install(options, env, io),
         Action::Remove => remove(options, env, io),
+        Action::RelinkShim => relink_shim(env, io),
     }
+}
+
+/// Runs as the plugin's last build step; it never touches client config.
+fn relink_shim(env: &InstallEnv, io: &mut Io) -> i32 {
+    let path = env.shim_path();
+    let line = match shim::relink(env) {
+        Ok(shim::Relink::Relinked) => {
+            format!("shim: relinked {} -> {}", path.display(), env.exe.display())
+        }
+        Ok(shim::Relink::Current) => "shim: current".to_owned(),
+        Ok(shim::Relink::NotInstalled) => "shim: not installed; nothing to relink".to_owned(),
+        Ok(shim::Relink::Left) => format!(
+            "shim: left as is; {} does not point at a Herdr plugin build",
+            path.display()
+        ),
+        Err(err) => return fail(io, err),
+    };
+    let _ = writeln!(io.out, "{line}");
+    0
 }
 
 fn fail(io: &mut Io, message: impl std::fmt::Display) -> i32 {

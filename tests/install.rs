@@ -548,6 +548,108 @@ fn install_skips_a_provider_whose_cli_is_not_on_path() {
     assert!(!sb.codex_toml().exists());
 }
 
+/// A sandbox whose bridge runs from a Herdr-managed plugin build, as `herdr plugin update`
+/// leaves it, with the shim pointing at `old`.
+fn plugin_update_sandbox(old: Option<&str>) -> Sandbox {
+    let mut sb = Sandbox::new();
+    let exe = sb
+        .root
+        .join("plugins/github-installations/herdr-mcp-1/2-0/checkout/bin/herdr-mcp");
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::write(&exe, "#!/bin/sh\n").unwrap();
+    sb.env.exe = exe;
+    if let Some(old) = old {
+        fs::create_dir_all(sb.shim().parent().unwrap()).unwrap();
+        symlink(sb.root.join(old), sb.shim()).unwrap();
+    }
+    sb
+}
+
+fn relink(sb: &Sandbox) -> Outcome {
+    run_with(&sb.env, &opts(Action::RelinkShim, false, false), false, "")
+}
+
+fn place_binary(sb: &Sandbox, relative: &str) {
+    let path = sb.root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "").unwrap();
+}
+
+#[test]
+fn relink_follows_an_update_from_an_older_plugin_build() {
+    let old = "plugins/github/herdr-mcp-1/bin/herdr-mcp";
+    let sb = plugin_update_sandbox(Some(old));
+    place_binary(&sb, old);
+
+    let outcome = relink(&sb);
+    assert_eq!(outcome.code, 0, "{}", outcome.err);
+    assert_eq!(fs::read_link(sb.shim()).unwrap(), sb.env.exe);
+    assert!(outcome.out.contains("relinked"), "{}", outcome.out);
+}
+
+#[test]
+fn relink_repairs_a_shim_whose_plugin_build_was_cleaned_up() {
+    let sb = plugin_update_sandbox(Some(
+        "plugins/github-installations/herdr-mcp-1/1-0/checkout/bin/herdr-mcp",
+    ));
+
+    assert_eq!(relink(&sb).code, 0);
+    assert_eq!(fs::read_link(sb.shim()).unwrap(), sb.env.exe);
+}
+
+#[test]
+fn relink_never_creates_a_shim_the_user_did_not_install() {
+    let sb = plugin_update_sandbox(None);
+
+    let outcome = relink(&sb);
+    assert_eq!(outcome.code, 0);
+    assert!(fs::symlink_metadata(sb.shim()).is_err());
+    assert!(outcome.out.contains("not installed"), "{}", outcome.out);
+}
+
+#[test]
+fn relink_leaves_a_shim_pointing_outside_herdr_plugins_alone() {
+    let dev = "code/herdr-mcp/target/release/herdr-mcp";
+    let sb = plugin_update_sandbox(Some(dev));
+    place_binary(&sb, dev);
+
+    let outcome = relink(&sb);
+    assert_eq!(outcome.code, 0);
+    assert_eq!(fs::read_link(sb.shim()).unwrap(), sb.root.join(dev));
+    assert!(outcome.out.contains("left"), "{}", outcome.out);
+}
+
+#[test]
+fn relink_leaves_a_foreign_file_alone() {
+    let sb = plugin_update_sandbox(None);
+    fs::create_dir_all(sb.shim().parent().unwrap()).unwrap();
+    fs::write(sb.shim(), "#!/bin/sh\n").unwrap();
+
+    assert_eq!(relink(&sb).code, 0);
+    assert!(!fs::symlink_metadata(sb.shim()).unwrap().is_symlink());
+}
+
+#[test]
+fn relink_from_a_build_outside_herdr_plugins_changes_nothing() {
+    let sb = installed();
+    let old = "plugins/github/herdr-mcp-1/bin/herdr-mcp";
+    place_binary(&sb, old);
+    fs::remove_file(sb.shim()).unwrap();
+    symlink(sb.root.join(old), sb.shim()).unwrap();
+
+    assert_eq!(relink(&sb).code, 0);
+    assert_eq!(fs::read_link(sb.shim()).unwrap(), sb.root.join(old));
+}
+
+#[test]
+fn relink_of_a_current_shim_is_a_no_op() {
+    let sb = installed();
+    let outcome = relink(&sb);
+    assert_eq!(outcome.code, 0);
+    assert_eq!(fs::read_link(sb.shim()).unwrap(), sb.env.exe);
+    assert!(outcome.out.contains("current"), "{}", outcome.out);
+}
+
 #[test]
 fn classifier_reports_global_only_for_our_entry() {
     let sb = Sandbox::new();

@@ -8,6 +8,9 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["cargo", "install", "--path", ".", "--root", ".", "--locked"]
 
+[[build]]
+command = ["bin/herdr-mcp", "install", "--relink-shim"]
+
 [[actions]]
 id = "status"
 title = "Herdr MCP: install status"

@@ -78,7 +78,9 @@ fn run_install(args: &InstallArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let action = if args.status {
+    let action = if args.relink_shim {
+        Action::RelinkShim
+    } else if args.status {
         Action::Status
     } else if args.remove {
         Action::Remove

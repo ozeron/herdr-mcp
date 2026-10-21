@@ -71,11 +71,22 @@ fn manifest_has_required_fields() {
 fn build_installs_the_binary_under_the_plugin_root() {
     let doc = manifest();
     let builds = tables(&doc, "build");
-    assert_eq!(builds.len(), 1);
+    assert_eq!(builds.len(), 2);
     assert_eq!(
         argv(builds[0]),
         ["cargo", "install", "--path", ".", "--root", ".", "--locked"]
     );
+}
+
+#[test]
+fn second_build_step_relinks_the_shim_to_the_new_build() {
+    let doc = manifest();
+    let builds = tables(&doc, "build");
+    let words = argv(builds[1]);
+    assert_eq!(words, ["bin/herdr-mcp", "install", "--relink-shim"]);
+    let mut full = vec!["herdr-mcp".to_owned()];
+    full.extend(words[1..].iter().cloned());
+    Args::try_parse_from(&full).unwrap_or_else(|err| panic!("binary rejects {full:?}: {err}"));
 }
 
 #[test]
