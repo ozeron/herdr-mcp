@@ -8,7 +8,7 @@ use crate::herdr::{
 use crate::output::{last_meaningful, strip_ansi, truncate_tail};
 use crate::server::Inner;
 
-pub const DEFAULT_LINES: u32 = 80;
+pub const DEFAULT_LINES: u32 = 120;
 pub const MAX_LINES: u32 = 1000;
 pub const DEFAULT_MAX_CHARS: usize = 32_000;
 pub const MAX_CHARS: usize = 100_000;
@@ -18,7 +18,6 @@ pub const MAX_CHARS: usize = 100_000;
 #[schemars(crate = "rmcp::schemars")]
 pub enum Source {
     Recent,
-    #[serde(alias = "screen")]
     Visible,
 }
 
@@ -36,14 +35,12 @@ impl Source {
 pub struct ReadParams {
     /// Pane ID or agent name. Defaults to the calling pane.
     pub target: Option<String>,
-    /// `recent` (default) is the latest output, scrollback included; `visible` (alias `screen`) is exactly what is on screen now.
+    /// `recent` (default) is the latest output, scrollback included; `visible` is exactly what is on screen now.
     pub source: Option<Source>,
-    /// Lines to return. Blank lines and box-drawing rules are skipped unless `raw`. Default 80, enough for an agent's latest turn; leave it unset unless you need more. Capped at 1000.
+    /// Lines to return; blank lines and box-drawing rules are skipped. Default 120, enough for an agent's latest turn: leave it unset. Capped at 1000.
     pub lines: Option<u32>,
     /// Character cap on the returned text; the oldest output is cut first. Default 32000, capped at 100000.
     pub max_chars: Option<usize>,
-    /// Return the terminal rows as they are, blank lines and UI rules included. Default false.
-    pub raw: Option<bool>,
 }
 
 pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError> {
@@ -71,12 +68,8 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     if requested > lines {
         notes.push(format!("lines capped at {MAX_LINES}"));
     }
-    let raw = params.raw.unwrap_or(false);
-    let rows = if raw {
-        lines
-    } else {
-        lines.saturating_mul(4).min(MAX_LINES)
-    };
+    // Room for the blank lines and UI rules that are skipped.
+    let rows = lines.saturating_mul(4).min(MAX_LINES);
 
     let (fetched, agent) = tokio::join!(fetch(&client, &target, source, rows), async {
         match inner.client() {
@@ -94,12 +87,7 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         );
     }
 
-    let clean = strip_ansi(&result.text);
-    let clean = if raw {
-        clean
-    } else {
-        last_meaningful(&clean, lines as usize)
-    };
+    let clean = last_meaningful(&strip_ansi(&result.text), lines as usize);
     let (text, cut) = truncate_tail(clean, max_chars);
     if cut {
         notes.push(format!("text cut to the last {max_chars} characters"));

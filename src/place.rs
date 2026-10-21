@@ -38,7 +38,7 @@ pub struct Where {
     pub of: Option<String>,
     /// A new tab. This is the default. It goes into `workspace_id` when given, else the calling pane's workspace; a caller with no verified pane (a remote client) must give `workspace_id`.
     pub tab: Option<bool>,
-    /// Workspace ID or exact label for a new tab or worktree, from herdr_list. Wins over the calling pane's workspace. Required for callers with no verified pane. A cwd outside this workspace's worktree is allowed and returns a warning.
+    /// Workspace ID, or label matched case-insensitively (an ID wins), from herdr_list, for a new tab or worktree. Wins over the calling pane's workspace. Required for remote callers. A cwd outside this workspace's worktree is allowed and returns a warning.
     pub workspace_id: Option<String>,
     /// A new workspace.
     pub workspace: Option<bool>,

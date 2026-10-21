@@ -13,7 +13,7 @@ use crate::server::Inner;
 pub struct MoveParams {
     /// Pane ID or agent name to move.
     pub target: String,
-    /// Destination workspace ID or exact label, from herdr_list. The pane moves into a new tab there.
+    /// Destination workspace ID, or label matched case-insensitively (an ID wins), from herdr_list. The pane moves into a new tab there.
     pub workspace_id: String,
     /// Label for the new tab.
     pub label: Option<String>,

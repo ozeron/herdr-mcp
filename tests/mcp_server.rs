@@ -201,11 +201,12 @@ async fn control_mode_lists_all_fifteen_with_annotations() {
         "herdr_send",
         "herdr_interrupt",
         "herdr_close",
+        "herdr_move",
     ];
     for tool in &tools {
         let name = tool.name.as_ref();
         let ann = tool.annotations.as_ref().expect(name);
-        if ["herdr_mail_send", "herdr_use_session", "herdr_move"].contains(&name) {
+        if ["herdr_mail_send", "herdr_use_session"].contains(&name) {
             assert_eq!(ann.destructive_hint, Some(false), "{name}");
             assert_ne!(ann.read_only_hint, Some(true), "{name}");
         } else if read_only.contains(&name) {
@@ -481,4 +482,73 @@ async fn bridge_exits_when_stdin_closes() {
         .await
         .expect("server did not exit")
         .unwrap();
+}
+
+const RESULT_FIELDS: &[&str] = &[
+    "reply", "excerpt", "rewait", "delivery", "turn", "note", "status", "phase", "inbox",
+];
+
+/// Every backticked word a parameter's description offers must be one of that parameter's
+/// values, so a description never advertises an option the schema rejects.
+#[tokio::test]
+async fn enum_descriptions_only_offer_values_the_schema_accepts() {
+    let h = start(Opts {
+        mode: ToolMode::Control,
+        ..Opts::default()
+    })
+    .await;
+    let tools = h.client.list_all_tools().await.unwrap();
+    let mut checked = 0;
+    for tool in &tools {
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        let defs = schema.get("$defs").cloned().unwrap_or_default();
+        let Some(props) = schema["properties"].as_object() else {
+            continue;
+        };
+        for (name, prop) in props {
+            let reference = prop["anyOf"]
+                .as_array()
+                .and_then(|alts| alts.iter().find_map(|alt| alt["$ref"].as_str()))
+                .or_else(|| prop["$ref"].as_str());
+            let Some(def) = reference.and_then(|r| r.rsplit('/').next()) else {
+                continue;
+            };
+            let values: Vec<String> = defs[def]["enum"]
+                .as_array()
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .or_else(|| {
+                    defs[def]["oneOf"].as_array().map(|v| {
+                        v.iter()
+                            .filter_map(|x| x["const"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            if values.is_empty() {
+                continue;
+            }
+            let description = prop["description"].as_str().unwrap_or_default();
+            for word in description.split('`').skip(1).step_by(2) {
+                // Parameter and result-field names are words too, not offered values.
+                let field = props.contains_key(word) || RESULT_FIELDS.contains(&word);
+                if !field
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c == '-')
+                {
+                    assert!(
+                        values.iter().any(|v| v == word),
+                        "{}.{name} offers `{word}`, not in {values:?}",
+                        tool.name
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "only {checked} enum parameters checked");
 }

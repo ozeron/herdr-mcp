@@ -2,7 +2,7 @@ Herdr MCP: observe and drive Herdr panes, agents and shell processes on the user
 
 - Start with `herdr_capabilities` (it lists the sessions too), then `herdr_list` with `kind: agent` and `tail: 8`: one call shows each agent's name, status, title and last lines.
 - Find an agent with `herdr_list` and `label_contains`, using a word from its name or title. Do not read panes to search.
-- Read one pane with `herdr_read` and leave `lines` unset; the default covers an agent's latest turn. Pass `source: screen` to see exactly what is on screen.
+- Read one pane with `herdr_read` and leave `lines` unset; the default covers an agent's latest turn. Pass `source: visible` to see exactly what is on screen.
 - You have no caller pane. Give every target explicitly, and refer to an agent by name when it has one.
 - `herdr_launch` and `herdr_run` need `where.workspace_id` (an ID or label from `herdr_list`) for a new tab: focus is not yours and can change between calls. Check `workspace` and any `warning` in the result. If a pane landed in the wrong workspace, fix it with `herdr_move`; never relaunch.
 - To get an agent's answer, call `herdr_send` with `wait: turn`: it returns the excerpt when the turn ends. On `timed_out`, pass its `turn` to `herdr_wait`. Do not poll with `herdr_read`.

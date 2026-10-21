@@ -483,28 +483,6 @@ async fn list_without_tail_reads_no_pane() {
 }
 
 #[tokio::test]
-async fn read_source_screen_is_the_visible_screen() {
-    let h = start(None).await;
-    h.fake.reply("agent.read", read_result("w1:p4", "screen"));
-
-    let read = ok(
-        &h,
-        "herdr_read",
-        json!({"target": "rev", "source": "screen"}),
-    )
-    .await;
-
-    assert_eq!(read["source"], "visible");
-    let read_req = h
-        .fake
-        .requests()
-        .into_iter()
-        .find(|r| r["method"] == "agent.read")
-        .unwrap();
-    assert_eq!(read_req["params"]["source"], "visible");
-}
-
-#[tokio::test]
 async fn blocked_agent_has_a_short_reason_and_idle_agent_has_none() {
     let h = start(Some("w1:p1")).await;
     script_tree(&h.fake);
@@ -587,7 +565,7 @@ async fn list_reports_herdr_not_running() {
 }
 
 #[tokio::test]
-async fn read_defaults_to_the_caller_with_80_lines() {
+async fn read_defaults_to_the_caller_with_120_lines() {
     let h = start(Some("w1:p1")).await;
     h.fake.reply_params(
         "pane.process_info",
@@ -611,8 +589,8 @@ async fn read_defaults_to_the_caller_with_80_lines() {
         .find(|r| r["method"] == "agent.read")
         .unwrap();
     assert_eq!(
-        request["params"]["lines"], 320,
-        "fetches extra rows to fill 80 meaningful lines"
+        request["params"]["lines"], 480,
+        "fetches extra rows to fill 120 meaningful lines"
     );
     assert_eq!(request["params"]["source"], "recent");
 }
@@ -677,23 +655,12 @@ async fn read_strips_ansi_escapes() {
 }
 
 #[tokio::test]
-async fn read_skips_blank_lines_and_tui_rules_unless_raw() {
+async fn read_skips_blank_lines_and_tui_rules() {
     let h = start(None).await;
     let screen = "reply line one\nreply line two\n\n\n\u{2500}\u{2500}\u{2500}\n\u{203a} prompt\n\n  footer\n";
-    h.fake.reply_seq(
-        "agent.read",
-        vec![read_result("w1:p4", screen), read_result("w1:p4", screen)],
-    );
+    h.fake.reply("agent.read", read_result("w1:p4", screen));
     let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 3})).await;
     assert_eq!(read["text"], "reply line two\n\u{203a} prompt\n  footer");
-
-    let raw = ok(
-        &h,
-        "herdr_read",
-        json!({"target": "rev", "lines": 3, "raw": true}),
-    )
-    .await;
-    assert_eq!(raw["text"], screen);
     let rows: Vec<_> = h
         .fake
         .requests()
@@ -701,7 +668,7 @@ async fn read_skips_blank_lines_and_tui_rules_unless_raw() {
         .filter(|r| r["method"] == "agent.read")
         .map(|r| r["params"]["lines"].clone())
         .collect();
-    assert_eq!(rows, vec![json!(12), json!(3)]);
+    assert_eq!(rows, vec![json!(12)]);
 }
 
 #[tokio::test]
