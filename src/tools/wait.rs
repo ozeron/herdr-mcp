@@ -150,10 +150,7 @@ pub async fn run(
         }
     };
     if let Some(note) = note {
-        out["note"] = match out["note"].as_str() {
-            Some(existing) => serde_json::json!(format!("{existing}; {note}")),
-            None => serde_json::json!(note),
-        };
+        out.add_note(note);
     }
-    Ok(out)
+    Ok(out.to_json())
 }

@@ -485,7 +485,7 @@ pub async fn run(
                     &inner.wait,
                     Request { pane: turn.pane.clone(), condition: Condition::Turn(turn.clone()), cap: remaining },
                     ticks,
-                ) => result,
+                ) => result.map(|outcome| outcome.to_json()),
                 () = cancel.cancelled() => {
                     return Err(cancelled(
                         "the client cancelled the wait; the agent keeps working. Call herdr_wait with the turn to resume",
@@ -668,7 +668,7 @@ async fn await_reply(w: ReplyWait<'_>) -> Result<Value, HerdrError> {
             .min(boundary.saturating_duration_since(now));
         tokio::select! {
             result = &mut turn_wait, if settled.is_none() => {
-                let Value::Object(mut fields) = result? else {
+                let Value::Object(mut fields) = result?.to_json() else {
                     return Err(HerdrError::tool("herdr_protocol", "the turn wait returned no fields"));
                 };
                 if is_settled(&fields) {

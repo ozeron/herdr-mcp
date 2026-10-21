@@ -99,7 +99,9 @@ fn request(condition: Condition, cap_ms: u64) -> Request {
 }
 
 async fn run(fake: &FakeHerdr, tuning: &Tuning, request: Request) -> Result<Value, HerdrError> {
-    wait::wait(&client(fake), tuning, request, None).await
+    wait::wait(&client(fake), tuning, request, None)
+        .await
+        .map(|outcome| outcome.to_json())
 }
 
 async fn run_ok(fake: &FakeHerdr, tuning: &Tuning, request: Request) -> Value {
@@ -1037,7 +1039,8 @@ async fn progress_ticks_arrive_in_increasing_order() {
         Some(tx),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .to_json();
 
     assert_eq!(out["timed_out"], true);
     let mut ticks = Vec::new();
@@ -1046,6 +1049,125 @@ async fn progress_ticks_arrive_in_increasing_order() {
     }
     assert_eq!(ticks.len(), 3, "{ticks:?}");
     assert!(ticks.windows(2).all(|pair| pair[0] < pair[1]), "{ticks:?}");
+}
+
+async fn json_of(fake: &FakeHerdr, condition: Condition, cap_ms: u64) -> Value {
+    run_ok(fake, &fast(), request(condition, cap_ms)).await
+}
+
+#[tokio::test]
+async fn the_rendered_json_of_each_condition_is_pinned() {
+    let seqs = |status: &str, seq: u64, completion: u64| {
+        json!({"matched": true, "timed_out": false, "pane": PANE, "status": status,
+               "state_change_seq": seq, "completion_seq": completion, "excerpt": "ran\n$"})
+    };
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("ran\n$ "));
+    always(&fake, "agent.get", info("done", 43, Some(43)));
+    let mut done = seqs("done", 43, 43);
+    done["superseded"] = json!(false);
+    let out = json_of(&fake, Condition::Turn(token(41, TurnFrom::Working)), 5000).await;
+    assert_eq!(out, done);
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("ran\n$ "));
+    always(&fake, "agent.get", info("blocked", 42, None));
+    let out = json_of(&fake, Condition::Turn(token(41, TurnFrom::Working)), 5000).await;
+    assert_eq!(
+        out,
+        json!({"matched": true, "timed_out": false, "pane": PANE, "status": "blocked",
+               "state_change_seq": 42, "completion_seq": null, "excerpt": "ran\n$",
+               "superseded": false,
+               "turn": {"pane": PANE, "terminal_id": TERMINAL, "shell_pid": null, "after": 42, "from": "blocked"}})
+    );
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("ran\n$ "));
+    always(&fake, "agent.get", info("working", 45, None));
+    let out = json_of(&fake, Condition::Turn(token(41, TurnFrom::Working)), 5000).await;
+    assert_eq!(
+        out,
+        json!({"matched": true, "timed_out": false, "pane": PANE, "status": "working",
+               "state_change_seq": 45, "completion_seq": null, "excerpt": "ran\n$",
+               "superseded": true})
+    );
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("ran\n$ "));
+    always(&fake, "agent.get", info("working", 41, None));
+    let out = json_of(&fake, Condition::Turn(token(41, TurnFrom::Working)), 100).await;
+    assert_eq!(
+        out,
+        json!({"matched": false, "timed_out": true, "pane": PANE, "status": "working",
+               "state_change_seq": 41, "completion_seq": null, "excerpt": "ran\n$",
+               "turn": {"pane": PANE, "terminal_id": TERMINAL, "shell_pid": null, "after": 41, "from": "working"}})
+    );
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("ran\n$ "));
+    always(&fake, "agent.get", info("idle", 44, Some(44)));
+    let out = json_of(&fake, Condition::Until(vec![AgentStatus::Idle]), 5000).await;
+    assert_eq!(out, seqs("idle", 44, 44));
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("ran\n$ "));
+    always(&fake, "agent.get", info("unknown", 43, None));
+    let out = json_of(&fake, Condition::Until(vec![AgentStatus::Unknown]), 5000).await;
+    assert_eq!(
+        out,
+        json!({"matched": true, "timed_out": false, "pane": PANE, "status": "unknown",
+               "state_change_seq": 43, "completion_seq": null, "excerpt": "ran\n$",
+               "note": "status is unknown: read the pane before concluding anything about the turn"})
+    );
+
+    let output = |needle: &str| Condition::Output {
+        needle: needle.into(),
+        after_command: None,
+    };
+    let fake = FakeHerdr::start().await;
+    fake.reply_seq(
+        "pane.read",
+        vec![read_result("$ "), read_result("$ \nserver ready\n")],
+    );
+    let out = json_of(&fake, output("ready"), 5000).await;
+    assert_eq!(
+        out,
+        json!({"matched": true, "timed_out": false, "pane": PANE, "excerpt": "server ready"})
+    );
+
+    let fake = FakeHerdr::start().await;
+    always(&fake, "pane.read", read_result("$ building\n"));
+    let out = json_of(&fake, output("ready"), 100).await;
+    assert_eq!(
+        out,
+        json!({"matched": false, "timed_out": true, "pane": PANE, "excerpt": "$ building"})
+    );
+
+    let fake = FakeHerdr::start().await;
+    process_seq(&fake, 200, &[777, 777, 200]);
+    let out = json_of(&fake, Condition::ProcessExit { pgid: Some(777) }, 5000).await;
+    assert_eq!(
+        out,
+        json!({"matched": true, "timed_out": false, "pane": PANE, "pgid": 777})
+    );
+
+    let fake = FakeHerdr::start().await;
+    process_seq(&fake, 200, &[200]);
+    let out = json_of(&fake, Condition::ProcessExit { pgid: None }, 5000).await;
+    assert_eq!(
+        out,
+        json!({"matched": false, "timed_out": false, "pane": PANE, "pgid": null,
+               "result": "no_active_work"})
+    );
+
+    let fake = FakeHerdr::start().await;
+    process_seq(&fake, 200, &[777]);
+    let out = json_of(&fake, Condition::ProcessExit { pgid: Some(777) }, 100).await;
+    assert_eq!(
+        out,
+        json!({"matched": false, "timed_out": true, "pane": PANE, "pgid": 777})
+    );
 }
 
 struct Harness {

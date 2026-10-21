@@ -70,6 +70,83 @@ pub struct Request {
     pub cap: Duration,
 }
 
+/// What one wait found. `to_json` is the only place the wire shape is built.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub matched: bool,
+    pub timed_out: bool,
+    pub pane: String,
+    /// Joined with `"; "` at render, in the order they were added.
+    pub notes: Vec<String>,
+    pub detail: Detail,
+}
+
+#[derive(Debug, Clone)]
+pub enum Detail {
+    Agent(AgentDetail),
+    Output {
+        excerpt: String,
+    },
+    Process {
+        pgid: Option<u32>,
+        /// Set when no non-shell group ever appeared, so there was nothing to wait for.
+        no_active_work: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentDetail {
+    pub status: AgentStatus,
+    pub state_change_seq: u64,
+    pub completion_seq: Option<u64>,
+    pub excerpt: String,
+    pub superseded: Option<bool>,
+    /// Only when the turn settles blocked or times out: the token to wait again with.
+    pub turn: Option<Turn>,
+}
+
+impl Outcome {
+    pub fn add_note(&mut self, note: impl Into<String>) {
+        self.notes.push(note.into());
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut out = json!({
+            "matched": self.matched,
+            "timed_out": self.timed_out,
+            "pane": self.pane,
+        });
+        match &self.detail {
+            Detail::Agent(agent) => {
+                out["status"] = json!(agent.status);
+                out["state_change_seq"] = json!(agent.state_change_seq);
+                out["completion_seq"] = json!(agent.completion_seq);
+                out["excerpt"] = json!(agent.excerpt);
+                if let Some(superseded) = agent.superseded {
+                    out["superseded"] = json!(superseded);
+                }
+                if let Some(turn) = &agent.turn {
+                    out["turn"] = json!(turn);
+                }
+            }
+            Detail::Output { excerpt } => out["excerpt"] = json!(excerpt),
+            Detail::Process {
+                pgid,
+                no_active_work,
+            } => {
+                out["pgid"] = json!(pgid);
+                if *no_active_work {
+                    out["result"] = json!("no_active_work");
+                }
+            }
+        }
+        if !self.notes.is_empty() {
+            out["note"] = json!(self.notes.join("; "));
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Progress {
     pub elapsed: Duration,
@@ -82,7 +159,7 @@ pub async fn wait(
     tuning: &Tuning,
     request: Request,
     progress: Option<UnboundedSender<Progress>>,
-) -> Result<Value, HerdrError> {
+) -> Result<Outcome, HerdrError> {
     let started = Instant::now();
     let cap = request.cap;
     let work = dispatch(client, tuning, request, started + cap);
@@ -107,7 +184,7 @@ async fn dispatch(
     tuning: &Tuning,
     request: Request,
     deadline: Instant,
-) -> Result<Value, HerdrError> {
+) -> Result<Outcome, HerdrError> {
     match request.condition {
         Condition::Turn(turn) => wait_for_turn(client, tuning, turn, deadline).await,
         Condition::Until(statuses) => {
@@ -346,26 +423,26 @@ async fn agent_result(
     matched: bool,
     superseded: Option<bool>,
     turn: Option<&Turn>,
-) -> Value {
-    let mut out = json!({
-        "matched": matched,
-        "timed_out": !matched,
-        "pane": agent.pane_id,
-        "status": status,
-        "state_change_seq": agent.state_change_seq,
-        "completion_seq": agent.completion_seq,
-        "excerpt": excerpt(client, &agent.pane_id).await,
-    });
-    if let Some(superseded) = superseded {
-        out["superseded"] = json!(superseded);
+) -> Outcome {
+    let notes = if matched && status == AgentStatus::Unknown {
+        vec![UNKNOWN_NOTE.to_string()]
+    } else {
+        Vec::new()
+    };
+    Outcome {
+        matched,
+        timed_out: !matched,
+        pane: agent.pane_id.clone(),
+        notes,
+        detail: Detail::Agent(AgentDetail {
+            status,
+            state_change_seq: agent.state_change_seq,
+            completion_seq: agent.completion_seq,
+            excerpt: excerpt(client, &agent.pane_id).await,
+            superseded,
+            turn: turn.cloned(),
+        }),
     }
-    if let Some(turn) = turn {
-        out["turn"] = json!(turn);
-    }
-    if matched && status == AgentStatus::Unknown {
-        out["note"] = json!(UNKNOWN_NOTE);
-    }
-    out
 }
 
 /// Each snapshot is judged by `evaluate`; a blocked-then-approved agent re-bases the token.
@@ -374,7 +451,7 @@ async fn wait_for_turn(
     tuning: &Tuning,
     mut turn: Turn,
     deadline: Instant,
-) -> Result<Value, HerdrError> {
+) -> Result<Outcome, HerdrError> {
     let mut wakeups = Wakeups::open(client, &turn.pane, tuning.poll_interval, deadline).await?;
     let mut pane = turn.pane.clone();
     let mut terminal_id = Some(turn.terminal_id.clone());
@@ -445,7 +522,7 @@ async fn wait_for_status(
     pane: &str,
     statuses: &[AgentStatus],
     deadline: Instant,
-) -> Result<Value, HerdrError> {
+) -> Result<Outcome, HerdrError> {
     let mut wakeups = Wakeups::open(client, pane, tuning.poll_interval, deadline).await?;
     let mut pane = pane.to_string();
     let mut terminal_id = None;
@@ -474,7 +551,7 @@ async fn wait_for_output(
     needle: &str,
     after_command: Option<&str>,
     deadline: Instant,
-) -> Result<Value, HerdrError> {
+) -> Result<Outcome, HerdrError> {
     let first = bounded(client, deadline, read_text(client, pane))
         .await
         .map_err(closed)?;
@@ -496,21 +573,24 @@ async fn wait_for_output(
         Ok::<_, HerdrError>(text)
     })
     .await?;
-    let note = matcher.anchor_missing(&last.lock().unwrap()).then_some(
-        "the echoed command is no longer in the pane's recent output, so only output added from the first read of this wait can match",
-    );
-    let mut out = match outcome {
-        MatchOutcome::Matched { excerpt } => {
-            json!({"matched": true, "timed_out": false, "pane": pane, "excerpt": excerpt})
-        }
-        MatchOutcome::TimedOut { tail } => {
-            json!({"matched": false, "timed_out": true, "pane": pane, "excerpt": tail})
-        }
+    let notes = matcher
+        .anchor_missing(&last.lock().unwrap())
+        .then_some(
+            "the echoed command is no longer in the pane's recent output, so only output added from the first read of this wait can match".to_string(),
+        )
+        .into_iter()
+        .collect();
+    let (matched, excerpt) = match outcome {
+        MatchOutcome::Matched { excerpt } => (true, excerpt),
+        MatchOutcome::TimedOut { tail } => (false, tail),
     };
-    if let Some(note) = note {
-        out["note"] = json!(note);
-    }
-    Ok(out)
+    Ok(Outcome {
+        matched,
+        timed_out: !matched,
+        pane: pane.to_string(),
+        notes,
+        detail: Detail::Output { excerpt },
+    })
 }
 
 /// Matches when the tracked process group has left the foreground and a recheck still
@@ -521,11 +601,20 @@ async fn wait_for_process(
     pane: &str,
     pgid: Option<u32>,
     deadline: Instant,
-) -> Result<Value, HerdrError> {
+) -> Result<Outcome, HerdrError> {
     let observe_until = Instant::now() + tuning.observe_window;
     let mut tracked = pgid;
     let mut unavailable;
-    let done = |tracked: Option<u32>, matched: bool, timed_out: bool| json!({"matched": matched, "timed_out": timed_out, "pane": pane, "pgid": tracked});
+    let done = |pgid: Option<u32>, matched: bool, timed_out: bool, no_active_work: bool| Outcome {
+        matched,
+        timed_out,
+        pane: pane.to_string(),
+        notes: Vec::new(),
+        detail: Detail::Process {
+            pgid,
+            no_active_work,
+        },
+    };
     loop {
         let info = bounded(client, deadline, client.pane_process_info(pane))
             .await
@@ -537,9 +626,7 @@ async fn wait_for_process(
                 if let Some(group) = info.left_shell_group() {
                     tracked = Some(group);
                 } else if !unavailable && Instant::now() >= observe_until {
-                    let mut out = done(None, false, false);
-                    out["result"] = json!("no_active_work");
-                    return Ok(out);
+                    return Ok(done(None, false, false, true));
                 }
             }
             Some(group) => {
@@ -549,16 +636,16 @@ async fn wait_for_process(
                         .await
                         .map_err(closed)?;
                     if again.shell_in_front_strict() {
-                        return Ok(done(tracked, true, false));
+                        return Ok(done(tracked, true, false, false));
                     }
                 }
             }
         }
         if Instant::now() >= deadline {
-            let mut out = done(tracked, false, true);
+            let mut out = done(tracked, false, true, false);
             if unavailable {
-                out["note"] = json!(
-                    "process info unavailable: the foreground process group could not be read, so the process may still be running"
+                out.add_note(
+                    "process info unavailable: the foreground process group could not be read, so the process may still be running",
                 );
             }
             return Ok(out);
