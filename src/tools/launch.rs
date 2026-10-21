@@ -4,19 +4,23 @@ use std::time::Duration;
 
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ToolMode;
+use crate::delegation::{
+    NO_MAIL_NOTE, ReplyWait, await_reply, mail_plan, reply_json, reply_paragraph,
+    require_verified_caller, take_reply,
+};
 use crate::herdr::{
     AgentInfo, AgentReadParams, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError,
     ReadSource,
 };
 use crate::install::shim_path_in;
 use crate::install::status::{McpStatus, global_mode, mcp_status_for};
-use crate::mailbox::{Inbox, Mailbox, Message, SenderFilter};
+use crate::mailbox::{Message, SenderFilter};
 use crate::matcher::{read_text, tail};
 use crate::place::{self, Options, Placed, Where};
 use crate::provenance;
@@ -26,7 +30,7 @@ use crate::scope::Scope;
 use crate::server::Inner;
 use crate::tools::send::{gated_prompt, prompt_error, turn_for};
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
-use crate::turn::{Turn, TurnFrom};
+use crate::turn::TurnFrom;
 use crate::wait::{self, Condition, Progress, Request};
 
 pub const START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -245,13 +249,17 @@ pub async fn run(
     }
     let mail_plan = match reply {
         Reply::Screen => None,
-        Reply::Mail => Some(mail_plan(
-            inner,
-            &params.kind,
-            control,
-            &snapshot,
-            &resolution,
-        )?),
+        Reply::Mail => {
+            require_verified_caller(&resolution)?;
+            let child_has_mail_tool =
+                injection(inner, &params.kind, control)?.mcp != McpStatus::Unsupported.as_str();
+            Some(mail_plan(
+                &params.kind,
+                child_has_mail_tool,
+                &snapshot,
+                &resolution,
+            )?)
+        }
     };
     let caller_mode = match (&resolution.caller, resolution.caller_verified) {
         (Some(caller), true) if requested_mode != RuntimeMode::Inherit => client
@@ -417,6 +425,7 @@ pub async fn run(
             "The child will mail its result to you; end your turn, and the mail nudge will wake you.",
         );
     }
+    let mailbox = inner.mailbox();
     let filter = SenderFilter::new([placed.pane_id.clone(), params.name.clone()]);
     let Some(turn) = turn else {
         add_note(
@@ -424,7 +433,7 @@ pub async fn run(
             "the prompt was accepted but the agent is neither working nor blocked, so there is no turn to wait on; read the pane",
         );
         if let (Some(plan), LaunchWait::Turn) = (&mail_plan, wait) {
-            let mailed = take_reply(&inner.mailbox(), &plan.inbox, &filter)?;
+            let mailed = take_reply(&mailbox, &plan.inbox, &filter)?;
             set_reply(&mut out, mailed);
         }
         return Ok(out);
@@ -463,21 +472,23 @@ pub async fn run(
     let mut details = waiting.clone();
     details["turn"] = json!(turn);
     let result = match &mail_plan {
-        Some(plan) => {
-            await_reply(ReplyWait {
-                client,
-                inner,
-                plan,
-                filter: &filter,
-                turn: turn.clone(),
-                name: &params.name,
-                remaining,
-                ticks,
-                cancel: &cancel,
-                details: &details,
-            })
-            .await
-        }
+        Some(plan) => await_reply(ReplyWait {
+            client,
+            mailbox: &mailbox,
+            wait: &inner.wait,
+            mail_poll: inner.launch.mail_poll,
+            reply_grace: inner.launch.reply_grace,
+            plan,
+            filter: &filter,
+            turn: turn.clone(),
+            name: &params.name,
+            remaining,
+            ticks,
+            cancel: &cancel,
+            details: &details,
+        })
+        .await
+        .map(|outcome| outcome.to_json()),
         None => {
             tokio::select! {
                 result = wait::wait(
@@ -513,76 +524,6 @@ pub async fn run(
     }
 }
 
-/// What a `reply: mail` launch needs of the caller: the inbox the child's mail lands in and the
-/// name the child is told to mail.
-struct MailPlan {
-    inbox: Inbox,
-    parent: String,
-}
-
-/// Checked before anything is created: replies go to the caller's inbox, and the child needs the
-/// mail tool to send one.
-fn mail_plan(
-    inner: &Inner,
-    kind: &str,
-    control: bool,
-    snapshot: &crate::herdr::SessionSnapshot,
-    resolution: &crate::caller::Resolution,
-) -> Result<MailPlan, HerdrError> {
-    let caller = match &resolution.caller {
-        Some(caller) if resolution.caller_verified => caller,
-        _ => {
-            return Err(HerdrError::invalid_params(
-                "reply mail needs a verified caller: replies go to the caller's inbox, and none could be verified",
-            ));
-        }
-    };
-    if injection(inner, kind, control)?.mcp == McpStatus::Unsupported.as_str() {
-        return Err(HerdrError::tool(
-            "reply_unsupported",
-            format!(
-                "kind {kind:?} gets no herdr MCP server here, so the child would have no mail tool to reply with; use reply screen"
-            ),
-        ));
-    }
-    let name = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.pane_id == caller.pane_id)
-        .and_then(|agent| agent.name.clone());
-    Ok(MailPlan {
-        inbox: Inbox::new(&caller.pane_id, name.as_deref()),
-        parent: name.unwrap_or_else(|| caller.pane_id.clone()),
-    })
-}
-
-fn reply_paragraph(parent: &str) -> String {
-    format!(
-        "When you have finished, send your complete final result as the body of one herdr_mail_send call to {parent}. The body is the deliverable: exact, complete, nothing else. Do this even if you also print it."
-    )
-}
-
-const NO_MAIL_NOTE: &str = "child finished without mailing a result; read its pane";
-
-/// Consumes the oldest unread mail from the child and nothing else.
-fn take_reply(
-    mailbox: &Mailbox,
-    inbox: &Inbox,
-    filter: &SenderFilter,
-) -> Result<Option<Message>, HerdrError> {
-    Ok(mailbox
-        .take(inbox, Some(filter), true, 1)?
-        .0
-        .into_iter()
-        .next())
-}
-
-fn reply_json(message: &Message) -> Value {
-    json!({
-        "id": message.id, "body": message.body, "from": message.from, "ts_ms": message.ts_ms,
-    })
-}
-
 fn set_reply(out: &mut Value, message: Option<Message>) {
     match message {
         Some(message) => out["reply"] = reply_json(&message),
@@ -591,138 +532,6 @@ fn set_reply(out: &mut Value, message: Option<Message>) {
             add_note(out, NO_MAIL_NOTE);
         }
     }
-}
-
-struct ReplyWait<'a> {
-    client: &'a Client,
-    inner: &'a Inner,
-    plan: &'a MailPlan,
-    filter: &'a SenderFilter,
-    turn: Turn,
-    name: &'a str,
-    remaining: Duration,
-    ticks: Option<UnboundedSender<Progress>>,
-    cancel: &'a CancellationToken,
-    details: &'a Value,
-}
-
-fn is_settled(fields: &Map<String, Value>) -> bool {
-    fields.get("matched") == Some(&json!(true))
-        && matches!(
-            fields.get("status").and_then(Value::as_str),
-            Some("done" | "idle")
-        )
-}
-
-/// Waits for the child's mail and its turn together. Mail ends the wait at once. A turn that
-/// settles gets `reply_grace` for its mail to arrive. Returns the fields to merge into the launch
-/// result.
-async fn await_reply(w: ReplyWait<'_>) -> Result<Value, HerdrError> {
-    let mailbox = w.inner.mailbox();
-    let tuning = &w.inner.launch;
-    let deadline = Instant::now() + w.remaining;
-    let turn_wait = wait::wait(
-        w.client,
-        &w.inner.wait,
-        Request {
-            pane: w.turn.pane.clone(),
-            condition: Condition::Turn(w.turn.clone()),
-            cap: w.remaining,
-        },
-        w.ticks,
-    );
-    tokio::pin!(turn_wait);
-    // The settled turn's result and when its grace ends.
-    let mut settled: Option<(Map<String, Value>, Instant)> = None;
-    loop {
-        if let Some(message) = take_reply(&mailbox, &w.plan.inbox, w.filter)? {
-            let mut fields = match settled {
-                Some((fields, _)) => fields,
-                None => running_fields(w.client, &w.turn.pane).await,
-            };
-            fields.remove("excerpt");
-            fields.insert("reply".into(), reply_json(&message));
-            return Ok(Value::Object(fields));
-        }
-        let now = Instant::now();
-        if now >= deadline
-            && let Some((mut fields, _)) = settled.take()
-        {
-            fields.insert("matched".into(), json!(false));
-            return Ok(timed_out(fields, w.name));
-        }
-        if let Some((fields, grace_end)) = &settled
-            && now >= *grace_end
-        {
-            let mut fields = fields.clone();
-            fields.insert("reply".into(), Value::Null);
-            fields.insert("note".into(), json!(NO_MAIL_NOTE));
-            return Ok(Value::Object(fields));
-        }
-        let boundary = match &settled {
-            Some((_, grace_end)) => (*grace_end).min(deadline),
-            None => deadline,
-        };
-        let nap = tuning
-            .mail_poll
-            .min(boundary.saturating_duration_since(now));
-        tokio::select! {
-            result = &mut turn_wait, if settled.is_none() => {
-                let Value::Object(mut fields) = result?.to_json() else {
-                    return Err(HerdrError::tool("herdr_protocol", "the turn wait returned no fields"));
-                };
-                if is_settled(&fields) {
-                    settled = Some((fields, Instant::now() + tuning.reply_grace));
-                } else if fields.get("timed_out") == Some(&json!(true)) {
-                    if let Some(message) = take_reply(&mailbox, &w.plan.inbox, w.filter)? {
-                        fields.remove("excerpt");
-                        fields.insert("matched".into(), json!(true));
-                        fields.insert("timed_out".into(), json!(false));
-                        fields.insert("reply".into(), reply_json(&message));
-                        return Ok(Value::Object(fields));
-                    }
-                    return Ok(timed_out(fields, w.name));
-                } else {
-                    // Blocked, unknown or working again: the caller has to look.
-                    fields.insert("reply".into(), Value::Null);
-                    return Ok(Value::Object(fields));
-                }
-            }
-            () = sleep(nap) => {}
-            () = w.cancel.cancelled() => {
-                let mut details = w.details.clone();
-                details["rewait"] = rewait(w.name);
-                return Err(cancelled(
-                    "the client cancelled the wait; the agent keeps working. Call herdr_mail_wait with from set to the child's name to resume",
-                    details,
-                ));
-            }
-        }
-    }
-}
-
-fn rewait(name: &str) -> Value {
-    json!({"mail": {"from": name}})
-}
-
-fn timed_out(mut fields: Map<String, Value>, name: &str) -> Value {
-    fields.insert("timed_out".into(), json!(true));
-    fields.insert("reply".into(), Value::Null);
-    fields.insert("rewait".into(), rewait(name));
-    Value::Object(fields)
-}
-
-/// The child's current status, for a reply that arrived while it was still running.
-async fn running_fields(client: &Client, pane: &str) -> Map<String, Value> {
-    let mut fields = Map::new();
-    fields.insert("matched".into(), json!(true));
-    fields.insert("timed_out".into(), json!(false));
-    if let Ok(agent) = client.agent_get(pane).await {
-        fields.insert("status".into(), json!(agent.agent_status));
-        fields.insert("state_change_seq".into(), json!(agent.state_change_seq));
-        fields.insert("completion_seq".into(), json!(agent.completion_seq));
-    }
-    fields
 }
 
 /// The dialog of `kind` on the pane's visible screen and the screen's tail, or `None` when the
