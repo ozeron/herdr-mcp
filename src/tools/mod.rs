@@ -3,6 +3,7 @@ pub mod close;
 pub mod interrupt;
 pub mod launch;
 pub mod list;
+pub mod mail;
 pub mod read;
 pub mod run;
 pub mod send;
