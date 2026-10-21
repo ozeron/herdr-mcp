@@ -485,6 +485,10 @@ async fn wait_for_output(
     let last = Mutex::new(first.clone());
     let timeout = deadline.saturating_duration_since(Instant::now());
     let outcome = wait_for_match(&matcher, timeout, tuning.pane_interval, || async {
+        // The matcher's last poll can wake right at the deadline, when a read has no time left.
+        if Instant::now() >= deadline {
+            return Ok(last.lock().unwrap().clone());
+        }
         let text = bounded(client, deadline, read_text(client, pane))
             .await
             .map_err(closed)?;
