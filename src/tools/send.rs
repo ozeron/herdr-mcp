@@ -56,7 +56,7 @@ pub struct SendParams {
     pub text: Option<String>,
     /// Raw keys to send, such as ["Enter"] or ["y"].
     pub keys: Option<Vec<String>>,
-    /// For a prompt. auto (default) starts a turn on an idle agent; on a working agent it queues the prompt where the agent supports that (Claude Code: delivery queued), else waits for idle like after_idle. after_idle waits for idle, then sends; steer types into a working agent and returns no turn; restart interrupts, waits for idle, then sends.
+    /// For a prompt. auto (default) starts a turn on an idle agent. On a working agent it queues the prompt only for kinds that queue typed input (Claude Code: delivery queued, or unconfirmed when the queue marker never shows); any other working agent returns busy at once with nothing typed. after_idle waits for idle, then sends; steer types into the running turn and returns no turn; restart interrupts, waits for idle, then sends.
     pub mode: Option<SendMode>,
     /// For a prompt. turn waits for the turn it started to settle and returns the excerpt, bounded by the wait cap; on timed_out, pass the turn to herdr_wait. none (default) returns once delivered. A queued prompt has no turn yet, so it returns at once.
     pub wait: Option<SendWait>,
@@ -234,19 +234,31 @@ async fn send_prompt(
         }
         SendMode::Auto => match status {
             AgentStatus::Idle | AgentStatus::Done => ("started", false),
+            // Decided before typing: only a kind that queues typed input gets it while working.
             AgentStatus::Working if provider(kind).queue_marker.is_some() => {
+                refuse_dialog(client, pane, kind).await?;
+                if ct.is_cancelled() {
+                    return Err(cancelled(pane, false));
+                }
                 let mut out =
                     steer(client, pane, prompt, status, kind, send_now, pacing.settle).await?;
                 out["mode"] = json!(SendMode::Auto);
-                out["result"] = json!(out["delivery"]);
+                if out["delivery"] == "steered" {
+                    // The kind queues, but its queue marker never showed: say so, never guess.
+                    out["delivery"] = json!("unconfirmed");
+                    out["note"] = json!(UNCONFIRMED_NOTE);
+                }
+                out["result"] = out["delivery"].clone();
                 return Ok(out);
             }
             AgentStatus::Working => {
-                tokio::select! {
-                    idle = wait_idle(client, pacing.idle_poll, pane, deadline, false) => idle?,
-                    () = ct.cancelled() => return Err(cancelled(pane, false)),
-                }
-                ("sent_after_idle", false)
+                return Err(HerdrError::detailed(
+                    "busy",
+                    format!(
+                        "{pane} is working and its kind has no input queue, so nothing was typed. Wait with herdr_wait, resend with mode after_idle to send when it is idle, or mode steer to type into the running turn"
+                    ),
+                    json!({"pane": pane, "status": "working", "kind": kind}),
+                ));
             }
             _ => {
                 return Err(HerdrError::tool(
@@ -354,6 +366,27 @@ fn no_send_now_note(kind: Option<&str>) -> String {
     )
 }
 
+const UNCONFIRMED_NOTE: &str = "The agent was working; its queue marker never showed, so it is not confirmed whether the prompt was queued or taken into the running turn. Read the pane before sending again.";
+
+/// Refuses before typing when a known startup or permission dialog is on screen: typed text
+/// would answer it.
+async fn refuse_dialog(client: &Client, pane: &str, kind: Option<&str>) -> Result<(), HerdrError> {
+    match visible_dialog(client, pane, kind.unwrap_or_default()).await {
+        Some((dialog, _)) => Err(HerdrError::detailed(
+            "agent_needs_input",
+            format!(
+                "{pane} shows a dialog ({}); nothing was typed. Read the pane, then answer it or ask the user",
+                dialog.id
+            ),
+            json!({"pane": pane, "dialog": dialog.id}),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Screen reads after typing into a working agent, `settle` apart, looking for its queue marker.
+const QUEUE_READS: usize = 3;
+
 const QUEUED_NOTE: &str = "The agent is mid-turn and queued this prompt; it runs when the current turn ends. Use send_now to submit it immediately, or herdr_wait on the agent to know when it finishes.";
 
 /// Whether the visible screen shows the kind's queue marker.
@@ -386,8 +419,16 @@ async fn steer(
     let mut delivery = if working { "steered" } else { "started" };
     let mut note = None;
     if working && let Some(marker) = provider.queue_marker {
-        sleep(settle).await;
-        if shows_queue_marker(client, pane, marker).await {
+        // The marker can take a redraw or two to appear.
+        let mut seen = false;
+        for _ in 0..QUEUE_READS {
+            sleep(settle).await;
+            if shows_queue_marker(client, pane, marker).await {
+                seen = true;
+                break;
+            }
+        }
+        if seen {
             delivery = "queued";
             note = Some(QUEUED_NOTE.to_string());
             if send_now && let Some(key) = provider.send_now_key {

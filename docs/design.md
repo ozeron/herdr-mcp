@@ -184,7 +184,7 @@ Semantics:
   - **Resync.** On `events_lost` the engine resubscribes and resyncs from `agent.get`.
   - The token is T3's `runId` pinning, built from Herdr's counter. It is unambiguous only if the agent was idle at send time.
 - **Send modes.** These are the honest version of T3's `auto` / `queue` / `steer` / `restart`.
-  - `auto` sends if the agent is idle, and returns `busy` if it is working.
+  - `auto` sends if the agent is idle. On a working agent it queues the prompt if the kind queues typed input (Claude Code), confirmed from the screen, and otherwise returns `busy` at once.
   - `after_idle` waits, bounded, for idle and then sends. This is T3's `queue`, done synchronously.
   - `steer` types into a working agent. The result has `turn: null`, because the next completion may belong to the earlier turn.
   - `restart` interrupts, waits for idle, then sends.

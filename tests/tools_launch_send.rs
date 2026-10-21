@@ -1660,43 +1660,6 @@ async fn auto_to_a_working_claude_queues_the_prompt() {
 }
 
 #[tokio::test]
-async fn auto_to_a_working_codex_waits_for_idle_then_sends() {
-    let h = start(Opts::default()).await;
-    script_send(
-        &h.fake,
-        Some("w1:p1"),
-        vec![rev("working", 3), rev("working", 3), rev("done", 4)],
-    );
-
-    let out = ok(
-        &h,
-        "herdr_send",
-        json!({"target": "rev", "prompt": "next", "timeout_ms": 5000}),
-    )
-    .await;
-
-    assert_eq!(out["mode"], "auto");
-    assert_eq!(out["result"], "sent_after_idle");
-    assert_eq!(count(&h.fake, "agent.prompt"), 1);
-}
-
-#[tokio::test]
-async fn auto_to_a_codex_that_never_idles_is_not_sent() {
-    let h = start(Opts::default()).await;
-    script_send(&h.fake, Some("w1:p1"), vec![rev("working", 3)]);
-
-    let out = err(
-        &h,
-        "herdr_send",
-        json!({"target": "rev", "prompt": "next", "timeout_ms": 60}),
-    )
-    .await;
-
-    assert_eq!(out["code"], "not_sent");
-    assert_nothing_typed(&h.fake);
-}
-
-#[tokio::test]
 async fn wait_turn_returns_the_settled_turn_with_its_excerpt() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3), rev("done", 6)]);
@@ -1750,6 +1713,97 @@ async fn wait_is_refused_for_text_and_keys() {
         out.to_string().contains("wait applies to a prompt"),
         "{out}"
     );
+    assert_nothing_typed(&h.fake);
+}
+
+#[tokio::test]
+async fn auto_to_a_working_codex_is_busy_at_once_and_types_nothing() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("working", 3)]);
+    let started = std::time::Instant::now();
+
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next", "timeout_ms": 5000}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "busy");
+    assert_eq!(out["kind"], "codex");
+    assert!(
+        out["message"].as_str().unwrap().contains("after_idle"),
+        "{out}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_nothing_typed(&h.fake);
+}
+
+#[tokio::test]
+async fn a_late_queue_marker_still_counts_as_queued() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
+    // The dialog check, then two reads before the marker shows.
+    screens(
+        &h.fake,
+        &[
+            WORKING_SCREEN,
+            WORKING_SCREEN,
+            WORKING_SCREEN,
+            QUEUED_SCREEN,
+        ],
+    );
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next task"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["result"], "queued");
+}
+
+#[tokio::test]
+async fn a_queue_marker_that_never_shows_is_unconfirmed_with_a_note() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
+    screens(&h.fake, &[WORKING_SCREEN]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next task"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "unconfirmed");
+    assert_eq!(out["result"], "unconfirmed");
+    assert!(
+        out["note"].as_str().unwrap().contains("not confirmed"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn a_dialog_on_screen_is_refused_before_typing() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
+    screens(
+        &h.fake,
+        &["Do you trust the files in this folder?\n 1. Yes, proceed\n"],
+    );
+
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next task"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_needs_input");
+    assert_eq!(out["dialog"], "folder_trust");
     assert_nothing_typed(&h.fake);
 }
 
