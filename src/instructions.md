@@ -22,4 +22,4 @@ Rules of use:
 - To get replies, tell the child your pane id, then `herdr_mail_wait` and `herdr_mail_read`. A mail nudge in your prompt means call `herdr_mail_read`.
 - Read mode exposes `herdr_capabilities`, `herdr_list`, `herdr_read`, `herdr_wait` and the three mail tools. Control tools exist only when the bridge was started with `--tools control`.
 
-Tools return structured JSON. Malformed arguments return a JSON-RPC `invalid_params` error. A tool failure sets `isError` and carries a `code` and a `message`.
+Tools return structured JSON. Malformed arguments fail with `isError` and a plain-text message naming the bad field, with no `code`. A tool failure sets `isError` and carries a `code` and a `message`.

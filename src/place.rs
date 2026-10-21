@@ -14,6 +14,7 @@ use crate::provenance;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
 pub struct WorktreeWhere {
     /// Branch for the new Herdr worktree.
     pub branch: String,
@@ -24,11 +25,15 @@ pub struct WorktreeWhere {
 /// Where to put the work. Give at most one field; the default is a new tab.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
 pub struct Where {
     /// An existing idle shell pane (ID or agent name). Refused if its foreground is not the shell.
     pub pane: Option<String>,
-    /// Split the calling pane (or the focused pane for external callers).
+    /// Split the pane named by `of`, or the calling pane when `of` is omitted. External callers
+    /// must give `of`.
     pub split: Option<SplitDirection>,
+    /// Pane to split (pane ID or agent name). Defaults to the calling pane; external callers must give it.
+    pub of: Option<String>,
     /// A new tab in the calling pane's workspace (or the focused workspace). This is the default.
     pub tab: Option<bool>,
     /// A new workspace.
@@ -94,6 +99,9 @@ fn plan<'a>(where_: Option<&'a Where>, options: &Options) -> Result<Plan<'a>, He
     let Some(where_) = where_ else {
         return Ok(Plan::Tab);
     };
+    if where_.of.is_some() && where_.split.is_none() {
+        return Err(HerdrError::invalid_params("of only applies to split"));
+    }
     let mut chosen = Vec::new();
     if let Some(pane) = &where_.pane {
         chosen.push(Plan::Existing(pane));
@@ -155,8 +163,18 @@ pub async fn place(
     let placed = match plan {
         Plan::Existing(target) => return existing(client, resolution, target).await,
         Plan::Split(direction) => {
+            let target = match where_.and_then(|w| w.of.as_deref()) {
+                Some(of) => resolve_of(client, of).await?,
+                None => verified
+                    .map(|caller| caller.pane_id.clone())
+                    .ok_or_else(|| {
+                        HerdrError::invalid_params(
+                            "an external caller must name the pane to split with where.of",
+                        )
+                    })?,
+            };
             let params = PaneSplitParams {
-                target_pane_id: verified.map(|caller| caller.pane_id.clone()),
+                target_pane_id: Some(target),
                 direction,
                 cwd: options.cwd.clone(),
                 env: options.env.clone(),
@@ -230,6 +248,30 @@ pub async fn place(
         return Err(err);
     }
     Ok(placed)
+}
+
+/// A pane ID such as `w1:p2`, as opposed to a tab ID (`w1:t1`), a workspace ID or an agent name.
+fn is_pane_id(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(workspace, pane)| {
+        !workspace.is_empty()
+            && pane
+                .strip_prefix('p')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+async fn resolve_of(client: &Client, of: &str) -> Result<String, HerdrError> {
+    if is_pane_id(of) {
+        return Ok(of.to_string());
+    }
+    match client.agent_get(of).await {
+        Ok(agent) => Ok(agent.pane_id),
+        Err(err) if err.is_target_gone() => Err(HerdrError::tool(
+            "target_not_found",
+            format!("where.of takes a pane ID or an agent name; {of:?} matches neither"),
+        )),
+        Err(err) => Err(err),
+    }
 }
 
 async fn existing(

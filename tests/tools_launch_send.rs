@@ -2327,3 +2327,30 @@ async fn a_kind_without_runtime_flags_refuses_a_runtime_mode() {
     let (_h, out) = launch_with_mode("opencode", json!({"runtime_mode": "inherit"}), None).await;
     out.unwrap();
 }
+
+#[tokio::test]
+async fn launch_split_of_a_pane_id_targets_that_pane() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake.reply(
+        "pane.split",
+        json!({"type": "pane_info", "pane": pane("w1:p9", "w1:t1", "w1", None)}),
+    );
+
+    ok(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "where": {"split": "down", "of": "w2:p3"}}),
+    )
+    .await;
+
+    let split = &requests(&h.fake, "pane.split")[0]["params"];
+    assert_eq!(split["target_pane_id"], "w2:p3");
+    assert_eq!(count(&h.fake, "tab.create"), 0);
+}

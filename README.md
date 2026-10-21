@@ -83,9 +83,9 @@ Behaviour worth knowing:
 - `herdr_wait {process_exit}` returns `{result: "no_active_work", matched: false, timed_out: false}` when nothing was running. Do not re-wait.
 - Waits never cancel work. A `timed_out` result means call again. The wait cap is 280 s for Codex, 600 s for Claude and 50 s otherwise.
 - Idle is not success. No tool reports success: read the output and decide.
-- `where` takes at most one of `pane`, `split` (`right` or `down`), `tab`, `workspace` or `worktree{branch, base}`. The default is a new tab.
+- `where` takes at most one of `pane`, `split` (`right` or `down`), `tab`, `workspace` or `worktree{branch, base}`. The default is a new tab. `split` takes `of`, the pane to split (pane ID or agent name); it defaults to the calling pane, and external callers must give it. `of` without `split` is an error, and so is an unknown key.
 
-Malformed arguments return a JSON-RPC `invalid_params` error. Tool failures return `isError` with a `code` and a `message`. Codes worth knowing:
+Malformed arguments (a missing field, a bad enum value, an unknown key) fail with `isError` and a plain-text message naming the field, with no `code`. Tool failures return `isError` with a `code` and a `message`. Codes worth knowing:
 - `answer_refused`: `herdr_interrupt` would answer a blocked prompt.
 - `agent_needs_input`: `herdr_launch` found a startup dialog it did not answer (`dialogs: surface`, one that stayed after the answer, or more than 3). The pane is kept; details carry `pane`, `phase` and `dialog{id, excerpt}`.
 - `keys_failed`: `herdr_send` could not send the keys.

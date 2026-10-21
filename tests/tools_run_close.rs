@@ -16,7 +16,7 @@ use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
 use rmcp::ServiceExt;
-use rmcp::model::{ClientCapabilities, ClientConfig, Implementation};
+use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
 use serde_json::{Value, json};
 
 struct Opts {
@@ -874,4 +874,174 @@ async fn only_flickering_groups_give_a_null_pgid_and_a_note() {
     let out = run_observed("make dev", flicker).await;
     assert_eq!(out["pgid"], Value::Null);
     assert!(out["note"].as_str().unwrap().contains("make"));
+}
+
+async fn external_split(of: Option<&str>) -> Harness {
+    let h = start(Opts {
+        env_pane: None,
+        ..Opts::default()
+    })
+    .await;
+    h.fake.reply("session.snapshot", snapshot(None));
+    h.fake
+        .reply("pane.split", pane_info("w1:p9", "w1:t1", "w1"));
+    h.fake.reply("pane.report_metadata", ok_reply());
+    h.fake.reply("pane.send_input", ok_reply());
+    h.fake.reply_seq(
+        "pane.process_info",
+        vec![process_info("w1:p9", 31337, 31337)],
+    );
+    reads(&h.fake, &["$ "]);
+    let mut placement = json!({"split": "down"});
+    if let Some(of) = of {
+        placement["of"] = json!(of);
+    }
+    ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": placement}),
+    )
+    .await;
+    h
+}
+
+#[tokio::test]
+async fn split_of_a_pane_id_targets_that_pane() {
+    let h = external_split(Some("w3J:p1")).await;
+
+    let split = &requests(&h.fake, "pane.split")[0]["params"];
+    assert_eq!(split["target_pane_id"], "w3J:p1");
+    assert_eq!(count(&h.fake, "agent.get"), 0);
+}
+
+#[tokio::test]
+async fn split_of_an_agent_name_resolves_it_through_agent_get() {
+    let h = start(Opts::default()).await;
+    script_split(&h.fake);
+    h.fake.reply(
+        "agent.get",
+        json!({"type": "agent_info", "agent": {
+            "terminal_id": "t-w1:p4", "name": "rev", "agent": "codex", "agent_status": "idle",
+            "pane_id": "w1:p4", "tab_id": "w1:t2", "workspace_id": "w1", "focused": false,
+            "revision": 1, "state_change_seq": 3, "interactive_ready": true,
+            "launch_pending": false}}),
+    );
+    h.fake
+        .reply_seq("pane.process_info", vec![process_info("w1:p9", 200, 200)]);
+    reads(&h.fake, &["$ "]);
+
+    ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"split": "right", "of": "rev"}}),
+    )
+    .await;
+
+    assert_eq!(requests(&h.fake, "agent.get")[0]["params"]["target"], "rev");
+    let split = &requests(&h.fake, "pane.split")[0]["params"];
+    assert_eq!(split["target_pane_id"], "w1:p4");
+}
+
+#[tokio::test]
+async fn an_external_split_without_of_is_refused_before_any_mutation() {
+    let h = start(Opts {
+        env_pane: None,
+        ..Opts::default()
+    })
+    .await;
+    h.fake.reply("session.snapshot", snapshot(None));
+    h.fake
+        .reply("pane.split", pane_info("w1:p9", "w1:t1", "w1"));
+
+    let out = err(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"split": "down"}}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "invalid_params");
+    assert!(
+        out["message"].as_str().unwrap().contains("where.of"),
+        "{out}"
+    );
+    assert_eq!(count(&h.fake, "pane.split"), 0);
+    assert_eq!(count(&h.fake, "pane.report_metadata"), 0);
+}
+
+#[tokio::test]
+async fn a_verified_split_without_of_targets_the_caller_pane() {
+    let h = start(Opts::default()).await;
+    script_split(&h.fake);
+    h.fake
+        .reply_seq("pane.process_info", vec![process_info("w1:p9", 200, 200)]);
+    reads(&h.fake, &["$ "]);
+
+    ok(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"split": "down"}}),
+    )
+    .await;
+
+    let split = &requests(&h.fake, "pane.split")[0]["params"];
+    assert_eq!(split["target_pane_id"], "w1:p1");
+}
+
+#[tokio::test]
+async fn of_without_split_is_invalid_params() {
+    let h = start(Opts::default()).await;
+    for placement in [
+        json!({"of": "w1:p2"}),
+        json!({"tab": true, "of": "w1:p2"}),
+        json!({"pane": "w1:p2", "of": "w1:p2"}),
+    ] {
+        let out = err(
+            &h,
+            "herdr_run",
+            json!({"command": "ls", "where": placement}),
+        )
+        .await;
+        assert_eq!(out["code"], "invalid_params", "{placement}");
+        assert!(
+            out["message"]
+                .as_str()
+                .unwrap()
+                .contains("of only applies to split"),
+            "{out}"
+        );
+    }
+    assert!(h.fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_key_in_where_fails_the_call_and_mutates_nothing() {
+    let h = start(Opts::default()).await;
+    script_split(&h.fake);
+    h.fake
+        .reply("tab.create", tab_created("w1:t9", "w1", "w1:p9"));
+    reads(&h.fake, &["$ "]);
+    for placement in [
+        json!({"split": "down", "off": "x"}),
+        json!({"worktree": {"branch": "b", "bas": "main"}}),
+    ] {
+        let mut params = CallToolRequestParams::new("herdr_run");
+        params.arguments = json!({"command": "ls", "where": placement})
+            .as_object()
+            .cloned();
+        let result = h.client.call_tool(params).await;
+        // rmcp reports a parameter deserialization failure as an error result, not a JSON-RPC error.
+        let result = result.unwrap();
+        assert_eq!(result.is_error, Some(true), "{placement}: {result:?}");
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("unknown field"), "{placement}: {text}");
+    }
+    for method in [
+        "pane.split",
+        "tab.create",
+        "workspace.create",
+        "worktree.create",
+    ] {
+        assert_eq!(count(&h.fake, method), 0, "{method}");
+    }
 }

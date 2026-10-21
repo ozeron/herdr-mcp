@@ -60,6 +60,9 @@ async fn ae1_list_and_read_return_tree_and_bounded_tail() {
         [
             "herdr_capabilities",
             "herdr_list",
+            "herdr_mail_read",
+            "herdr_mail_send",
+            "herdr_mail_wait",
             "herdr_read",
             "herdr_wait"
         ]
