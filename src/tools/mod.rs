@@ -2,6 +2,7 @@ pub mod capabilities;
 pub mod close;
 pub mod interrupt;
 pub mod launch;
+pub mod launch_session;
 pub mod list;
 pub mod mail;
 pub mod read;

@@ -316,6 +316,10 @@ fn script_launch(fake: &FakeHerdr, spec: Launch) {
 
 /// `after_prompt` is what `agent.get` reports once the prompt has been sent.
 fn script_launch_then(fake: &FakeHerdr, spec: Launch, after_prompt: Value) {
+    script_launch_with(fake, spec, Script::Reply(after_prompt));
+}
+
+fn script_launch_with(fake: &FakeHerdr, spec: Launch, after_prompt: Script) {
     caller_ok(fake);
     fake.reply_seq(
         "session.snapshot",
@@ -336,7 +340,7 @@ fn script_launch_then(fake: &FakeHerdr, spec: Launch, after_prompt: Value) {
     fake.reply_seq("pane.process_info", fronts);
     fake.reply_seq("agent.get", spec.ready);
     fake.reply("agent.prompt", prompted_kid("working", 7));
-    fake.on_after("agent.get", "agent.prompt", Script::Reply(after_prompt));
+    fake.on_after("agent.get", "agent.prompt", after_prompt);
     fake.on(
         "events.subscribe",
         Script::Stream {
@@ -2876,4 +2880,269 @@ async fn a_long_unwrapped_line_survives_in_the_excerpt() {
     for read in requests(&h.fake, "pane.read") {
         assert_eq!(read["params"]["source"], "recent_unwrapped");
     }
+}
+
+fn assert_no_phase(out: &Value) {
+    assert!(out.get("phase").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn a_failed_agent_tag_after_start_is_provenance_failed_and_closes_the_tab() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake.on_seq(
+        "pane.report_metadata",
+        vec![
+            Script::Reply(ok_reply()),
+            Script::error("invalid_metadata_token", "bad"),
+        ],
+    );
+    h.fake.reply("tab.close", ok_reply());
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "provenance_failed");
+    assert_eq!(out["phase"], "started");
+    assert_eq!(out["pane"], "w1:p9");
+    assert_eq!(count(&h.fake, "agent.start"), 1);
+    assert_eq!(count(&h.fake, "agent.prompt"), 0);
+    assert_eq!(requests(&h.fake, "tab.close").len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_get_error_while_waiting_for_ready_closes_the_tab_without_details() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake
+        .on_seq("agent.get", vec![Script::error("pane_not_found", "gone")]);
+    h.fake.reply("tab.close", ok_reply());
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "pane_not_found");
+    assert_no_phase(&out);
+    assert_eq!(count(&h.fake, "agent.prompt"), 0);
+    let closed = requests(&h.fake, "tab.close");
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["params"]["tab_id"], "w1:t9");
+}
+
+#[tokio::test]
+async fn an_agent_that_exits_in_a_created_tab_reports_cleaned_up_true() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: vec![kid("unknown", 1, false, true)],
+        },
+    );
+    h.fake
+        .reply_seq("pane.process_info", vec![process_info("w1:p9", 200, 200)]);
+    h.fake.reply("tab.close", ok_reply());
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go", "start_timeout_ms": 20000}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_exited");
+    assert_eq!(out["phase"], "started");
+    assert_eq!(out["cleaned_up"], true);
+    assert_eq!(count(&h.fake, "tab.close"), 1);
+}
+
+#[tokio::test]
+async fn an_agent_that_exits_in_an_existing_pane_reports_cleaned_up_false_and_closes_nothing() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: vec![kid("unknown", 1, false, true)],
+        },
+    );
+    h.fake.reply_params(
+        "pane.process_info",
+        json!({"pane_id": "w1:p2"}),
+        process_info("w1:p2", 200, 200),
+    );
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go",
+               "where": {"pane": "w1:p2"}, "start_timeout_ms": 20000}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_exited");
+    assert_eq!(out["phase"], "started");
+    assert_eq!(out["pane"], "w1:p2");
+    assert_eq!(out["cleaned_up"], false);
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn a_socket_error_from_send_keys_during_dialogs_has_no_details_and_keeps_the_pane() {
+    let h = start(Opts::default()).await;
+    launch_with_dialog(&h, &[HOOK_DIALOG]);
+    h.fake.on_seq(
+        "agent.send_keys",
+        vec![Script::error("pane_not_found", "gone")],
+    );
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "codex", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "pane_not_found");
+    assert_no_phase(&out);
+    assert_eq!(count(&h.fake, "agent.send_keys"), 1);
+    assert_eq!(count(&h.fake, "agent.prompt"), 0);
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn a_prompt_refused_while_blocked_is_agent_blocked_with_phase_started_and_keeps_the_pane() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake.on_seq(
+        "agent.prompt",
+        vec![Script::error("agent_blocked", "agent is blocked")],
+    );
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_blocked");
+    assert_eq!(out["phase"], "started");
+    assert_eq!(out["pane"], "w1:p9");
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn any_other_prompt_error_passes_through_without_details_and_keeps_the_pane() {
+    let h = start(Opts::default()).await;
+    script_launch(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+    );
+    h.fake.on_seq(
+        "agent.prompt",
+        vec![Script::error("pane_not_found", "gone")],
+    );
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "pane_not_found");
+    assert_no_phase(&out);
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn a_wait_error_reports_phase_waiting_with_the_turn_and_keeps_the_pane() {
+    let h = start(Opts::default()).await;
+    script_launch_with(
+        &h.fake,
+        Launch {
+            busy: 0,
+            ready: ready_idle(),
+        },
+        Script::error("pane_not_found", "gone"),
+    );
+
+    let out = err(
+        &h,
+        "herdr_launch",
+        json!({"kind": "claude", "name": "kid", "instructions": "go", "wait": "turn"}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "agent_not_running");
+    assert_eq!(out["phase"], "waiting");
+    assert_eq!(out["pane"], "w1:p9");
+    assert_eq!(out["turn"]["after"], 7);
+    assert_no_cleanup(&h.fake);
+}
+
+#[tokio::test]
+async fn cancel_while_the_start_is_retrying_keeps_the_pane_and_reports_phase_placed() {
+    let fake = FakeHerdr::start().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let mut inner = direct_inner(&fake, ToolMode::Control, &log_dir);
+    inner.launch.start_retry_window = Duration::from_secs(30);
+    caller_ok(&fake);
+    fake.reply_seq(
+        "session.snapshot",
+        vec![snapshot(false, None), snapshot(true, None)],
+    );
+    fake.reply("tab.create", tab_created());
+    fake.reply("pane.report_metadata", ok_reply());
+    fake.on_seq(
+        "agent.start",
+        vec![Script::error("agent_pane_busy", "busy")],
+    );
+    fake.reply_seq("pane.process_info", vec![process_info("w1:p9", 200, 200)]);
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        canceller.cancel();
+    });
+
+    let result = launch::run(&inner, None, cancel, None, launch_params(json!({}))).await;
+    task.await.unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), "cancelled");
+    let details = err.details().expect("details");
+    assert_eq!(details["phase"], "placed");
+    assert_eq!(details["pane"], "w1:p9");
+    assert_no_cleanup(&fake);
 }

@@ -22,13 +22,14 @@ use crate::install::shim_path_in;
 use crate::install::status::{McpStatus, global_mode, mcp_status_for};
 use crate::mailbox::{Message, SenderFilter};
 use crate::matcher::{read_text, tail};
-use crate::place::{self, Options, Placed, Where};
+use crate::place::{self, Options, Where};
 use crate::provenance;
 use crate::providers::{Dialog, is_ready, match_dialog, mcp_args, mode_args, runtime_args};
 use crate::runtime_mode::{self, RuntimeMode};
 use crate::scope::Scope;
 use crate::server::Inner;
-use crate::tools::send::{gated_prompt, prompt_error, turn_for};
+use crate::tools::launch_session::{LaunchSession, Phase};
+use crate::tools::send::{gated_prompt, turn_for};
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::TurnFrom;
 use crate::wait::{self, Condition, Progress, Request};
@@ -155,25 +156,6 @@ pub struct LaunchParams {
     pub allow_full_access: Option<bool>,
 }
 
-/// What this call made, reported with every phase so a timeout or cancel never leads to a repeat.
-fn progress(placed: &Placed, name: &str, phase: &str) -> Value {
-    json!({
-        "phase": phase, "name": name, "pane": placed.pane_id, "tab": placed.tab_id,
-        "workspace": placed.workspace_id, "created": placed.created_json(),
-    })
-}
-
-fn cancelled(message: &str, details: Value) -> HerdrError {
-    HerdrError::detailed("cancelled", message, details)
-}
-
-fn detailed(err: HerdrError, details: Value) -> HerdrError {
-    match err {
-        HerdrError::Tool { code, message } => HerdrError::detailed(code, message, details),
-        other => other,
-    }
-}
-
 pub async fn run(
     inner: &Inner,
     client_info_name: Option<&str>,
@@ -275,83 +257,67 @@ pub async fn run(
         params.allow_full_access.unwrap_or(false),
     )?;
     let placed = place::place(client, &resolution, params.placement.as_ref(), &options).await?;
+    let mut session = LaunchSession::new(client, placed, &params.name);
 
     let injected = match injection(inner, &params.kind, control) {
         Ok(found) => found,
-        Err(err) => {
-            placed.cleanup(client).await;
-            return Err(err);
-        }
+        Err(err) => return Err(session.fail_and_clean_up(err).await),
     };
-    let mut start = AgentStartParams::new(&params.name, &params.kind, &placed.pane_id);
+    let mut start = AgentStartParams::new(&params.name, &params.kind, &session.placed().pane_id);
     start.args = mode_args.into_iter().chain(injected.args).collect();
     let cap = inner.profile.wait_cap(client_info_name);
     let (timeout, cap_note) = clamp_timeout(params.start_timeout_ms, cap, DEFAULT_TIMEOUT);
-    let started = tokio::select! {
-        started = start_agent(client, &inner.launch, &placed.pane_id, &start) => started,
-        () = cancel.cancelled() => {
-            return Err(cancelled(
-                "the client cancelled the launch before the agent started. The pane is kept: read it, then continue with herdr_send or close it",
-                progress(&placed, &params.name, "placed"),
-            ));
-        }
-    };
+    let started = session
+        .race(
+            &cancel,
+            start_agent(client, &inner.launch, &session.placed().pane_id, &start),
+        )
+        .await?;
     if let Err(err) = started {
-        placed.cleanup(client).await;
-        return Err(err);
+        return Err(session.fail_and_clean_up(err).await);
     }
+    session.advance(Phase::Started);
 
     if let Err(err) = provenance::tag_agent(
         client,
-        &placed.pane_id,
+        &session.placed().pane_id,
         provenance::parent_value(&resolution),
     )
     .await
     {
-        placed.cleanup(client).await;
-        return Err(HerdrError::detailed(
+        let failure = HerdrError::detailed(
             "provenance_failed",
             format!(
                 "the agent started but could not be tagged with its launcher ({err}); the pane is kept unless this call created it"
             ),
-            progress(&placed, &params.name, "started"),
-        ));
+            session.details(),
+        );
+        return Err(session.fail_and_clean_up(failure).await);
     }
 
-    let ready = tokio::select! {
-        ready = await_ready(
-            client,
-            &inner.launch,
-            &placed,
-            &params.kind,
-            &params.name,
-            timeout,
-        ) => ready,
-        () = cancel.cancelled() => {
-            return Err(cancelled(
-                "the client cancelled the launch while the agent was starting. The pane is kept: read it, then continue with herdr_send or close it",
-                progress(&placed, &params.name, "started"),
-            ));
-        }
-    };
+    let ready = session
+        .race(
+            &cancel,
+            await_ready(&session, &inner.launch, &params.kind, timeout),
+        )
+        .await?;
     if let Err(failure) = ready {
-        if failure.cleanup {
-            placed.cleanup(client).await;
-        }
-        return Err(failure.err);
+        return Err(match failure {
+            NotReady::Cleanup(err) => session.fail_and_clean_up(err).await,
+            NotReady::Keep(err) => session.fail_keep(err),
+        });
     }
 
     let handled = handle_dialogs(
         client,
         &inner.launch,
-        &placed,
+        &session,
         &params.kind,
-        &params.name,
         params.dialogs.unwrap_or_default(),
     )
     .await?;
 
-    let mut out = progress(&placed, &params.name, "started");
+    let mut out = session.details();
     if !handled.is_empty() {
         out["dialogs"] = json!(
             handled
@@ -397,23 +363,11 @@ pub async fn run(
         None => base_instructions,
     };
 
-    let agent = gated_prompt(client, &placed.pane_id, instructions)
+    let agent = gated_prompt(client, &session.placed().pane_id, instructions)
         .await
-        .map_err(|err| {
-            let phase = if matches!(
-                err,
-                HerdrError::Api {
-                    code: ApiErrorCode::AgentBlocked,
-                    ..
-                }
-            ) {
-                "started"
-            } else {
-                "prompted"
-            };
-            prompt_error(err, &placed.pane_id, progress(&placed, &params.name, phase))
-        })?;
+        .map_err(|err| session.fail_prompt(err))?;
     let turn = turn_for(client, &agent).await;
+    session.advance(Phase::Prompted);
     out["phase"] = json!("prompted");
     out["status"] = json!(agent.agent_status);
     out["turn"] = json!(turn);
@@ -426,7 +380,7 @@ pub async fn run(
         );
     }
     let mailbox = inner.mailbox();
-    let filter = SenderFilter::new([placed.pane_id.clone(), params.name.clone()]);
+    let filter = SenderFilter::new([session.placed().pane_id.clone(), params.name.clone()]);
     let Some(turn) = turn else {
         add_note(
             &mut out,
@@ -441,6 +395,7 @@ pub async fn run(
     if wait != LaunchWait::Turn {
         return Ok(out);
     }
+    session.advance(Phase::Waiting);
     out["phase"] = json!("waiting");
     if turn.from == TurnFrom::Blocked {
         out["matched"] = json!(true);
@@ -451,7 +406,7 @@ pub async fn run(
             out["reply"] = Value::Null;
         }
         out["excerpt"] = json!(
-            read_text(client, &placed.pane_id)
+            read_text(client, &session.placed().pane_id)
                 .await
                 .map(|text| tail(&text))
                 .unwrap_or_default()
@@ -459,7 +414,6 @@ pub async fn run(
         return Ok(out);
     }
 
-    let waiting = progress(&placed, &params.name, "waiting");
     let remaining = cap.saturating_sub(call_start.elapsed());
     if remaining.is_zero() {
         out["timed_out"] = json!(true);
@@ -469,8 +423,8 @@ pub async fn run(
         );
         return Ok(out);
     }
-    let mut details = waiting.clone();
-    details["turn"] = json!(turn);
+    session.attach_turn(json!(turn));
+    let details = session.details();
     let result = match &mail_plan {
         Some(plan) => await_reply(ReplyWait {
             client,
@@ -489,22 +443,22 @@ pub async fn run(
         })
         .await
         .map(|outcome| outcome.to_json()),
-        None => {
-            tokio::select! {
-                result = wait::wait(
+        None => session
+            .race(
+                &cancel,
+                wait::wait(
                     client,
                     &inner.wait,
-                    Request { pane: turn.pane.clone(), condition: Condition::Turn(turn.clone()), cap: remaining },
+                    Request {
+                        pane: turn.pane.clone(),
+                        condition: Condition::Turn(turn.clone()),
+                        cap: remaining,
+                    },
                     ticks,
-                ) => result.map(|outcome| outcome.to_json()),
-                () = cancel.cancelled() => {
-                    return Err(cancelled(
-                        "the client cancelled the wait; the agent keeps working. Call herdr_wait with the turn to resume",
-                        details,
-                    ));
-                }
-            }
-        }
+                ),
+            )
+            .await?
+            .map(|outcome| outcome.to_json()),
     };
     match result {
         Ok(Value::Object(fields)) => {
@@ -520,7 +474,7 @@ pub async fn run(
             Ok(out)
         }
         Ok(other) => Ok(other),
-        Err(err) => Err(detailed(err, details)),
+        Err(err) => Err(session.fail_keep(err)),
     }
 }
 
@@ -547,14 +501,9 @@ pub(crate) async fn visible_dialog(
     match_dialog(Some(kind), &read.text).map(|dialog| (dialog, tail(&read.text)))
 }
 
-fn needs_input(
-    placed: &Placed,
-    name: &str,
-    dialog: &Dialog,
-    excerpt: &str,
-    why: &str,
-) -> HerdrError {
-    let mut details = progress(placed, name, "started");
+fn needs_input(session: &LaunchSession, dialog: &Dialog, excerpt: &str, why: &str) -> HerdrError {
+    let name = session.name();
+    let mut details = session.details();
     details["dialog"] = json!({"id": dialog.id, "excerpt": excerpt});
     HerdrError::detailed(
         "agent_needs_input",
@@ -571,19 +520,17 @@ fn needs_input(
 async fn handle_dialogs(
     client: &Client,
     tuning: &LaunchTuning,
-    placed: &Placed,
+    session: &LaunchSession<'_>,
     kind: &str,
-    name: &str,
     mode: Dialogs,
 ) -> Result<Vec<(&'static Dialog, &'static str)>, HerdrError> {
-    let pane = placed.pane_id.as_str();
+    let pane = session.placed().pane_id.as_str();
     let mut handled = Vec::new();
     let mut current = visible_dialog(client, pane, kind).await;
     while let Some((dialog, excerpt)) = current {
         if mode == Dialogs::Surface {
             return Err(needs_input(
-                placed,
-                name,
+                session,
                 dialog,
                 &excerpt,
                 "and dialogs is surface",
@@ -591,8 +538,7 @@ async fn handle_dialogs(
         }
         if handled.len() >= MAX_DIALOGS {
             return Err(needs_input(
-                placed,
-                name,
+                session,
                 dialog,
                 &excerpt,
                 "after too many dialogs",
@@ -617,8 +563,7 @@ async fn handle_dialogs(
             if Instant::now() >= deadline {
                 let excerpt = current.map(|(_, excerpt)| excerpt).unwrap_or_default();
                 return Err(needs_input(
-                    placed,
-                    name,
+                    session,
                     dialog,
                     &excerpt,
                     "that is still on screen after it was answered",
@@ -777,45 +722,38 @@ async fn start_agent(
     }
 }
 
-struct NotReady {
-    err: HerdrError,
-    cleanup: bool,
+enum NotReady {
+    Cleanup(HerdrError),
+    Keep(HerdrError),
 }
 
 /// Readiness plus the probed quiet window: after first ready, the agent must show no
 /// `state_change_seq` change for `quiet_window` before it is prompted.
 async fn await_ready(
-    client: &Client,
+    session: &LaunchSession<'_>,
     tuning: &LaunchTuning,
-    placed: &Placed,
     kind: &str,
-    name: &str,
     timeout: Duration,
 ) -> Result<AgentInfo, NotReady> {
+    let client = session.client();
+    let name = session.name();
     let deadline = Instant::now() + timeout;
-    let pane = placed.pane_id.as_str();
+    let pane = session.placed().pane_id.as_str();
     let mut seen_ready = false;
     let mut last_seq = 0;
     let mut quiet_since = Instant::now();
     let started = quiet_since;
     let mut seen_group = false;
     loop {
-        let agent = client
-            .agent_get(pane)
-            .await
-            .map_err(|err| NotReady { err, cleanup: true })?;
+        let agent = client.agent_get(pane).await.map_err(NotReady::Cleanup)?;
         if agent.agent_status == AgentStatus::Blocked {
-            return Err(NotReady {
-                err: HerdrError::detailed(
-                    "agent_not_ready",
-                    format!(
-                        "{} is blocked during startup, probably on a trust or login prompt. The pane is kept: read it, answer it, then continue with herdr_send",
-                        name
-                    ),
-                    progress(placed, name, "started"),
+            return Err(NotReady::Keep(HerdrError::tool(
+                "agent_not_ready",
+                format!(
+                    "{} is blocked during startup, probably on a trust or login prompt. The pane is kept: read it, answer it, then continue with herdr_send",
+                    name
                 ),
-                cleanup: false,
-            });
+            )));
         }
         if agent.launch_pending
             && let Ok(info) = client.pane_process_info(pane).await
@@ -826,18 +764,15 @@ async fn await_ready(
             } else if info.shell_in_front_strict()
                 && (seen_group || started.elapsed() >= tuning.startup_grace)
             {
-                let mut details = progress(placed, name, "started");
-                details["cleaned_up"] = json!(placed.created.is_some());
-                return Err(NotReady {
-                    err: HerdrError::detailed(
-                        "agent_exited",
-                        format!(
-                            "{kind} exited before it was ready; check the agent's arguments and login"
-                        ),
-                        details,
+                let mut details = session.details();
+                details["cleaned_up"] = json!(session.placed().created.is_some());
+                return Err(NotReady::Cleanup(HerdrError::detailed(
+                    "agent_exited",
+                    format!(
+                        "{kind} exited before it was ready; check the agent's arguments and login"
                     ),
-                    cleanup: true,
-                });
+                    details,
+                )));
             }
         }
 
@@ -859,18 +794,14 @@ async fn await_ready(
         if now >= deadline {
             // One agent.get after a readiness timeout releases the name Herdr reserved for the start.
             let _ = client.agent_get(pane).await;
-            return Err(NotReady {
-                err: HerdrError::detailed(
-                    "agent_not_ready",
-                    format!(
-                        "{} was not ready after {} ms. The pane is kept: read it, then continue with herdr_send or close it",
-                        name,
-                        timeout.as_millis()
-                    ),
-                    progress(placed, name, "started"),
+            return Err(NotReady::Keep(HerdrError::tool(
+                "agent_not_ready",
+                format!(
+                    "{} was not ready after {} ms. The pane is kept: read it, then continue with herdr_send or close it",
+                    name,
+                    timeout.as_millis()
                 ),
-                cleanup: false,
-            });
+            )));
         }
         sleep(
             tuning

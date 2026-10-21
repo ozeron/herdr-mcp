@@ -14,6 +14,7 @@ use crate::matcher::{MatchOutcome, Matcher, POLL_INTERVAL, read_text, tail, wait
 use crate::place::{self, Options, Placed, Where};
 use crate::scope::Scope;
 use crate::server::Inner;
+use crate::tools::launch_session::LaunchSession;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 
 const PGID_OBSERVE_WINDOW: Duration = Duration::from_secs(2);
@@ -72,18 +73,16 @@ pub async fn run(
     let resolution = scope.caller().await?.clone();
     let client = scope.client();
     let placed = place::place(client, &resolution, params.placement.as_ref(), &options).await?;
+    let session = LaunchSession::new(client, placed, "");
+    let placed = session.placed();
 
     let needle = params
         .ready
         .as_ref()
         .map_or("", |ready| ready.pattern.as_str());
-    let sent = send(client, &placed, &params.command, needle).await;
-    let matcher = match sent {
+    let matcher = match send(client, placed, &params.command, needle).await {
         Ok(matcher) => matcher,
-        Err(err) => {
-            placed.cleanup(client).await;
-            return Err(err);
-        }
+        Err(err) => return Err(session.fail_and_clean_up(err).await),
     };
 
     let cap = inner.profile.wait_cap(client_info_name);

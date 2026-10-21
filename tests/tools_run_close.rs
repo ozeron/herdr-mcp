@@ -1045,3 +1045,55 @@ async fn an_unknown_key_in_where_fails_the_call_and_mutates_nothing() {
         assert_eq!(count(&h.fake, method), 0, "{method}");
     }
 }
+
+#[tokio::test]
+async fn a_readiness_read_error_keeps_the_pane_and_carries_no_details() {
+    let h = start(Opts::default()).await;
+    script_split(&h.fake);
+    h.fake.on_seq(
+        "pane.read",
+        vec![
+            Script::Reply(read_result("w1:p9", "$ ")),
+            Script::error("pane_not_found", "gone"),
+        ],
+    );
+
+    let out = err(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"split": "down"},
+               "ready": {"match": "done", "timeout_ms": 5000}}),
+    )
+    .await;
+
+    assert_eq!(out["code"], "pane_not_found");
+    assert!(out.get("phase").is_none(), "{out}");
+    assert_eq!(count(&h.fake, "pane.send_input"), 1);
+    for method in ["pane.close", "tab.close", "workspace.close"] {
+        assert_eq!(count(&h.fake, method), 0, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_send_into_an_existing_pane_closes_nothing() {
+    let h = start(Opts::default()).await;
+    script_caller(&h.fake);
+    h.fake.reply("session.snapshot", snapshot(None));
+    h.fake.reply("pane.read", read_result("w1:p2", "$ "));
+    h.fake
+        .on("pane.send_input", Script::error("pane_not_found", "gone"));
+    h.fake
+        .reply("pane.process_info", process_info("w1:p2", 100, 100));
+
+    let code = err_code(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"pane": "w1:p2"}}),
+    )
+    .await;
+
+    assert_eq!(code, "pane_not_found");
+    for method in ["pane.close", "tab.close", "workspace.close"] {
+        assert_eq!(count(&h.fake, method), 0, "{method}");
+    }
+}
