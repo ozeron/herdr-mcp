@@ -26,6 +26,10 @@ claude mcp add --scope user herdr -- {shim} {claude_flags}
 # Claude Code, project .mcp.json
 {{"mcpServers": {{"herdr": {{"command": "{shim}", "args": [{claude_json}]}}}}}}
 
+# Claude Desktop, ~/Library/Application Support/Claude/claude_desktop_config.json
+# No --client: the app cancels tool calls after about 60 s, so keep the default wait cap.
+{{"mcpServers": {{"herdr": {{"command": "{shim}", "args": ["--tools", "{tools}"]}}}}}}
+
 # Codex
 codex mcp add herdr -- {shim} {codex_flags}
 # `codex mcp add` cannot set env_vars or tool_timeout_sec. Add them by hand (see the TOML below), or run `herdr-mcp install`.

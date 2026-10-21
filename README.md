@@ -128,7 +128,11 @@ herdr-mcp print-config                 # read tools
 herdr-mcp print-config --tools control
 ```
 
-It prints `claude mcp add` and `codex mcp add` commands, a Claude `.mcp.json` entry and a Codex `config.toml` table. All of them point at the shim and nothing else under your home directory. Outside Herdr there is no caller pane, so `herdr_read` and `herdr_wait` need an explicit target. Pass `--session <name>` to pick a named Herdr session.
+It prints `claude mcp add` and `codex mcp add` commands, a Claude `.mcp.json` entry, a Claude Desktop entry and a Codex `config.toml` table. All of them point at the shim and nothing else under your home directory. Outside Herdr there is no caller pane, so `herdr_read` and `herdr_wait` need an explicit target, a split needs `where.of`, and the mail tools and `reply: mail` need a caller pane, so they are unavailable. Pass `--session <name>` to pick a named Herdr session.
+
+Desktop apps start the server without your shell's environment, so use the absolute shim path, and add an `env` entry if you set `XDG_CONFIG_HOME`. The Claude Desktop entry omits `--client`: the app cancels a tool call after about 60 s, and the default 50 s wait cap stays under it.
+
+ChatGPT's Codex tab reads the Codex `config.toml`. ChatGPT chat reaches a local server through OpenAI's Secure MCP Tunnel: run `tunnel-client` with `herdr-mcp` as its stdio command and keep the read tools.
 
 ## Logs
 

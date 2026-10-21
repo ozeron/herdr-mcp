@@ -194,6 +194,34 @@ fn print_config_defaults_to_read_and_names_only_the_shim() {
 }
 
 #[test]
+fn print_config_gives_desktop_apps_the_default_wait_cap() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_str().unwrap();
+    let out = print_config(home.path(), &[]);
+    let heading = out
+        .lines()
+        .position(|line| line.starts_with("# Claude Desktop"))
+        .expect("a Claude Desktop section");
+    let entry = out
+        .lines()
+        .skip(heading)
+        .find(|line| line.starts_with('{'))
+        .expect("a Claude Desktop JSON entry");
+    let entry: serde_json::Value = serde_json::from_str(entry).expect("valid JSON");
+    let server = &entry["mcpServers"]["herdr"];
+    assert_eq!(
+        server["command"],
+        format!("{home_path}/.local/bin/herdr-mcp"),
+        "{out}"
+    );
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["--tools", "read"]),
+        "no --client, so the wait cap stays under the app's tool timeout: {out}"
+    );
+}
+
+#[test]
 fn print_config_prints_control_only_when_asked() {
     let home = tempfile::tempdir().unwrap();
     let out = print_config(home.path(), &["--tools", "control"]);
