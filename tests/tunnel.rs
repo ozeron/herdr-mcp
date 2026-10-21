@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 use herdr_mcp::install::Io;
 use herdr_mcp::tunnel::{
-    RunOptions, Runner, StartOptions, TunnelEnv, log, parse_duration, prepare_run, setup, start,
-    status, stop, validate_tunnel_id,
+    JobState, RunOptions, Runner, StartOptions, TunnelEnv, log, parse_duration, parse_job_state,
+    prepare_run, setup, start, status, stop, validate_tunnel_id,
 };
 use tempfile::TempDir;
 
@@ -548,7 +548,7 @@ fn start_writes_the_read_plist_then_bootstraps() {
     assert!(!text.contains("--full"), "{text}");
     assert!(!text.contains("control"), "{text}");
 
-    assert_eq!(runner.verbs(), ["print", "bootstrap"]);
+    assert_eq!(runner.verbs(), ["print", "bootstrap", "print"]);
     assert_eq!(
         runner.calls()[1],
         [
@@ -575,7 +575,7 @@ fn start_boots_out_an_already_loaded_agent_first() {
     let runner = FakeRunner::new(true);
     let run = start_with(&sandbox, &runner, &StartOptions::default(), false, "");
     assert_eq!(run.code, 0, "{}{}", run.out, run.err);
-    assert_eq!(runner.verbs(), ["print", "bootout", "bootstrap"]);
+    assert_eq!(runner.verbs(), ["print", "bootout", "bootstrap", "print"]);
     assert_eq!(runner.calls()[1][1], format!("gui/501/{LABEL}"));
     let text = fs::read_to_string(sandbox.plist()).unwrap();
     assert_eq!(
@@ -918,4 +918,117 @@ fn background_commands_say_macos_only_on_other_platforms() {
             "{all}"
         );
     }
+}
+
+/// What `launchctl print` showed in the smoke test for a job that keeps exiting.
+const PRINT_FAILING: &str = "gui/501/dev.herdr-mcp.tunnel = {\n\tactive count = 0\n\tstate = spawn scheduled\n\tprogram = /x/herdr-mcp\n\truns = 2\n\tlast exit code = 1\n\tendpoints = {\n\t\t\"x\" = {\n\t\t\tstate = active\n\t\t}\n\t}\n}\n";
+const PRINT_RUNNING: &str = "gui/501/dev.herdr-mcp.tunnel = {\n\tstate = running\n\truns = 1\n\tlast exit code = (never exited)\n\tendpoints = {\n\t\t\"x\" = {\n\t\t\tstate = active\n\t\t}\n\t}\n}\n";
+
+#[test]
+fn job_state_reads_the_jobs_own_lines_not_nested_ones() {
+    assert_eq!(parse_job_state(PRINT_RUNNING), JobState::Running);
+    assert_eq!(parse_job_state(PRINT_FAILING), JobState::Failing(1));
+    assert_eq!(
+        parse_job_state("x = {\n\tstate = waiting\n\tlast exit code = 0\n}\n"),
+        JobState::Starting
+    );
+    assert_eq!(
+        parse_job_state("x = {\n\tstate = spawn scheduled\n\tlast exit code = (never exited)\n}\n"),
+        JobState::Starting
+    );
+    assert_eq!(parse_job_state(""), JobState::Loaded);
+}
+
+/// A launchd whose job dies at once: `print` reports it failing, and bootstrap leaves an error
+/// in the service log the way the real job would.
+struct DyingRunner {
+    err_log: PathBuf,
+    loaded: Mutex<bool>,
+    booted_out: Mutex<bool>,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl Runner for DyingRunner {
+    fn run(&self, _program: &Path, args: &[String]) -> std::io::Result<i32> {
+        self.calls.lock().unwrap().push(args.to_vec());
+        match args[0].as_str() {
+            "bootstrap" => {
+                *self.loaded.lock().unwrap() = true;
+                fs::write(
+                    &self.err_log,
+                    "herdr-mcp: no runtime key: set CONTROL_PLANE_API_KEY or run `herdr-mcp tunnel setup`\n",
+                )?;
+                Ok(0)
+            }
+            "bootout" => {
+                *self.loaded.lock().unwrap() = false;
+                *self.booted_out.lock().unwrap() = true;
+                Ok(0)
+            }
+            "print" if !*self.loaded.lock().unwrap() => Ok(113),
+            _ => Ok(0),
+        }
+    }
+
+    fn run_output(&self, program: &Path, args: &[String]) -> std::io::Result<(i32, String)> {
+        let code = self.run(program, args)?;
+        let out = if args[0] == "print" && code == 0 {
+            PRINT_FAILING.to_owned()
+        } else {
+            String::new()
+        };
+        Ok((code, out))
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_job_that_dies_on_start_is_unloaded_and_its_error_shown() {
+    let sandbox = Sandbox::new();
+    sandbox.ready();
+    let runner = DyingRunner {
+        err_log: sandbox.state_dir().join("tunnel.err.log"),
+        loaded: Mutex::new(false),
+        booted_out: Mutex::new(false),
+        calls: Mutex::new(Vec::new()),
+    };
+    let env = sandbox.env();
+    let run = drive(false, "", |io| {
+        start(&env, &StartOptions::default(), &runner, NOW, io)
+    });
+    assert_ne!(run.code, 0, "{}", run.err);
+    assert!(
+        run.err.contains("exited right away (exit 1)"),
+        "{}",
+        run.err
+    );
+    assert!(run.err.contains("no runtime key"), "{}", run.err);
+    assert!(
+        *runner.booted_out.lock().unwrap(),
+        "the dying job is booted out"
+    );
+    assert!(!sandbox.plist().exists(), "no plist is left behind");
+    assert!(!sandbox.state_dir().join("tunnel.state").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn status_reports_a_failing_job_with_its_last_error() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_dir()).unwrap();
+    let runner = DyingRunner {
+        err_log: sandbox.state_dir().join("tunnel.err.log"),
+        loaded: Mutex::new(true),
+        booted_out: Mutex::new(false),
+        calls: Mutex::new(Vec::new()),
+    };
+    fs::write(&runner.err_log, "first\nherdr-mcp: no runtime key\n").unwrap();
+    let env = sandbox.env();
+    let run = drive(false, "", |io| status(&env, &runner, io));
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(
+        run.out.contains("service:   failing (last exit 1") && run.out.contains("no runtime key"),
+        "{}",
+        run.out
+    );
 }

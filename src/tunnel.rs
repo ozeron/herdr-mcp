@@ -24,6 +24,8 @@ pub const LABEL: &str = "dev.herdr-mcp.tunnel";
 const AGENT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const STATE_FILE: &str = "tunnel.state";
+/// How long `start` watches a new job before trusting that it stays up.
+const START_SETTLE: Duration = Duration::from_secs(3);
 pub const CONFIRM_PHRASE: &str = "full access";
 
 #[derive(Debug, Error)]
@@ -58,6 +60,11 @@ impl TunnelError {
 pub trait Runner: Send + Sync {
     /// Runs `program` with `args` and returns its exit code.
     fn run(&self, program: &Path, args: &[String]) -> std::io::Result<i32>;
+
+    /// Like `run`, but also returns stdout. A runner that cannot capture it returns it empty.
+    fn run_output(&self, program: &Path, args: &[String]) -> std::io::Result<(i32, String)> {
+        self.run(program, args).map(|code| (code, String::new()))
+    }
 }
 
 pub struct SystemRunner;
@@ -71,6 +78,53 @@ impl Runner for SystemRunner {
             .stderr(Stdio::null())
             .status()?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    fn run_output(&self, program: &Path, args: &[String]) -> std::io::Result<(i32, String)> {
+        let output = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()?;
+        Ok((
+            output.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        ))
+    }
+}
+
+/// What `launchctl print` says about the job: whether its process is up, and its last exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobState {
+    NotLoaded,
+    Running,
+    /// Loaded, but the process is not up and last exited with this non-zero code.
+    Failing(i32),
+    /// Loaded and not failing, but not running either: about to spawn, or exited cleanly.
+    Starting,
+    /// Loaded, but `launchctl print` gave nothing to read.
+    Loaded,
+}
+
+/// Reads the job's own `state` and `last exit code` lines, which sit one tab deep; nested
+/// endpoint states sit deeper and are ignored.
+pub fn parse_job_state(print: &str) -> JobState {
+    let field = |name: &str| {
+        print.lines().find_map(|line| {
+            line.strip_prefix('\t')
+                .filter(|rest| !rest.starts_with('\t'))
+                .and_then(|rest| rest.strip_prefix(name))
+                .map(str::trim)
+        })
+    };
+    let state = field("state =");
+    if state == Some("running") {
+        return JobState::Running;
+    }
+    match field("last exit code =").and_then(|code| code.parse::<i32>().ok()) {
+        Some(code) if code != 0 => JobState::Failing(code),
+        _ if state.is_some() => JobState::Starting,
+        _ => JobState::Loaded,
     }
 }
 
@@ -652,6 +706,25 @@ fn is_loaded(env: &TunnelEnv, runner: &dyn Runner) -> Result<bool, TunnelError> 
     Ok(launchctl(env, runner, &["print", &agent_target(env)])? == 0)
 }
 
+fn job_state(env: &TunnelEnv, runner: &dyn Runner) -> Result<JobState, TunnelError> {
+    let args = vec!["print".to_owned(), agent_target(env)];
+    let (code, out) = runner
+        .run_output(&env.launchctl(), &args)
+        .map_err(|err| TunnelError::new(format!("launchctl: {err}")))?;
+    Ok(if code == 0 {
+        parse_job_state(&out)
+    } else {
+        JobState::NotLoaded
+    })
+}
+
+/// The last line the service wrote to its error log, which names why it exited.
+fn last_error(env: &TunnelEnv) -> Option<String> {
+    tail(&env.state_dir().join("tunnel.err.log"), 1)?
+        .pop()
+        .filter(|line| !line.trim().is_empty())
+}
+
 fn report(io: &mut Io, result: Result<i32, TunnelError>) -> i32 {
     match result {
         Ok(code) => code,
@@ -707,6 +780,8 @@ fn try_start(
     }
 
     private_dir(&env.state_dir())?;
+    // A fresh error log, so a failure reported below belongs to this start.
+    let _ = fs::remove_file(env.state_dir().join("tunnel.err.log"));
     let plist_path = env.plist_path();
     write_file(&plist_path, &plist(env, &run_args))?;
 
@@ -730,6 +805,13 @@ fn try_start(
             "launchctl bootstrap failed (exit {code}); nothing is running"
         )));
     }
+    if let Some(exit) = died_on_start(env, runner)? {
+        let _ = stop_service(env, runner);
+        let why = last_error(env).unwrap_or_else(|| "no error output".to_owned());
+        return Err(TunnelError::new(format!(
+            "the tunnel exited right away (exit {exit}): {why}\nNothing is left running; fix that and run `herdr-mcp tunnel start` again."
+        )));
+    }
 
     let mode = if options.full { "full" } else { "read" };
     let state = json!({
@@ -749,6 +831,24 @@ fn try_start(
         env.audit_path().display()
     );
     Ok(0)
+}
+
+/// Watches the new job for `START_SETTLE`; returns its exit code if it is already failing.
+/// A runner that cannot read `launchctl print` (`Loaded`) is not watched.
+fn died_on_start(env: &TunnelEnv, runner: &dyn Runner) -> Result<Option<i32>, TunnelError> {
+    let deadline = std::time::Instant::now() + START_SETTLE;
+    loop {
+        match job_state(env, runner)? {
+            JobState::Failing(code) => return Ok(Some(code)),
+            JobState::Loaded | JobState::NotLoaded => return Ok(None),
+            JobState::Running | JobState::Starting if std::time::Instant::now() >= deadline => {
+                return Ok(None);
+            }
+            JobState::Running | JobState::Starting => {
+                std::thread::sleep(Duration::from_millis(250))
+            }
+        }
+    }
 }
 
 /// Removes the plist and the state file, then boots the agent out. The bridge calls this from
@@ -816,15 +916,20 @@ pub fn status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> i32 {
 }
 
 fn try_status(env: &TunnelEnv, runner: &dyn Runner, io: &mut Io) -> Result<i32, TunnelError> {
-    let loaded = is_loaded(env, runner)?;
+    let job = job_state(env, runner)?;
     let state: Option<Value> = fs::read_to_string(env.state_file())
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
-    let _ = writeln!(
-        io.out,
-        "service:   {}",
-        if loaded { "running" } else { "not running" }
-    );
+    let service = match job {
+        JobState::NotLoaded => "not running".to_owned(),
+        JobState::Running | JobState::Loaded => "running".to_owned(),
+        JobState::Starting => "starting".to_owned(),
+        JobState::Failing(code) => format!(
+            "failing (last exit {code}; launchd keeps restarting it): {}",
+            last_error(env).unwrap_or_else(|| "no error output".to_owned())
+        ),
+    };
+    let _ = writeln!(io.out, "service:   {service}");
     if let Some(state) = &state {
         let when = |key: &str| state[key].as_u64().map(iso8601);
         let text = |key: &str| state[key].as_str().map(str::to_owned);
