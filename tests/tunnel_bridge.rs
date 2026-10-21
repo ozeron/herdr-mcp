@@ -591,3 +591,40 @@ fn remote_inbox_names_come_from_the_client_product() {
         "kenwoo"
     );
 }
+
+#[tokio::test]
+async fn the_audit_keeps_every_argument_but_redacts_env_values_and_mail_bodies() {
+    let r = serve(ToolMode::Control, true, None, None).await;
+    script_no_agents(&r);
+    err_code(
+        &r.h,
+        "herdr_send",
+        json!({"target": "w1:p4", "prompt": "go", "mode": "steer", "wait": "turn"}),
+    )
+    .await;
+    err_code(
+        &r.h,
+        "herdr_run",
+        json!({"command": "ls", "env": {"TOKEN": "s3cret"}, "where": {"workspace_id": "w2"}}),
+    )
+    .await;
+    ok(
+        &r.h,
+        "herdr_mail_send",
+        json!({"to": "chatgpt", "body": "private words"}),
+    )
+    .await;
+
+    let lines = r.lines();
+    assert_eq!(lines[0]["mode"], "steer");
+    assert_eq!(lines[0]["wait"], "turn");
+    assert_eq!(lines[0]["prompt"], "go");
+    assert_eq!(lines[1]["env"], json!(["TOKEN"]));
+    assert_eq!(lines[1]["where"]["workspace_id"], "w2");
+    assert_eq!(lines[2]["body_len"], 13);
+    let raw = r.raw();
+    assert!(
+        !raw.contains("s3cret") && !raw.contains("private words"),
+        "{raw}"
+    );
+}

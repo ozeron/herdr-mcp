@@ -49,6 +49,8 @@ const CONTROL_TOOLS: [&str; 6] = [
 struct Caller {
     client: Option<String>,
     mcp_session: Option<String>,
+    /// The call's arguments as sent, for the audit log.
+    args: serde_json::Map<String, serde_json::Value>,
 }
 
 tokio::task_local! {
@@ -328,6 +330,7 @@ impl HerdrMcp {
             let note = CALLER
                 .try_with(|caller| {
                     note.clone()
+                        .args(&caller.args)
                         .caller(caller.client.as_deref(), caller.mcp_session.as_deref())
                 })
                 .unwrap_or_else(|_| note.clone());
@@ -393,7 +396,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::sessions::UseParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::use_session(&params);
+        let note = Note::none();
         let result = tools::sessions::use_session(&self.inner, params).await;
         self.finish("herdr_use_session", started, note, result)
     }
@@ -444,7 +447,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::read::ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::read(&params);
+        let note = Note::none();
         let result = tools::read::run(&self.inner, params).await;
         self.finish("herdr_read", started, note, result)
     }
@@ -459,7 +462,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::wait::WaitParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::wait(&params);
+        let note = Note::none();
         let result = tools::wait::run(&self.inner, &ctx, params).await;
         self.finish("herdr_wait", started, note, result)
     }
@@ -474,7 +477,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::launch::LaunchParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::launch(&params);
+        let note = Note::none();
         let result = tools::launch::run(
             &self.inner,
             client_name(&ctx).as_deref(),
@@ -496,7 +499,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::run::RunParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::run(&params);
+        let note = Note::none();
         let result = tools::run::run(&self.inner, client_name(&ctx).as_deref(), params).await;
         self.finish("herdr_run", started, note, result)
     }
@@ -511,7 +514,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::send::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::send(&params);
+        let note = Note::none();
         let result = tools::send::run(
             &self.inner,
             client_name(&ctx).as_deref(),
@@ -532,7 +535,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::interrupt::InterruptParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::interrupt(&params);
+        let note = Note::none();
         let result = tools::interrupt::run(&self.inner, params).await;
         self.finish("herdr_interrupt", started, note, result)
     }
@@ -546,7 +549,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::close::CloseParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::close(&params);
+        let note = Note::none();
         let result = tools::close::run(&self.inner, params).await;
         self.finish("herdr_close", started, note, result)
     }
@@ -560,7 +563,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::move_pane::MoveParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::move_pane(&params);
+        let note = Note::none();
         let result = tools::move_pane::run(&self.inner, params).await;
         self.finish("herdr_move", started, note, result)
     }
@@ -575,7 +578,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::mail::SendParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::mail_send(&params);
+        let note = Note::none();
         let result = tools::mail::send(
             &self.inner,
             &self.mailbox(),
@@ -596,7 +599,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::mail::ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::mail_read(params.from.as_deref());
+        let note = Note::none();
         let result = tools::mail::read(
             &self.inner,
             &self.mailbox(),
@@ -617,7 +620,7 @@ impl HerdrMcp {
         Parameters(params): Parameters<tools::mail::WaitParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
-        let note = Note::mail_read(params.from.as_deref());
+        let note = Note::none();
         let result = tools::mail::wait(
             &self.inner,
             &self.mailbox(),
@@ -641,6 +644,7 @@ impl ServerHandler for HerdrMcp {
         let caller = Caller {
             client: client_name(&context),
             mcp_session: mcp_session(&context),
+            args: request.arguments.clone().unwrap_or_default(),
         };
         let refusal = if self.expired() {
             let start = self.inner.tunnel.as_ref().map_or("", |t| t.start_command);

@@ -1,5 +1,6 @@
 //! The tunnel audit log: one JSON line per tool call, kept apart from `herdr-mcp.log`.
 //! It deliberately holds commands, text and keys, so the file is 0600 in a 0700 directory.
+//! Every argument is kept except mail bodies, output needles and env values (see `Note::args`).
 //! Pane output, read text and tool results never reach it: a result adds only a short summary
 //! (delivery, match flags, how many characters a read returned).
 
@@ -9,10 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
 use serde_json::{Map, Value, json};
-
-use crate::tools::{close, interrupt, launch, mail, move_pane, read, run, send, sessions, wait};
 
 pub const LOG_NAME: &str = "tunnel-audit.log";
 
@@ -28,18 +26,9 @@ pub struct Note {
     extra: Map<String, Value>,
 }
 
-fn value(item: &impl Serialize) -> Value {
-    serde_json::to_value(item).unwrap_or(Value::Null)
-}
-
 impl Note {
     pub fn none() -> Self {
         Self::default()
-    }
-
-    fn target(mut self, target: Option<&str>) -> Self {
-        self.target = target.map(str::to_owned);
-        self
     }
 
     fn with(mut self, key: &str, item: Option<Value>) -> Self {
@@ -49,79 +38,37 @@ impl Note {
         self
     }
 
-    pub fn read(params: &read::ReadParams) -> Self {
-        Self::none()
-            .target(params.target.as_deref())
-            .with("lines", params.lines.map(Value::from))
-    }
-
-    pub fn wait(params: &wait::WaitParams) -> Self {
-        Self::none().target(params.target.as_deref())
-    }
-
-    pub fn mail_read(from: Option<&str>) -> Self {
-        Self::none().target(from)
-    }
-
-    pub fn run(params: &run::RunParams) -> Self {
-        Self::none().with("command", Some(json!(params.command)))
-    }
-
-    pub fn send(params: &send::SendParams) -> Self {
-        Self::none()
-            .target(Some(&params.target))
-            .with("text", params.text.as_ref().map(|t| json!(t)))
-            .with("keys", params.keys.as_ref().map(value))
-            .with("prompt", params.prompt.as_ref().map(|p| json!(p)))
-    }
-
-    pub fn launch(params: &launch::LaunchParams) -> Self {
-        Self::none()
-            .with(
-                "workspace_id",
-                params
-                    .placement
-                    .as_ref()
-                    .and_then(|w| w.workspace_id.as_ref())
-                    .map(|w| json!(w)),
-            )
-            .with("kind", Some(json!(params.kind)))
-            .with("name", Some(json!(params.name)))
-            .with(
-                "instructions",
-                params.instructions.as_ref().map(|i| json!(i)),
-            )
-            .with("runtime_mode", params.runtime_mode.as_ref().map(value))
-    }
-
-    pub fn interrupt(params: &interrupt::InterruptParams) -> Self {
-        Self::none()
-            .target(Some(&params.target))
-            .with("method", params.method.as_ref().map(value))
-    }
-
-    pub fn move_pane(params: &move_pane::MoveParams) -> Self {
-        Self::none()
-            .target(Some(&params.target))
-            .with("workspace_id", Some(json!(params.workspace_id)))
-            .with("force", params.force.map(Value::from))
-    }
-
-    pub fn close(params: &close::CloseParams) -> Self {
-        Self::none()
-            .target(Some(&params.target))
-            .with("force", params.force.map(Value::from))
-    }
-
-    /// The body is private mail: only its length is recorded.
-    pub fn mail_send(params: &mail::SendParams) -> Self {
-        Self::none()
-            .with("to", Some(json!(params.to)))
-            .with("body_len", Some(json!(params.body.len())))
-    }
-
-    pub fn use_session(params: &sessions::UseParams) -> Self {
-        Self::none().with("name", Some(json!(params.name)))
+    /// The call's arguments as sent, minus what must not be kept: a mail body and a wait or
+    /// readiness needle keep only their length, and `env` keeps only its variable names. Prompts, text, keys and commands stay,
+    /// because they are what the remote caller told this machine to do.
+    pub fn args(mut self, args: &Map<String, Value>) -> Self {
+        for (key, item) in args {
+            match key.as_str() {
+                "body" => {
+                    let len = item.as_str().map_or(0, str::len);
+                    self.extra.insert("body_len".into(), json!(len));
+                }
+                "env" => {
+                    let names: Vec<&String> = item
+                        .as_object()
+                        .map(|env| env.keys().collect())
+                        .unwrap_or_default();
+                    self.extra.insert("env".into(), json!(names));
+                }
+                "target" => self.target = item.as_str().map(str::to_owned),
+                // A wait or readiness needle is usually copied from pane output.
+                "output" | "ready" => {
+                    self.extra.insert(key.clone(), without_match(item));
+                }
+                // The result summary, set first, wins: it says what happened, not what was asked.
+                _ => {
+                    self.extra
+                        .entry(key.clone())
+                        .or_insert_with(|| item.clone());
+                }
+            }
+        }
+        self
     }
 
     /// Who called: the MCP client's name and its session, so two chats can be told apart.
@@ -165,6 +112,20 @@ impl Note {
             ))),
         )
     }
+}
+
+/// `item` with any `match` string replaced by its length.
+fn without_match(item: &Value) -> Value {
+    let mut item = item.clone();
+    if let Some(fields) = item.as_object_mut()
+        && let Some(needle) = fields.remove("match")
+    {
+        fields.insert(
+            "match_len".into(),
+            json!(needle.as_str().map_or(0, str::len)),
+        );
+    }
+    item
 }
 
 /// Result fields that say what happened without carrying pane output.
