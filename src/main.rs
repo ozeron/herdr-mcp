@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use clap::Parser;
 use herdr_mcp::caller::{CallerEnv, ProcessAncestry};
-use herdr_mcp::cli::{Args, Command, InstallArgs, PrintConfigArgs};
+use herdr_mcp::cli::{Args, Command, InstallArgs, PrintConfigArgs, TunnelCommand};
 use herdr_mcp::herdr::{SessionEnv, resolve_socket_path};
 use herdr_mcp::install::{self, Action, InstallEnv, Io, Options};
 use herdr_mcp::log::Logger;
 use herdr_mcp::print_config;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
+use herdr_mcp::tunnel::{self, TunnelEnv};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -21,6 +22,7 @@ async fn main() -> ExitCode {
     match &args.command {
         Some(Command::Install(install_args)) => return run_install(install_args),
         Some(Command::PrintConfig(print_args)) => return run_print_config(print_args),
+        Some(Command::Tunnel(tunnel_command)) => return run_tunnel(tunnel_command),
         None => {}
     }
     let socket_path =
@@ -107,6 +109,46 @@ fn run_install(args: &InstallArgs) -> ExitCode {
             err: &mut err,
         },
     );
+    let _ = out.flush();
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+fn run_tunnel(command: &TunnelCommand) -> ExitCode {
+    let env = match TunnelEnv::from_process() {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let stdin = std::io::stdin();
+    let stdin_is_tty = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let mut io = Io {
+        stdin_is_tty,
+        input: &mut input,
+        out: &mut out,
+        err: &mut err,
+    };
+    let code = match command {
+        TunnelCommand::Setup => tunnel::setup(&env, &mut io),
+        TunnelCommand::Run(args) => {
+            match tunnel::prepare_run(&env, args.session.as_deref(), &mut io) {
+                Ok(mut child) => {
+                    // exec replaces this process, so closing the pane kills tunnel-client directly.
+                    let err = std::os::unix::process::CommandExt::exec(&mut child);
+                    eprintln!("herdr-mcp: cannot start tunnel-client: {err}");
+                    1
+                }
+                Err(err) => {
+                    eprintln!("herdr-mcp: {err}");
+                    1
+                }
+            }
+        }
+    };
     let _ = out.flush();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }

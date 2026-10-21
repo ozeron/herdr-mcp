@@ -50,6 +50,24 @@ pub enum Command {
     Install(InstallArgs),
     /// Print MCP client setup snippets for external Claude and Codex
     PrintConfig(PrintConfigArgs),
+    /// Reach the read tools from ChatGPT through OpenAI's tunnel-client
+    #[command(subcommand)]
+    Tunnel(TunnelCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TunnelCommand {
+    /// Save the tunnel ID and store the runtime key in the macOS Keychain
+    Setup,
+    /// Run tunnel-client with the read tools; access lasts until it exits
+    Run(TunnelRunArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct TunnelRunArgs {
+    /// Herdr session name for the bridge
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]

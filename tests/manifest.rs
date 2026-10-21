@@ -97,8 +97,8 @@ fn every_command_runs_bin_herdr_mcp_with_a_subcommand_it_accepts() {
         .chain(tables(&doc, "panes"))
         .collect();
     assert!(
-        entries.len() >= 4,
-        "status, install, install-control, remove"
+        entries.len() >= 6,
+        "status, install, install-control, remove, tunnel-setup, tunnel"
     );
     for entry in entries {
         let id = text(entry, "id");
@@ -117,7 +117,13 @@ fn install_and_remove_open_a_pane_because_actions_have_no_tty() {
     let doc = manifest();
     let panes = tables(&doc, "panes");
     let ids: Vec<&str> = panes.iter().map(|pane| text(pane, "id")).collect();
-    for id in ["install", "install-control", "remove"] {
+    for id in [
+        "install",
+        "install-control",
+        "remove",
+        "tunnel-setup",
+        "tunnel",
+    ] {
         assert!(ids.contains(&id), "missing pane {id}");
     }
     for pane in &panes {
@@ -142,9 +148,28 @@ fn install_panes_pass_the_right_flags() {
             "install" => assert_eq!(words[1..], ["install"]),
             "install-control" => assert_eq!(words[1..], ["install", "--control"]),
             "remove" => assert_eq!(words[1..], ["install", "--remove"]),
+            "tunnel-setup" => assert_eq!(words[1..], ["tunnel", "setup"]),
+            "tunnel" => assert_eq!(words[1..], ["tunnel", "run"]),
             other => panic!("unexpected pane {other}"),
         }
     }
+}
+
+#[test]
+fn tunnel_panes_say_read_only_and_keep_errors_visible() {
+    let doc = manifest();
+    let panes = tables(&doc, "panes");
+    assert_eq!(panes.len(), 5);
+    for pane in panes.iter().filter(|p| text(p, "id").starts_with("tunnel")) {
+        assert!(text(pane, "title").starts_with("Herdr MCP: ChatGPT tunnel"));
+        assert!(text(pane, "description").contains("Read tools only"));
+        assert!(
+            argv(pane)[2].contains("read _"),
+            "press Enter to close wrapper"
+        );
+    }
+    let run = panes.iter().find(|p| text(p, "id") == "tunnel").unwrap();
+    assert!(text(run, "description").contains("while this pane is open"));
 }
 
 fn print_config(home: &std::path::Path, extra: &[&str]) -> String {

@@ -132,7 +132,27 @@ It prints `claude mcp add` and `codex mcp add` commands, a Claude `.mcp.json` en
 
 Desktop apps start the server without your shell's environment, so use the absolute shim path, and add an `env` entry if you set `XDG_CONFIG_HOME`. The Claude Desktop entry omits `--client`: the app cancels a tool call after about 60 s, and the default 50 s wait cap stays under it.
 
-ChatGPT's Codex tab reads the Codex `config.toml`. ChatGPT chat reaches a local server through OpenAI's Secure MCP Tunnel: run `tunnel-client` with `herdr-mcp` as its stdio command and keep the read tools.
+### ChatGPT
+
+ChatGPT's Codex tab reads the Codex `config.toml`, so `print-config` covers it. ChatGPT chat reaches a local server through OpenAI's tunnel-client, which keeps an outbound connection to OpenAI and runs `herdr-mcp --tools read` as its child.
+
+One time, on the OpenAI Platform:
+- create a tunnel in your ChatGPT workspace and note its `tunnel_...` ID;
+- create a restricted runtime key with Tunnels Read and Use.
+
+Then:
+1. `brew install openai/tools/tunnel-client`.
+2. Open the "Herdr MCP: ChatGPT tunnel (setup)" pane, or run `herdr-mcp tunnel setup`. It saves the ID to `~/.config/herdr-mcp/tunnel` (or under `$XDG_CONFIG_HOME`) and has the macOS Keychain prompt for the key. The key never passes through herdr-mcp.
+3. In ChatGPT: Plugins, +, Add custom MCP server, Connection: Tunnel, pick the tunnel, configure auth, accept the risk warning, Create as a plugin. A workspace admin must allow custom MCP servers, and check who in the workspace can use the connector.
+4. Open the "Herdr MCP: ChatGPT tunnel" pane, or run `herdr-mcp tunnel run [--session <name>]`. It reads `CONTROL_PLANE_API_KEY` if set, else the Keychain, and execs `tunnel-client run`.
+
+Safety:
+- Pane output goes to OpenAI and to whoever can use the connector, human shells included.
+- Pane output is untrusted input, so prompt injection can steer the model, but only read tools exist.
+- Read mode is fixed; there is no flag to expose control tools through the tunnel.
+- Access ends when you close the pane or press Ctrl-C.
+- The tunnel-client binary is not notarized: macOS may block it on first run. Allow it in System Settings, Privacy and Security.
+- Limits: 120 s per request, 10 MiB per message.
 
 ## Logs
 

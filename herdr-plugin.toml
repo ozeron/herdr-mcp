@@ -39,3 +39,17 @@ title = "Herdr MCP: remove"
 description = "Remove the herdr entries and shim that point at this plugin. Shows the plan and asks first."
 placement = "split"
 command = ["sh", "-c", "bin/herdr-mcp install --remove; printf '\\nPress Enter to close. '; read _"]
+
+[[panes]]
+id = "tunnel-setup"
+title = "Herdr MCP: ChatGPT tunnel (setup)"
+description = "Save your tunnel ID and store the runtime key in the macOS Keychain. Read tools only."
+placement = "split"
+command = ["sh", "-c", "bin/herdr-mcp tunnel setup; printf '\\nPress Enter to close. '; read _"]
+
+[[panes]]
+id = "tunnel"
+title = "Herdr MCP: ChatGPT tunnel"
+description = "Let ChatGPT use the read tools over OpenAI's tunnel. Read tools only; access lasts while this pane is open."
+placement = "split"
+command = ["sh", "-c", "bin/herdr-mcp tunnel run; printf '\\nPress Enter to close. '; read _"]
