@@ -11,7 +11,8 @@ use std::time::Duration;
 use herdr_mcp::install::Io;
 use herdr_mcp::tunnel::{
     DoctorOptions, JobState, RunOptions, Runner, StartOptions, TunnelEnv, doctor, log,
-    parse_duration, parse_job_state, prepare_run, setup, start, status, stop, validate_tunnel_id,
+    parse_duration, parse_job_state, prepare_run, restart_loaded, setup, start, status, stop,
+    validate_tunnel_id,
 };
 use tempfile::TempDir;
 
@@ -1706,4 +1707,77 @@ fn end_to_end_doctor_exits_zero_when_nothing_fails_and_non_zero_otherwise() {
     empty.fake_launchctl(false);
     let output = empty.herdr_mcp(&["tunnel", "doctor"], None);
     assert_eq!(output.status.code(), Some(1));
+}
+
+/// Reports only `loaded` labels as loaded, and fails `kickstart` with `kick_code`.
+struct LoadedOnly {
+    loaded: Vec<&'static str>,
+    kick_code: i32,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl Runner for LoadedOnly {
+    fn run(&self, _program: &Path, args: &[String]) -> std::io::Result<i32> {
+        self.calls.lock().unwrap().push(args.to_vec());
+        Ok(match args[0].as_str() {
+            "print" if self.loaded.iter().any(|label| args[1].ends_with(label)) => 0,
+            "print" => 1,
+            "kickstart" => self.kick_code,
+            _ => 0,
+        })
+    }
+}
+
+fn loaded_only(loaded: Vec<&'static str>, kick_code: i32) -> LoadedOnly {
+    LoadedOnly {
+        loaded,
+        kick_code,
+        calls: Mutex::new(Vec::new()),
+    }
+}
+
+#[test]
+fn restart_loaded_kickstarts_only_the_services_that_are_loaded() {
+    let sandbox = Sandbox::new();
+    let runner = loaded_only(vec!["dev.herdr-mcp.ngrok"], 0);
+
+    let lines = restart_loaded(&sandbox.env(), &runner);
+
+    let kicks: Vec<Vec<String>> = runner
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c[0] == "kickstart")
+        .cloned()
+        .collect();
+    assert_eq!(kicks, [["kickstart", "-k", "gui/501/dev.herdr-mcp.ngrok"]]);
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("restarted dev.herdr-mcp.ngrok"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn restart_loaded_with_nothing_loaded_does_nothing() {
+    let sandbox = Sandbox::new();
+    let runner = loaded_only(vec![], 0);
+
+    assert!(restart_loaded(&sandbox.env(), &runner).is_empty());
+    assert!(runner.calls.lock().unwrap().iter().all(|c| c[0] == "print"));
+}
+
+#[test]
+fn a_failed_kickstart_says_how_to_restart_by_hand() {
+    let sandbox = Sandbox::new();
+    let runner = loaded_only(vec![LABEL, "dev.herdr-mcp.ngrok"], 3);
+
+    let lines = restart_loaded(&sandbox.env(), &runner);
+
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines.iter().all(|l| l.contains("launchctl kickstart -k")),
+        "{lines:?}"
+    );
 }

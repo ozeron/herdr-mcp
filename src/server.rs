@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -134,6 +135,24 @@ impl Inner {
 pub struct HerdrMcp {
     inner: Arc<Inner>,
     tool_router: ToolRouter<Self>,
+    /// Tool calls running now, across every MCP session; a shutdown drains them first.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Counts one tool call for as long as it runs.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn enter(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl HerdrMcp {
@@ -155,7 +174,13 @@ impl HerdrMcp {
                 tunnel: None,
             }),
             tool_router,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// The count of tool calls running now, for draining before a shutdown.
+    pub fn in_flight(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.in_flight)
     }
 
     fn router(mode: ToolMode, tunnel: bool) -> ToolRouter<Self> {
@@ -585,6 +610,7 @@ impl ServerHandler for HerdrMcp {
             )
             .into_call_tool_result();
         }
+        let _running = InFlight::enter(&self.in_flight);
         let caller = Caller {
             client: client_name(&context),
             mcp_session: mcp_session(&context),

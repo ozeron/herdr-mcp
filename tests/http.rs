@@ -6,6 +6,7 @@ mod harness;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fake_herdr::FakeHerdr;
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
@@ -377,4 +378,67 @@ fn the_cli_has_no_flag_that_turns_auth_off() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[tokio::test]
+async fn drain_cancels_at_once_when_nothing_runs() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let running = std::sync::atomic::AtomicUsize::new(0);
+    let started = std::time::Instant::now();
+
+    http::drain(
+        &token,
+        &running,
+        Duration::from_secs(5),
+        Duration::from_millis(5),
+    )
+    .await;
+
+    assert!(token.is_cancelled());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn drain_waits_for_a_running_call_to_finish() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let finisher = Arc::clone(&running);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        finisher.store(0, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+
+    http::drain(
+        &token,
+        &running,
+        Duration::from_secs(5),
+        Duration::from_millis(5),
+    )
+    .await;
+
+    assert!(token.is_cancelled());
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(70) && took < Duration::from_secs(2),
+        "{took:?}"
+    );
+}
+
+#[tokio::test]
+async fn drain_cuts_a_call_that_outlasts_the_cap() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let running = std::sync::atomic::AtomicUsize::new(1);
+    let started = std::time::Instant::now();
+
+    http::drain(
+        &token,
+        &running,
+        Duration::from_millis(60),
+        Duration::from_millis(5),
+    )
+    .await;
+
+    assert!(token.is_cancelled());
+    assert!(started.elapsed() >= Duration::from_millis(60));
 }

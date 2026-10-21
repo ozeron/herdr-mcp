@@ -859,6 +859,27 @@ fn launchctl(env: &TunnelEnv, runner: &dyn Runner, args: &[&str]) -> Result<i32,
         .map_err(|err| TunnelError::new(format!("launchctl: {err}")))
 }
 
+/// Restarts every herdr-mcp service that is loaded, so it runs the build the shim now points
+/// at. The job drains its running calls on the signal; launchd starts it again from the plist.
+/// Returns one line per service it touched.
+pub fn restart_loaded(env: &TunnelEnv, runner: &dyn Runner) -> Vec<String> {
+    [OPENAI, NGROK]
+        .iter()
+        .filter(|service| is_loaded(env, service, runner).unwrap_or(false))
+        .map(|service| {
+            let target = agent_target(env, service);
+            match launchctl(env, runner, &["kickstart", "-k", &target]) {
+                Ok(0) => format!("service: restarted {} on the new build", service.label),
+                Ok(code) => format!(
+                    "service: could not restart {} (launchctl exit {code}); run `launchctl kickstart -k {target}`",
+                    service.label
+                ),
+                Err(err) => format!("service: could not restart {}: {err}", service.label),
+            }
+        })
+        .collect()
+}
+
 fn agent_target(env: &TunnelEnv, service: &Service) -> String {
     format!("{}/{}", env.domain(), service.label)
 }

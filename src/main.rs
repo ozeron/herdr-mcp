@@ -92,7 +92,10 @@ async fn serve_http(args: &HttpServeArgs) -> Result<(), ServeError> {
         },
     })
     .await?;
-    tokio::spawn(http::cancel_on_signal(server.shutdown.clone()));
+    tokio::spawn(http::drain_on_signal(
+        server.shutdown.clone(),
+        server.in_flight.clone(),
+    ));
     if let Ok(addr) = server.listener.local_addr() {
         eprintln!("herdr-mcp: serving MCP on http://{addr}{}", http::MCP_PATH);
     }
@@ -177,16 +180,24 @@ fn run_install(args: &InstallArgs) -> ExitCode {
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    let code = install::run(
-        &options,
-        &env,
-        &mut Io {
-            stdin_is_tty,
-            input: &mut input,
-            out: &mut out,
-            err: &mut err,
-        },
-    );
+    let mut io = Io {
+        stdin_is_tty,
+        input: &mut input,
+        out: &mut out,
+        err: &mut err,
+    };
+    let code = if action == Action::RelinkShim {
+        let (code, relinked) = install::relink_shim(&env, &mut io);
+        // A running remote service still runs the old build; restart it on the new one.
+        if relinked && let Ok(tunnel_env) = TunnelEnv::from_process() {
+            for line in tunnel::restart_loaded(&tunnel_env, &tunnel::SystemRunner) {
+                let _ = writeln!(io.out, "{line}");
+            }
+        }
+        code
+    } else {
+        install::run(&options, &env, &mut io)
+    };
     let _ = out.flush();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }

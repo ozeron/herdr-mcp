@@ -7,6 +7,8 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -172,8 +174,14 @@ pub async fn serve(
         .await
 }
 
-/// Cancels `token` on SIGTERM or SIGINT.
-pub async fn cancel_on_signal(token: CancellationToken) {
+/// How long a shutdown waits for running tool calls. Under launchd's 20 s `ExitTimeOut`, so a
+/// restart drains before it kills.
+pub const DRAIN_MAX: Duration = Duration::from_secs(10);
+const DRAIN_POLL: Duration = Duration::from_millis(100);
+
+/// On SIGTERM or SIGINT, drains running tool calls, then cancels `token`. A call still
+/// running at `DRAIN_MAX` is cut; a cut wait resumes with `herdr_wait` and its turn token.
+pub async fn drain_on_signal(token: CancellationToken, in_flight: Arc<AtomicUsize>) {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (
         signal(SignalKind::terminate()),
@@ -184,6 +192,29 @@ pub async fn cancel_on_signal(token: CancellationToken) {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+        () = token.cancelled() => return,
+    }
+    drain(&token, &in_flight, DRAIN_MAX, DRAIN_POLL).await;
+}
+
+/// Waits until no tool call runs, `max` passes or `token` is cancelled elsewhere, then
+/// cancels `token`.
+pub async fn drain(
+    token: &CancellationToken,
+    in_flight: &AtomicUsize,
+    max: Duration,
+    poll: Duration,
+) {
+    let running = in_flight.load(Ordering::SeqCst);
+    if running > 0 {
+        eprintln!("herdr-mcp: shutting down after {running} running call(s), at most {max:?}");
+    }
+    let deadline = tokio::time::Instant::now() + max;
+    while in_flight.load(Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+        && !token.is_cancelled()
+    {
+        tokio::time::sleep(poll).await;
     }
     token.cancel();
 }

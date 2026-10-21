@@ -138,15 +138,18 @@ pub fn run(options: &Options, env: &InstallEnv, io: &mut Io) -> i32 {
         Action::Status => status_report(env, io),
         Action::Install => install(options, env, io),
         Action::Remove => remove(options, env, io),
-        Action::RelinkShim => relink_shim(env, io),
+        Action::RelinkShim => relink_shim(env, io).0,
     }
 }
 
-/// Runs as the plugin's last build step; it never touches client config.
-fn relink_shim(env: &InstallEnv, io: &mut Io) -> i32 {
+/// Runs as the plugin's last build step; it never touches client config. Returns the exit
+/// code and whether the shim now points at a new build.
+pub fn relink_shim(env: &InstallEnv, io: &mut Io) -> (i32, bool) {
     let path = env.shim_path();
+    let mut relinked = false;
     let line = match shim::relink(env) {
         Ok(shim::Relink::Relinked) => {
+            relinked = true;
             format!("shim: relinked {} -> {}", path.display(), env.exe.display())
         }
         Ok(shim::Relink::Current) => "shim: current".to_owned(),
@@ -155,10 +158,10 @@ fn relink_shim(env: &InstallEnv, io: &mut Io) -> i32 {
             "shim: left as is; {} does not point at a Herdr plugin build",
             path.display()
         ),
-        Err(err) => return fail(io, err),
+        Err(err) => return (fail(io, err), false),
     };
     let _ = writeln!(io.out, "{line}");
-    0
+    (0, relinked)
 }
 
 fn fail(io: &mut Io, message: impl std::fmt::Display) -> i32 {

@@ -718,7 +718,10 @@ async fn try_run(env: &TunnelEnv, options: &RunOptions) -> Result<i32, TunnelErr
         .map_err(|err| TunnelError::new(format!("cannot start ngrok: {err}")))?;
 
     let shutdown = server.shutdown.clone();
-    tokio::spawn(http::cancel_on_signal(shutdown.clone()));
+    tokio::spawn(http::drain_on_signal(
+        shutdown.clone(),
+        server.in_flight.clone(),
+    ));
     // `herdr_tunnel_stop` and the expiry reach a foreground run through this token.
     tokio::spawn({
         let shutdown = shutdown.clone();

@@ -51,6 +51,8 @@ After a restart, Herdr resumes agents only if its own Claude and Codex integrati
 
 On Herdr 0.9.5 or later, run `herdr plugin update herdr-mcp`. Herdr builds the update into a new directory, and the plugin's last build step re-points `~/.local/bin/herdr-mcp` at it. That step only touches a shim that already points at a Herdr plugin build: it never creates one, never changes client config, and leaves a shim you pointed elsewhere alone. On older Herdr, uninstall and reinstall the plugin. Check the result with `herdr-mcp install --status`.
 
+When the shim moves to a new build, the same step restarts a running remote service (`dev.herdr-mcp.tunnel` or `dev.herdr-mcp.ngrok`) so it runs the new code too. The service lets running tool calls finish for up to 10 seconds first; a wait cut off by the restart resumes with `herdr_wait` and its turn token. ChatGPT reconnects on its own, but refresh the connector when tool options change.
+
 A plugin update replaces the binary behind the shim. Every Claude and Codex session you start afterwards runs the new code, and in control mode it does so with shell authority. Reinstall the plugin only from a revision you trust.
 
 ## Tools
