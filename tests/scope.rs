@@ -102,9 +102,9 @@ async fn a_pane_id_resolves_to_that_pane_with_its_agent() {
     let agent_pane = scope.target(pane_request("w1:p4")).await.unwrap();
     let plain_pane = scope.target(pane_request("w1:p3")).await.unwrap();
 
-    assert_eq!(agent_pane.target.as_ref().unwrap().id, "w1:p4");
+    assert_eq!(agent_pane.target.id, "w1:p4");
     assert_eq!(agent_pane.agent().unwrap().name.as_deref(), Some("rev"));
-    assert_eq!(plain_pane.target.as_ref().unwrap().id, "w1:p3");
+    assert_eq!(plain_pane.target.id, "w1:p3");
     assert!(plain_pane.agent().is_none());
     assert!(agent_pane.resolution.caller_verified);
 }
@@ -116,7 +116,7 @@ async fn an_agent_name_resolves_to_its_pane() {
 
     let found = scope.target(pane_request("rev")).await.unwrap();
 
-    assert_eq!(found.target.unwrap().id, "w1:p4");
+    assert_eq!(found.target.id, "w1:p4");
 }
 
 #[tokio::test]
@@ -131,7 +131,7 @@ async fn a_name_missing_from_the_snapshot_falls_back_to_the_alias_lookup() {
 
     let found = scope.target(pane_request("old-name")).await.unwrap();
 
-    assert_eq!(found.target.unwrap().id, "w1:p4");
+    assert_eq!(found.target.id, "w1:p4");
     assert_eq!(count(&rig.fake, "agent.get"), 1);
 }
 
@@ -161,7 +161,7 @@ async fn the_verified_callers_own_pane_is_refused_unless_allowed() {
         .unwrap();
 
     assert_eq!(err.code(), "self_target");
-    assert_eq!(allowed.target.unwrap().id, "w1:p1");
+    assert_eq!(allowed.target.id, "w1:p1");
 }
 
 #[tokio::test]
@@ -191,8 +191,8 @@ async fn a_tab_holding_the_callers_pane_is_refused_for_self_targeting() {
         .unwrap();
 
     assert_eq!(err.code(), "self_target");
-    assert_eq!(other_tab.target.unwrap().pane_ids, vec!["w1:p3", "w1:p4"]);
-    assert_eq!(allowed.target.unwrap().kind, TargetKind::Tab);
+    assert_eq!(other_tab.target.pane_ids, vec!["w1:p3", "w1:p4"]);
+    assert_eq!(allowed.target.kind, TargetKind::Tab);
 }
 
 #[tokio::test]
@@ -293,9 +293,9 @@ async fn the_provenance_guard_lists_panes_no_bridge_launched_and_force_lets_them
     assert_eq!(err.code(), "not_launched_by_bridge");
     assert!(err.to_string().contains("(w1:p2)"), "{err}");
     assert!(tab.to_string().contains("w1:p2"), "{tab}");
-    assert_eq!(forced.target.unwrap().id, "w1:p2");
-    assert_eq!(launched.target.unwrap().id, "w1:t2");
-    assert_eq!(unguarded.target.unwrap().id, "w1:p2");
+    assert_eq!(forced.target.id, "w1:p2");
+    assert_eq!(launched.target.id, "w1:t2");
+    assert_eq!(unguarded.target.id, "w1:p2");
 }
 
 #[tokio::test]
@@ -318,13 +318,10 @@ async fn an_unknown_plain_name_resolves_to_no_target_when_tolerant() {
         .on_seq("agent.get", vec![Script::error("agent_not_found", "gone")]);
     let mut scope = Scope::open(&rig.inner).unwrap();
 
-    let nobody = scope
-        .target(pane_request("scribe").tolerant())
-        .await
-        .unwrap();
-    let known = scope.target(pane_request("rev").tolerant()).await.unwrap();
+    let nobody = scope.target_or_none(pane_request("scribe")).await.unwrap();
+    let known = scope.target_or_none(pane_request("rev")).await.unwrap();
     let own = scope
-        .target(pane_request("w1:p1").tolerant())
+        .target_or_none(pane_request("w1:p1"))
         .await
         .unwrap_err();
 
@@ -343,7 +340,7 @@ async fn an_unknown_id_shaped_string_still_fails_when_tolerant() {
     let mut scope = Scope::open(&rig.inner).unwrap();
 
     for id in ["w9:p9", "w9:t1", "w9"] {
-        let err = scope.target(pane_request(id).tolerant()).await.unwrap_err();
+        let err = scope.target_or_none(pane_request(id)).await.unwrap_err();
         assert_eq!(err.code(), "target_not_found", "{id}");
     }
 }
@@ -356,7 +353,7 @@ async fn a_tolerant_lookup_still_surfaces_other_alias_lookup_errors() {
     let mut scope = Scope::open(&rig.inner).unwrap();
 
     let err = scope
-        .target(pane_request("scribe").tolerant())
+        .target_or_none(pane_request("scribe"))
         .await
         .unwrap_err();
 
@@ -378,7 +375,7 @@ async fn a_scope_over_a_known_caller_takes_only_a_snapshot() {
     let ok = scope.target(pane_request("w1:p3")).await.unwrap();
 
     assert_eq!(err.code(), "self_target");
-    assert_eq!(ok.target.unwrap().id, "w1:p3");
+    assert_eq!(ok.target.id, "w1:p3");
     assert_eq!(count(&rig.fake, "pane.process_info"), before);
     assert_eq!(count(&rig.fake, "session.snapshot"), 2);
 }

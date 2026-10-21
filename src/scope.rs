@@ -57,7 +57,6 @@ pub struct TargetRequest<'a> {
     refusal_message: &'a str,
     allow_self: bool,
     provenance: Option<bool>,
-    tolerant: bool,
     self_guard_first: bool,
 }
 
@@ -71,7 +70,6 @@ impl<'a> TargetRequest<'a> {
             refusal_message,
             allow_self: false,
             provenance: None,
-            tolerant: false,
             self_guard_first: false,
         }
     }
@@ -92,12 +90,6 @@ impl<'a> TargetRequest<'a> {
         self
     }
 
-    /// An unknown name that does not look like a Herdr ID resolves to no target.
-    pub fn tolerant(mut self) -> Self {
-        self.tolerant = true;
-        self
-    }
-
     /// Check the self-guard before the kind. The default checks the kind first.
     pub fn self_guard_first(mut self) -> Self {
         self.self_guard_first = true;
@@ -105,24 +97,36 @@ impl<'a> TargetRequest<'a> {
     }
 }
 
-/// A guarded target, with the caller and the snapshot it was resolved in.
+/// A guarded target, with the caller and the snapshot it was resolved in. `T` is `Resolved`, or
+/// `Option<Resolved>` for `target_or_none`.
 #[derive(Debug)]
-pub struct Scoped {
+pub struct Scoped<T = Resolved> {
     pub resolution: Resolution,
     pub snapshot: SessionSnapshot,
-    /// `None` only for a tolerant request whose name matched nothing.
-    pub target: Option<Resolved>,
+    pub target: T,
 }
 
-impl Scoped {
-    /// The target of a request that is not tolerant, which always resolves one.
-    pub fn required(&self) -> &Resolved {
-        self.target.as_ref().expect("target is required")
-    }
+/// A scoped target that may hold no pane.
+pub trait MaybeResolved {
+    fn resolved(&self) -> Option<&Resolved>;
+}
 
+impl MaybeResolved for Resolved {
+    fn resolved(&self) -> Option<&Resolved> {
+        Some(self)
+    }
+}
+
+impl MaybeResolved for Option<Resolved> {
+    fn resolved(&self) -> Option<&Resolved> {
+        self.as_ref()
+    }
+}
+
+impl<T: MaybeResolved> Scoped<T> {
     /// The agent in the target pane, when the target is a pane with one.
     pub fn agent(&self) -> Option<&AgentInfo> {
-        let target = self.target.as_ref()?;
+        let target = self.target.resolved()?;
         if target.kind != TargetKind::Pane {
             return None;
         }
@@ -194,36 +198,30 @@ impl<'a> Scope<'a> {
     /// guards the target.
     pub async fn target(&mut self, request: TargetRequest<'_>) -> Result<Scoped, HerdrError> {
         let (snapshot, resolution) = self.snapshot_and_caller().await?;
+        let target = guard::resolve_target(&self.client, &snapshot, request.target).await?;
+        check(&request, &resolution, &snapshot, &target)?;
+        Ok(Scoped {
+            resolution,
+            snapshot,
+            target,
+        })
+    }
 
+    /// Like `target`, but an unknown name that does not look like a Herdr ID resolves to no
+    /// target.
+    pub async fn target_or_none(
+        &mut self,
+        request: TargetRequest<'_>,
+    ) -> Result<Scoped<Option<Resolved>>, HerdrError> {
+        let (snapshot, resolution) = self.snapshot_and_caller().await?;
         let target = match guard::resolve_target(&self.client, &snapshot, request.target).await {
-            Ok(target) => Some(target),
-            Err(err) if request.tolerant && tolerated(&err, request.target) => None,
+            Ok(target) => {
+                check(&request, &resolution, &snapshot, &target)?;
+                Some(target)
+            }
+            Err(err) if tolerated(&err, request.target) => None,
             Err(err) => return Err(err),
         };
-        if let Some(target) = &target {
-            let guard_pane = resolution.guard_target.as_deref();
-            let kind = || {
-                if request.accept.contains(&target.kind) {
-                    Ok(())
-                } else {
-                    Err(HerdrError::tool(
-                        request.refusal_code,
-                        request.refusal_message,
-                    ))
-                }
-            };
-            let own = || guard::self_guard(guard_pane, target, request.allow_self);
-            if request.self_guard_first {
-                own()?;
-                kind()?;
-            } else {
-                kind()?;
-                own()?;
-            }
-            if let Some(force) = request.provenance {
-                guard::provenance_guard(&snapshot, target, force)?;
-            }
-        }
         Ok(Scoped {
             resolution,
             snapshot,
@@ -273,6 +271,42 @@ impl<'a> Scope<'a> {
             snapshot,
         })
     }
+}
+
+fn check(
+    request: &TargetRequest<'_>,
+    resolution: &Resolution,
+    snapshot: &SessionSnapshot,
+    target: &Resolved,
+) -> Result<(), HerdrError> {
+    let kind = || {
+        if request.accept.contains(&target.kind) {
+            Ok(())
+        } else {
+            Err(HerdrError::tool(
+                request.refusal_code,
+                request.refusal_message,
+            ))
+        }
+    };
+    let own = || {
+        guard::self_guard(
+            resolution.guard_target.as_deref(),
+            target,
+            request.allow_self,
+        )
+    };
+    if request.self_guard_first {
+        own()?;
+        kind()?;
+    } else {
+        kind()?;
+        own()?;
+    }
+    if let Some(force) = request.provenance {
+        guard::provenance_guard(snapshot, target, force)?;
+    }
+    Ok(())
 }
 
 fn tolerated(err: &HerdrError, name: &str) -> bool {

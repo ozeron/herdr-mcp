@@ -223,7 +223,7 @@ fn stale() -> HerdrError {
 }
 
 /// Runs one socket step within `min(the client's timeout, the time left before deadline)`, so a
-/// stalled Herdr cannot push a wait past its cap. A poll that wakes at the deadline still gets
+/// stalled Herdr cannot push a wait more than `LAST_LOOK` past its cap at each step. A poll that wakes at the deadline still gets
 /// `LAST_LOOK` for its final read, instead of failing with 0 ms.
 async fn bounded<T>(
     client: &Client,
@@ -566,15 +566,18 @@ async fn wait_for_output(
     let last = Mutex::new(first.clone());
     let timeout = deadline.saturating_duration_since(Instant::now());
     let outcome = wait_for_match(&matcher, timeout, tuning.pane_interval, || async {
-        // The matcher's last poll can wake right at the deadline, when a read has no time left.
-        if Instant::now() >= deadline {
-            return Ok(last.lock().unwrap().clone());
+        // The matcher's last poll can wake right at the deadline; a read that times out then
+        // falls back to the last text.
+        match bounded(client, deadline, read_text(client, pane)).await {
+            Ok(text) => {
+                *last.lock().unwrap() = text.clone();
+                Ok(text)
+            }
+            Err(err) if err.code() == "herdr_timeout" && Instant::now() >= deadline => {
+                Ok(last.lock().unwrap().clone())
+            }
+            Err(err) => Err(closed(err)),
         }
-        let text = bounded(client, deadline, read_text(client, pane))
-            .await
-            .map_err(closed)?;
-        *last.lock().unwrap() = text.clone();
-        Ok::<_, HerdrError>(text)
     })
     .await?;
     let (matched, excerpt) = match outcome {

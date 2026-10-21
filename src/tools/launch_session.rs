@@ -40,8 +40,9 @@ impl Phase {
     }
 }
 
-/// The pane a call placed, with the phase it has reached. Every failure after placement leaves
-/// through one of its exits, so what is cleaned up and what a failure reports live here.
+/// The pane a call placed, with the phase it has reached. Failures in the launch steps leave
+/// through one of its exits, so what is cleaned up and what a failure reports live here. Errors
+/// from `handle_dialogs` and `take_reply` propagate as they are, and the pane is kept.
 pub struct LaunchSession<'a> {
     client: &'a Client,
     placed: Placed,

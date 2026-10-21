@@ -6,7 +6,7 @@ mod harness;
 use std::time::Duration;
 
 use fake_herdr::FakeHerdr;
-use harness::{count, snapshot};
+use harness::snapshot;
 use herdr_mcp::caller::{Caller, Resolution};
 use herdr_mcp::delegation::{
     Basis, MailPlan, ReplyOutcome, ReplyWait, await_reply, mail_plan, reply_paragraph,
@@ -342,7 +342,6 @@ fn snap() -> SessionSnapshot {
 
 #[tokio::test]
 async fn the_plan_refuses_an_unverified_caller_before_anything_else() {
-    let fake = FakeHerdr::start().await;
     for res in [
         resolution(None, false),
         resolution(Some("w1:p1"), false),
@@ -352,7 +351,6 @@ async fn the_plan_refuses_an_unverified_caller_before_anything_else() {
         assert_eq!(err.code(), "invalid_params");
         assert!(err.to_string().contains("verified caller"), "{err}");
     }
-    assert!(fake.requests().is_empty());
 }
 
 #[tokio::test]
@@ -368,11 +366,4 @@ async fn the_plan_mails_the_callers_name_or_pane() {
     let named = mail_plan("codex", true, &snap(), &resolution(Some("w1:p4"), true)).unwrap();
     assert_eq!(named.parent, "rev");
     assert!(reply_paragraph("rev").contains("herdr_mail_send call to rev."));
-}
-
-#[tokio::test]
-async fn a_plan_check_touches_nothing_on_the_socket() {
-    let rig = Rig::new().await;
-    let _ = mail_plan("codex", true, &snap(), &resolution(Some("w1:p1"), true)).unwrap();
-    assert_eq!(count(&rig.fake, "agent.get"), 0);
 }

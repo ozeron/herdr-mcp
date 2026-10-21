@@ -29,7 +29,7 @@ pub async fn run(inner: &Inner, params: CloseParams) -> Result<Value, HerdrError
     .provenance(params.force.unwrap_or(false));
     let scoped = scope.target(request).await?;
     let client = scope.client();
-    let target = scoped.required();
+    let target = &scoped.target;
 
     let kind = match target.kind {
         TargetKind::Pane => {

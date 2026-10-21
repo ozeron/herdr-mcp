@@ -288,7 +288,7 @@ async fn existing(
     )
     .refusal_code("invalid_params");
     let scoped = scope.target(request).await?;
-    let resolved = scoped.required();
+    let resolved = &scoped.target;
     let snapshot = &scoped.snapshot;
     let info = client.pane_process_info(&resolved.id).await?;
     if !info.shell_in_front_strict() {

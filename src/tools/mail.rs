@@ -97,13 +97,12 @@ pub async fn send(
         &[TargetKind::Pane],
         "herdr_mail_send takes a pane ID or an agent name",
     )
-    .allow_self(params.allow_self.unwrap_or(false))
-    .tolerant();
+    .allow_self(params.allow_self.unwrap_or(false));
     let Scoped {
         resolution,
         snapshot,
         target,
-    } = scope.target(request).await?;
+    } = scope.target_or_none(request).await?;
     let client = scope.client();
     let agent_name = |pane: &str| {
         snapshot

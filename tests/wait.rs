@@ -1022,6 +1022,106 @@ async fn a_stalled_herdr_cannot_push_a_turn_wait_past_its_cap() {
     }
 }
 
+const SLOW: Duration = Duration::from_millis(30);
+
+fn slow(method: &str, fake: &FakeHerdr, result: Value) {
+    fake.on_seq(
+        method,
+        vec![Script::Delayed(SLOW, Box::new(Script::Reply(result)))],
+    );
+}
+
+fn output_for(needle: &str) -> Condition {
+    Condition::Output {
+        needle: needle.into(),
+        after_command: None,
+    }
+}
+
+#[tokio::test]
+async fn an_output_wait_whose_last_poll_lands_at_the_deadline_times_out_cleanly() {
+    let fake = FakeHerdr::start().await;
+    slow("pane.read", &fake, read_result("$ building\n"));
+
+    let out = run_ok(&fake, &fast(), request(output_for("ready"), 60)).await;
+
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+}
+
+#[tokio::test]
+async fn an_output_read_that_outlasts_its_last_look_returns_the_last_text_at_the_deadline() {
+    let fake = FakeHerdr::start().await;
+    fake.on_seq(
+        "pane.read",
+        vec![Script::Delayed(
+            Duration::from_millis(200),
+            Box::new(Script::Reply(read_result("$ building\n"))),
+        )],
+    );
+
+    let out = run_ok(&fake, &fast(), request(output_for("ready"), 300)).await;
+
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+    assert!(out["excerpt"].as_str().unwrap().contains("building"));
+}
+
+#[tokio::test]
+async fn output_first_printed_in_the_read_made_at_the_deadline_matches() {
+    let fake = FakeHerdr::start().await;
+    fake.on_seq(
+        "pane.read",
+        vec![
+            Script::Delayed(SLOW, Box::new(Script::Reply(read_result("$ start\n")))),
+            Script::Delayed(
+                SLOW,
+                Box::new(Script::Reply(read_result("$ start\nready\n"))),
+            ),
+        ],
+    );
+
+    let out = run_ok(&fake, &fast(), request(output_for("ready"), 60)).await;
+
+    assert_eq!(out["matched"], true, "{out}");
+    assert_eq!(out["timed_out"], false);
+    assert!(out["excerpt"].as_str().unwrap().contains("ready"));
+}
+
+#[tokio::test]
+async fn a_process_exit_wait_whose_last_poll_lands_at_the_deadline_times_out_cleanly() {
+    let fake = FakeHerdr::start().await;
+    slow("pane.process_info", &fake, process_info(PANE, 200, 777));
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(Condition::ProcessExit { pgid: Some(777) }, 60),
+    )
+    .await;
+
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+}
+
+#[tokio::test]
+async fn a_turn_wait_whose_last_poll_lands_at_the_deadline_times_out_cleanly() {
+    let fake = FakeHerdr::start().await;
+    hold_stream(&fake, vec![]);
+    slow("agent.get", &fake, info("working", 41, None));
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(Condition::Turn(token(41, TurnFrom::Working)), 60),
+    )
+    .await;
+
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+    assert_eq!(out["status"], "working");
+}
+
 #[tokio::test]
 async fn progress_ticks_arrive_in_increasing_order() {
     let fake = FakeHerdr::start().await;
