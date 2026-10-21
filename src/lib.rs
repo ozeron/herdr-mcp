@@ -5,6 +5,7 @@ pub mod delegation;
 pub mod env;
 pub mod guard;
 pub mod herdr;
+pub mod http;
 pub mod install;
 pub mod log;
 pub mod mailbox;

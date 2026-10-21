@@ -59,6 +59,37 @@ pub enum Command {
     /// Reach the read tools from ChatGPT through OpenAI's tunnel-client
     #[command(subcommand)]
     Tunnel(TunnelCommand),
+    /// Serve MCP over Streamable HTTP on localhost, behind a bearer-token check
+    #[command(hide = true)]
+    HttpServe(HttpServeArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct HttpServeArgs {
+    /// Loopback address to listen on
+    #[arg(long, default_value = "127.0.0.1:0")]
+    pub bind: std::net::SocketAddr,
+    /// URL clients reach the server at; defaults to http://<bind>
+    #[arg(long)]
+    pub public_url: Option<String>,
+    /// Herdr session name; overrides HERDR_SOCKET_PATH and HERDR_SESSION
+    #[arg(long)]
+    pub session: Option<String>,
+    /// MCP client this bridge is installed for; sets the wait cap
+    #[arg(long, value_enum)]
+    pub client: Option<ClientKind>,
+    /// Override the wait cap in milliseconds
+    #[arg(long)]
+    pub max_wait_ms: Option<u64>,
+    /// Tools to register
+    #[arg(long, value_enum, default_value = "read")]
+    pub tools: ToolMode,
+    /// Tunnel mode: audit log and `herdr_tunnel_stop`
+    #[arg(long)]
+    pub tunnel: bool,
+    /// Stop the tunnel at this Unix time (seconds); needs --tunnel
+    #[arg(long, requires = "tunnel")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]

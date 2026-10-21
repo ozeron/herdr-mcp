@@ -5,16 +5,20 @@ use std::time::Duration;
 
 use clap::Parser;
 use herdr_mcp::caller::{CallerEnv, ProcessAncestry};
-use herdr_mcp::cli::{Args, Command, InstallArgs, PrintConfigArgs, TunnelCommand};
+use herdr_mcp::cli::ToolMode;
+use herdr_mcp::cli::{Args, Command, HttpServeArgs, InstallArgs, PrintConfigArgs, TunnelCommand};
 use herdr_mcp::herdr::{SessionEnv, resolve_socket_path};
+use herdr_mcp::http::{self, DenyAll, HttpOptions};
 use herdr_mcp::install::{self, Action, InstallEnv, Io, Options};
 use herdr_mcp::log::Logger;
 use herdr_mcp::print_config;
+use herdr_mcp::profile::ClientKind;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
 use herdr_mcp::tunnel::{self, RunOptions, StartOptions, SystemRunner, TunnelConfig, TunnelEnv};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,44 +27,20 @@ async fn main() -> ExitCode {
         Some(Command::Install(install_args)) => return run_install(install_args),
         Some(Command::PrintConfig(print_args)) => return run_print_config(print_args),
         Some(Command::Tunnel(tunnel_command)) => return run_tunnel(tunnel_command),
+        Some(Command::HttpServe(http_args)) => return run_http_serve(http_args).await,
         None => {}
     }
-    let socket_path =
-        match resolve_socket_path(args.session.as_deref(), &SessionEnv::from_process()) {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!("herdr-mcp: {err}");
-                return ExitCode::from(2);
-            }
-        };
-    let logger = socket_path
-        .parent()
-        .map(|dir| dir.join("herdr-mcp"))
-        .and_then(|dir| Logger::to_dir(dir).ok())
-        .unwrap_or_else(Logger::stderr_only);
-    let tunnel = if args.tunnel {
-        match TunnelConfig::from_process(args.expires_at) {
-            Ok(config) => Some(config),
-            Err(err) => {
-                eprintln!("herdr-mcp: {err}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        None
+    let server = match build_server(
+        args.session.as_deref(),
+        args.client,
+        args.max_wait_ms,
+        args.tools,
+        args.tunnel,
+        args.expires_at,
+    ) {
+        Ok(server) => server,
+        Err(code) => return code,
     };
-    let mut server = HerdrMcp::new(BridgeConfig {
-        socket_path,
-        profile: Profile::new(args.client, args.max_wait_ms.map(Duration::from_millis)),
-        mode: args.tools,
-        ancestry: Arc::new(ProcessAncestry),
-        caller_env: CallerEnv::from_process(),
-        logger,
-        install_env: InstallEnv::from_process().ok(),
-    });
-    if let Some(tunnel) = tunnel {
-        server = server.with_tunnel(tunnel);
-    }
     match server.serve(stdio()).await {
         Ok(running) => {
             let _ = running.waiting().await;
@@ -71,6 +51,100 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn run_http_serve(args: &HttpServeArgs) -> ExitCode {
+    let options = match HttpOptions::new(args.bind, args.public_url.as_deref()) {
+        Ok(options) => options,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let listener = match http::bind_loopback(args.bind).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let server = match build_server(
+        args.session.as_deref(),
+        args.client,
+        args.max_wait_ms,
+        args.tools,
+        args.tunnel,
+        args.expires_at,
+    ) {
+        Ok(server) => server,
+        Err(code) => return code,
+    };
+    let shutdown = CancellationToken::new();
+    // No auth is configured yet, so every request to /mcp is refused.
+    let router = match http::mcp_router(server, &options, Arc::new(DenyAll), shutdown.clone()) {
+        Ok(router) => router,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    tokio::spawn(http::cancel_on_signal(shutdown.clone()));
+    if let Ok(addr) = listener.local_addr() {
+        eprintln!("herdr-mcp: serving MCP on http://{addr}{}", http::MCP_PATH);
+    }
+    match http::serve(listener, router, shutdown).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("herdr-mcp: http server failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn build_server(
+    session: Option<&str>,
+    client: Option<ClientKind>,
+    max_wait_ms: Option<u64>,
+    tools: ToolMode,
+    tunnel: bool,
+    expires_at: Option<u64>,
+) -> Result<HerdrMcp, ExitCode> {
+    let socket_path = match resolve_socket_path(session, &SessionEnv::from_process()) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("herdr-mcp: {err}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    let logger = socket_path
+        .parent()
+        .map(|dir| dir.join("herdr-mcp"))
+        .and_then(|dir| Logger::to_dir(dir).ok())
+        .unwrap_or_else(Logger::stderr_only);
+    let tunnel = if tunnel {
+        match TunnelConfig::from_process(expires_at) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                eprintln!("herdr-mcp: {err}");
+                return Err(ExitCode::from(2));
+            }
+        }
+    } else {
+        None
+    };
+    let mut server = HerdrMcp::new(BridgeConfig {
+        socket_path,
+        profile: Profile::new(client, max_wait_ms.map(Duration::from_millis)),
+        mode: tools,
+        ancestry: Arc::new(ProcessAncestry),
+        caller_env: CallerEnv::from_process(),
+        logger,
+        install_env: InstallEnv::from_process().ok(),
+    });
+    if let Some(tunnel) = tunnel {
+        server = server.with_tunnel(tunnel);
+    }
+    Ok(server)
 }
 
 fn run_print_config(args: &PrintConfigArgs) -> ExitCode {
