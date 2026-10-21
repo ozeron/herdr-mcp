@@ -415,3 +415,57 @@ async fn an_unwritable_audit_log_does_not_fail_the_call() {
     let result = call(&r.h, "herdr_sessions", json!({})).await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
 }
+
+/// Starts the real binary over stdio with `env`, sends initialize and returns its reply.
+fn initialize_binary(args: &[&str], env: &[(&str, &Path)]) -> Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_herdr-mcp"));
+    cmd.args(args)
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn a_tunnel_bridge_ignores_an_inherited_caller_pane() {
+    let dir = TempDir::new().unwrap();
+    let pane = Path::new("w9:p9");
+    let state = dir.path().join("state");
+    let socket = dir.path().join("herdr.sock");
+    let env = [
+        ("HERDR_PANE_ID", pane),
+        ("XDG_STATE_HOME", state.as_path()),
+        ("HERDR_SOCKET_PATH", socket.as_path()),
+    ];
+
+    let tunnel = initialize_binary(&["--tools", "read", "--tunnel"], &env);
+    let local = initialize_binary(&["--tools", "read"], &env);
+
+    let text = |reply: &Value| reply["result"]["instructions"].as_str().unwrap().to_owned();
+    assert!(
+        text(&tunnel).contains("You have no caller pane"),
+        "{tunnel}"
+    );
+    assert!(!text(&local).contains("You have no caller pane"), "{local}");
+}

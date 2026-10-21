@@ -53,6 +53,13 @@ pub fn build_bridge(options: BridgeOptions) -> Result<HerdrMcp, ServeError> {
         .map(|dir| dir.join("herdr-mcp"))
         .and_then(|dir| Logger::to_dir(dir).ok())
         .unwrap_or_else(Logger::stderr_only);
+    // A tunnel's caller is remote and never has a pane, even when the bridge was started from
+    // a shell inside one and inherited its HERDR_PANE_ID.
+    let caller_env = if options.tunnel.is_some() {
+        CallerEnv::default()
+    } else {
+        CallerEnv::from_process()
+    };
     let mut server = HerdrMcp::new(BridgeConfig {
         socket_path,
         profile: Profile::new(
@@ -61,7 +68,7 @@ pub fn build_bridge(options: BridgeOptions) -> Result<HerdrMcp, ServeError> {
         ),
         mode: options.tools,
         ancestry: Arc::new(ProcessAncestry),
-        caller_env: CallerEnv::from_process(),
+        caller_env,
         logger,
         install_env: InstallEnv::from_process().ok(),
     });

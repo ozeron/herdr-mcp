@@ -53,6 +53,14 @@ pub const NGROK: Service = Service {
     start_command: "herdr-mcp tunnel ngrok start",
 };
 
+/// The hand-made ngrok bridge script some setups run under launchd. herdr-mcp only restarts it
+/// on update; it does not start, stop or configure it.
+pub const SCRIPT_BRIDGE: Service = Service {
+    label: "dev.herdr-mcp.bridge",
+    stem: "bridge",
+    start_command: "launchctl kickstart gui/$UID/dev.herdr-mcp.bridge",
+};
+
 impl Service {
     fn state_name(&self) -> String {
         format!("{}.state", self.stem)
@@ -863,7 +871,7 @@ fn launchctl(env: &TunnelEnv, runner: &dyn Runner, args: &[&str]) -> Result<i32,
 /// at. The job drains its running calls on the signal; launchd starts it again from the plist.
 /// Returns one line per service it touched.
 pub fn restart_loaded(env: &TunnelEnv, runner: &dyn Runner) -> Vec<String> {
-    [OPENAI, NGROK]
+    [OPENAI, NGROK, SCRIPT_BRIDGE]
         .iter()
         .filter(|service| is_loaded(env, service, runner).unwrap_or(false))
         .map(|service| {
