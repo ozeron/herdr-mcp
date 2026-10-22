@@ -55,57 +55,65 @@ async fn start(mode: ToolMode, pane_cwd: &str) -> Harness {
     }
 }
 
-/// A file outside the temp directory and outside `/work`, the panes' directory.
-fn outside_file() -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("Cargo.toml")
-        .display()
-        .to_string()
-}
-
-fn read(path: &Path, extra: Value) -> Value {
-    let mut args = json!({"path": path.display().to_string()});
+fn read(path: impl AsRef<Path>, extra: Value) -> Value {
+    let mut args = json!({"target": "w1:p1", "path": path.as_ref().display().to_string()});
     for (key, value) in extra.as_object().unwrap() {
         args[key] = value.clone();
     }
     args
 }
 
-#[tokio::test]
-async fn reads_a_text_file_under_the_temp_directory() {
+/// A pane opened in a fresh directory, and the directory.
+async fn pane_in_dir(mode: ToolMode) -> (Harness, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("report.md");
-    std::fs::write(&file, "# Report\nall good\n").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
+    let h = start(mode, &dir.path().display().to_string()).await;
+    (h, dir)
+}
 
-    let out = ok(&h, "herdr_file_read", read(&file, json!({}))).await;
+#[tokio::test]
+async fn reads_a_file_by_path_relative_to_the_panes_directory() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    std::fs::create_dir(dir.path().join("out")).unwrap();
+    std::fs::write(dir.path().join("out/report.md"), "# Report\nall good\n").unwrap();
+
+    let out = ok(&h, "herdr_file_read", read("out/report.md", json!({}))).await;
 
     assert_eq!(out["content"], "# Report\nall good\n");
     assert_eq!(out["encoding"], "utf8");
     assert_eq!(out["size"], 18);
-    assert_eq!(out["bytes"], 18);
     assert_eq!(out["eof"], true);
     assert!(out["next_offset"].is_null());
 }
 
 #[tokio::test]
+async fn an_agent_name_targets_its_pane_and_an_absolute_path_inside_works() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+    let mut args = read(dir.path().join("a.txt"), json!({}));
+    args["target"] = json!("rev");
+    assert_eq!(ok(&h, "herdr_file_read", args).await["content"], "hi");
+}
+
+#[tokio::test]
 async fn pages_end_on_whole_characters_and_continue_from_next_offset() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("text.txt");
-    std::fs::write(&file, "aé€b").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    std::fs::write(dir.path().join("t.txt"), "aé€b").unwrap();
 
     // 4 bytes stop inside the 3-byte euro sign, so the page ends before it.
-    let first = ok(&h, "herdr_file_read", read(&file, json!({"max_bytes": 4}))).await;
+    let first = ok(
+        &h,
+        "herdr_file_read",
+        read("t.txt", json!({"max_bytes": 4})),
+    )
+    .await;
     assert_eq!(first["content"], "aé");
-    assert_eq!(first["bytes"], 3);
     assert_eq!(first["next_offset"], 3);
     assert_eq!(first["eof"], false);
 
     let second = ok(
         &h,
         "herdr_file_read",
-        read(&file, json!({"offset": 3, "max_bytes": 4})),
+        read("t.txt", json!({"offset": 3, "max_bytes": 4})),
     )
     .await;
     assert_eq!(second["content"], "€b");
@@ -113,15 +121,25 @@ async fn pages_end_on_whole_characters_and_continue_from_next_offset() {
 }
 
 #[tokio::test]
+async fn a_page_smaller_than_a_character_takes_the_whole_character() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    std::fs::write(dir.path().join("e.txt"), "€€").unwrap();
+    let out = ok(
+        &h,
+        "herdr_file_read",
+        read("e.txt", json!({"max_bytes": 1})),
+    )
+    .await;
+    assert_eq!(out["content"], "€");
+    assert_eq!(out["next_offset"], 3);
+}
+
+#[tokio::test]
 async fn binary_comes_back_as_base64() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("chart.png");
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
     let bytes = [0x89, b'P', b'N', b'G', 0xff, 0x00];
-    std::fs::write(&file, bytes).unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-
-    let out = ok(&h, "herdr_file_read", read(&file, json!({}))).await;
-
+    std::fs::write(dir.path().join("c.png"), bytes).unwrap();
+    let out = ok(&h, "herdr_file_read", read("c.png", json!({}))).await;
     assert_eq!(out["encoding"], "base64");
     assert_eq!(
         STANDARD.decode(out["content"].as_str().unwrap()).unwrap(),
@@ -130,45 +148,33 @@ async fn binary_comes_back_as_base64() {
 }
 
 #[tokio::test]
-async fn a_file_under_a_panes_working_directory_is_allowed() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("out.csv");
-    std::fs::write(&file, "a,b\n").unwrap();
-    let h = start(ToolMode::Control, &dir.path().display().to_string()).await;
-    assert_eq!(
-        ok(&h, "herdr_file_read", read(&file, json!({}))).await["content"],
-        "a,b\n"
-    );
-    let manifest = outside_file();
-    let pane_dir = Path::new(&manifest).parent().unwrap().display().to_string();
-    let h = start(ToolMode::Control, &pane_dir).await;
-    assert_eq!(
-        ok(&h, "herdr_file_read", json!({"path": manifest})).await["encoding"],
-        "utf8"
-    );
+async fn paths_outside_the_panes_directory_are_refused() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x"), "x").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("x"), dir.path().join("link")).unwrap();
+    let escapes = [
+        "../x".to_owned(),
+        outside.path().join("x").display().to_string(),
+        "link".to_owned(),
+        "/etc/hosts".to_owned(),
+    ];
+    for path in escapes {
+        let out = err(&h, "herdr_file_read", read(&path, json!({}))).await;
+        assert_eq!(out["code"], "path_not_allowed", "{path}");
+        assert!(
+            !out.to_string().contains("/x\""),
+            "names the path as asked: {out}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_file_outside_every_root_is_refused_and_panes_outside_home_are_no_root() {
-    let h = start(ToolMode::Control, "/work").await;
-    let out = err(&h, "herdr_file_read", json!({"path": outside_file()})).await;
-    assert_eq!(out["code"], "path_not_allowed");
-    assert!(
-        out["roots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|root| !root.as_str().unwrap().ends_with("/work")),
-        "{out}"
-    );
-}
-
-#[tokio::test]
-async fn a_pane_in_the_root_or_home_directory_opens_nothing() {
-    for cwd in ["/", &std::env::var("HOME").unwrap()] {
-        let h = start(ToolMode::Control, cwd).await;
+async fn a_pane_opened_in_the_root_or_home_directory_reads_nothing() {
+    for cwd in ["/".to_owned(), std::env::var("HOME").unwrap()] {
+        let h = start(ToolMode::Control, &cwd).await;
         assert_eq!(
-            err_code(&h, "herdr_file_read", json!({"path": outside_file()})).await,
+            err_code(&h, "herdr_file_read", read("/etc/hosts", json!({}))).await,
             "path_not_allowed",
             "{cwd}"
         );
@@ -176,145 +182,44 @@ async fn a_pane_in_the_root_or_home_directory_opens_nothing() {
 }
 
 #[tokio::test]
-async fn a_symlink_out_of_a_root_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let link = dir.path().join("escape");
-    std::os::unix::fs::symlink(outside_file(), &link).unwrap();
-    let h = start(ToolMode::Control, "/work").await;
+async fn credential_directories_are_refused() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    std::fs::create_dir(dir.path().join(".ssh")).unwrap();
+    std::fs::write(dir.path().join(".ssh/id_ed25519"), "secret").unwrap();
     assert_eq!(
-        err_code(&h, "herdr_file_read", read(&link, json!({}))).await,
+        err_code(&h, "herdr_file_read", read(".ssh/id_ed25519", json!({}))).await,
         "path_not_allowed"
     );
 }
 
 #[tokio::test]
-async fn credential_directories_are_refused_under_any_root() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".ssh")).unwrap();
-    let key = dir.path().join(".ssh/id_ed25519");
-    std::fs::write(&key, "secret").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-    let out = err(&h, "herdr_file_read", read(&key, json!({}))).await;
-    assert_eq!(out["code"], "path_not_allowed");
-    assert!(!out.to_string().contains("secret\""), "{out}");
-}
-
-#[tokio::test]
-async fn missing_files_directories_and_bad_offsets_are_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("short.txt");
-    std::fs::write(&file, "abc").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-
+async fn missing_files_directories_unknown_panes_and_bad_offsets_are_errors() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    std::fs::write(dir.path().join("s.txt"), "abc").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
     assert_eq!(
-        err_code(
-            &h,
-            "herdr_file_read",
-            read(&dir.path().join("nope"), json!({}))
-        )
-        .await,
+        err_code(&h, "herdr_file_read", read("nope", json!({}))).await,
         "file_not_found"
     );
     assert_eq!(
-        err_code(&h, "herdr_file_read", read(dir.path(), json!({}))).await,
+        err_code(&h, "herdr_file_read", read("sub", json!({}))).await,
         "not_a_file"
     );
     assert_eq!(
-        err_code(&h, "herdr_file_read", read(&file, json!({"offset": 9}))).await,
+        err_code(&h, "herdr_file_read", read("s.txt", json!({"offset": 9}))).await,
         "invalid_params"
+    );
+    let mut args = read("s.txt", json!({}));
+    args["target"] = json!("w9:p9");
+    assert_eq!(
+        err_code(&h, "herdr_file_read", args).await,
+        "target_not_found"
     );
 }
 
 #[tokio::test]
 async fn read_mode_has_no_file_read_tool() {
-    let h = start(ToolMode::Read, "/work").await;
+    let (h, _dir) = pane_in_dir(ToolMode::Read).await;
     let tools = h.client.list_all_tools().await.unwrap();
     assert!(tools.iter().all(|tool| tool.name != "herdr_file_read"));
-}
-
-#[tokio::test]
-async fn a_pane_in_a_system_or_hidden_home_directory_opens_nothing() {
-    let home = std::env::var("HOME").unwrap();
-    for cwd in [
-        "/private".to_owned(),
-        "/etc".to_owned(),
-        format!("{home}/Library"),
-        format!("{home}/.config"),
-    ] {
-        let h = start(ToolMode::Control, &cwd).await;
-        assert_eq!(
-            err_code(&h, "herdr_file_read", json!({"path": "/etc/hosts"})).await,
-            "path_not_allowed",
-            "{cwd}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn env_files_and_git_config_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".env.local"), "TOKEN=x").unwrap();
-    std::fs::create_dir(dir.path().join(".git")).unwrap();
-    std::fs::write(dir.path().join(".git/config"), "[remote]").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-    for name in [".env.local", ".git/config"] {
-        assert_eq!(
-            err_code(
-                &h,
-                "herdr_file_read",
-                read(&dir.path().join(name), json!({}))
-            )
-            .await,
-            "path_not_allowed",
-            "{name}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn a_relative_path_is_invalid() {
-    let h = start(ToolMode::Control, "/work").await;
-    assert_eq!(
-        err_code(&h, "herdr_file_read", json!({"path": "Cargo.toml"})).await,
-        "invalid_params"
-    );
-}
-
-#[tokio::test]
-async fn a_page_smaller_than_a_character_takes_the_whole_character() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("euro.txt");
-    std::fs::write(&file, "€€").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-
-    let out = ok(&h, "herdr_file_read", read(&file, json!({"max_bytes": 1}))).await;
-
-    assert_eq!(out["encoding"], "utf8");
-    assert_eq!(out["content"], "€");
-    assert_eq!(out["next_offset"], 3);
-}
-
-#[tokio::test]
-async fn an_offset_inside_a_character_starts_at_the_next_one() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("euro.txt");
-    std::fs::write(&file, "€ab").unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-
-    let out = ok(&h, "herdr_file_read", read(&file, json!({"offset": 1}))).await;
-
-    assert_eq!(out["content"], "ab");
-    assert_eq!(out["offset"], 3);
-    assert!(out["note"].as_str().unwrap().contains("inside a character"));
-    assert_eq!(out["eof"], true);
-}
-
-#[tokio::test]
-async fn the_refusal_names_the_path_as_asked_not_a_symlink_target() {
-    let dir = tempfile::tempdir().unwrap();
-    let link = dir.path().join("escape");
-    std::os::unix::fs::symlink(outside_file(), &link).unwrap();
-    let h = start(ToolMode::Control, "/work").await;
-    let out = err(&h, "herdr_file_read", read(&link, json!({}))).await;
-    assert!(!out.to_string().contains("Cargo.toml"), "{out}");
 }

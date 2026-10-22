@@ -8,9 +8,7 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::caller::Resolution;
-use crate::delegation::{
-    MailPlan, ReplyWait, await_reply, caller_plan, remote_plan, reply_paragraph,
-};
+use crate::delegation::{ReplyWait, await_reply, caller_plan, remote_plan, reply_paragraph};
 use crate::guard::TargetKind;
 use crate::herdr::{
     AgentInfo, AgentPromptParams, AgentReadParams, AgentStatus, ApiErrorCode, Client, HerdrError,
@@ -196,27 +194,47 @@ pub async fn run(
             .await?;
             let remaining = cap.saturating_sub(started.elapsed());
             let waits = params.wait == Some(SendWait::Turn);
-            match &plan {
-                Some(plan) if waits && !out["turn"].is_null() => {
+            let turn = serde_json::from_value::<Turn>(out["turn"].clone()).ok();
+            match (&plan, turn) {
+                (Some(plan), Some(turn)) if waits => {
                     let name = agent.and_then(|agent| agent.name.clone());
-                    let sender = Sender {
-                        pane,
-                        name: name.as_deref(),
-                        since_ms: typed_ms,
-                    };
-                    await_mail(
-                        inner, client, &mut out, plan, sender, remaining, ct, progress,
-                    )
+                    // Mail sent before the prompt answers something else.
+                    let filter =
+                        SenderFilter::new(std::iter::once(pane.to_owned()).chain(name.clone()))
+                            .since(typed_ms);
+                    let outcome = await_reply(ReplyWait {
+                        client,
+                        mailbox: &inner.mailbox(),
+                        wait: &inner.wait,
+                        mail_poll: inner.launch.mail_poll,
+                        reply_grace: inner.launch.reply_grace,
+                        plan,
+                        filter: &filter,
+                        turn,
+                        name: name.as_deref().unwrap_or(pane),
+                        remaining,
+                        ticks: progress,
+                        cancel: ct,
+                        details: &json!({"pane": pane}),
+                    })
                     .await;
+                    match outcome {
+                        Ok(outcome) => merge_wait(&mut out, &outcome.to_json()),
+                        Err(err) if err.code() == "cancelled" => {
+                            out["timed_out"] = json!(true);
+                            out["reply"] = json!("pending");
+                        }
+                        Err(err) => wait_failed(&mut out, &err),
+                    }
                 }
-                Some(plan) => {
+                (Some(plan), _) => {
                     out["reply"] = json!("pending");
                     add_note(&mut out, &pending_note(inner.is_remote(), &plan.parent));
                 }
-                None if waits => {
+                (None, _) if waits => {
                     await_turn(client, inner, &mut out, remaining, ct, progress).await;
                 }
-                None => {}
+                (None, _) => {}
             }
             Ok(out)
         }
@@ -410,70 +428,6 @@ async fn await_turn(
     };
     match outcome {
         Ok(outcome) => merge_wait(out, &outcome.to_json()),
-        Err(err) => wait_failed(out, &err),
-    }
-}
-
-/// The agent a reply is expected from.
-#[derive(Debug, Clone, Copy)]
-struct Sender<'a> {
-    pane: &'a str,
-    name: Option<&'a str>,
-    /// When the prompt was typed: earlier mail from this agent answers something else.
-    since_ms: u64,
-}
-
-/// Waits for the agent's mailed answer and its turn together, like `await_turn`: the prompt is
-/// delivered, so nothing here fails the call.
-#[allow(clippy::too_many_arguments)]
-async fn await_mail(
-    inner: &Inner,
-    client: &Client,
-    out: &mut Value,
-    plan: &MailPlan,
-    sender: Sender<'_>,
-    remaining: Duration,
-    ct: &CancellationToken,
-    progress: Option<UnboundedSender<Progress>>,
-) {
-    let Ok(turn) = serde_json::from_value::<Turn>(out["turn"].clone()) else {
-        return;
-    };
-    let name = sender.name.unwrap_or(sender.pane);
-    if remaining.is_zero() {
-        out["timed_out"] = json!(true);
-        out["reply"] = json!("pending");
-        add_note(out, &pending_note(inner.is_remote(), &plan.parent));
-        return;
-    }
-    let filter = SenderFilter::new(
-        std::iter::once(sender.pane.to_owned()).chain(sender.name.map(str::to_owned)),
-    )
-    .since(sender.since_ms);
-    let mailbox = inner.mailbox();
-    let details = json!({"pane": sender.pane});
-    let outcome = await_reply(ReplyWait {
-        client,
-        mailbox: &mailbox,
-        wait: &inner.wait,
-        mail_poll: inner.launch.mail_poll,
-        reply_grace: inner.launch.reply_grace,
-        plan,
-        filter: &filter,
-        turn,
-        name,
-        remaining,
-        ticks: progress,
-        cancel: ct,
-        details: &details,
-    })
-    .await;
-    match outcome {
-        Ok(outcome) => merge_wait(out, &outcome.to_json()),
-        Err(err) if err.code() == "cancelled" => {
-            out["timed_out"] = json!(true);
-            out["reply"] = json!("pending");
-        }
         Err(err) => wait_failed(out, &err),
     }
 }

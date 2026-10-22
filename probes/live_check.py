@@ -114,16 +114,18 @@ def main(binary):
                 check("read visible works", not err and read.get("source") == "visible")
                 check("read reports more_above", "more_above" in read, json.dumps(read)[:200])
 
-                with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as report:
+                # The throwaway workspaces open in /tmp, so the pane reads from there.
+                with tempfile.NamedTemporaryFile("w", suffix=".md", dir="/tmp", delete=False) as report:
                     report.write("# live check\n")
                 try:
-                    got, err = bridge.tool("herdr_file_read", {"path": report.name})
-                    check("file read returns a temp file", not err and got.get("content") == "# live check\n",
-                          json.dumps(got)[:200])
+                    got, err = bridge.tool("herdr_file_read",
+                                           {"target": pane, "path": os.path.basename(report.name)})
+                    check("file read returns a file in the pane's directory",
+                          not err and got.get("content") == "# live check\n", json.dumps(got)[:200])
                 finally:
                     os.unlink(report.name)
-                got, err = bridge.tool("herdr_file_read", {"path": "/etc/hosts"})
-                check("file read refuses a path outside the roots",
+                got, err = bridge.tool("herdr_file_read", {"target": pane, "path": "/etc/hosts"})
+                check("file read refuses a path outside the pane's directory",
                       err and got.get("code") == "path_not_allowed", json.dumps(got)[:200])
 
                 moved, err = bridge.tool("herdr_move", {"target": pane, "workspace_id": b})
