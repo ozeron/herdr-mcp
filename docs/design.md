@@ -149,7 +149,7 @@ Conventions worth copying from T3:
 ## 3. Tool surface [shipped]
 
 There are nine tools.
-- **Modes:** the bridge takes `--tools read|control`, and read is the default. Read registers `herdr_capabilities`, `herdr_list`, `herdr_read` and `herdr_wait`. Control adds `herdr_launch`, `herdr_run`, `herdr_send`, `herdr_interrupt` and `herdr_close`.
+- **Modes:** the bridge takes `--tools read|control`, and read is the default. Read registers `herdr_capabilities`, `herdr_sessions`, `herdr_use_session`, `herdr_list`, `herdr_read`, `herdr_wait` and the three mail tools. Control adds `herdr_launch`, `herdr_run`, `herdr_send`, `herdr_interrupt`, `herdr_close`, `herdr_move` and `herdr_file_read`. A tunnel bridge also registers `herdr_tunnel_stop`.
 - **Targets:** a `target` is a pane ID or an agent name. `herdr_close` also takes a tab ID, and refuses a workspace.
 - **Placement:** `where` takes at most one of:
   - `{pane}`: an existing idle shell.
@@ -165,12 +165,14 @@ There are nine tools.
 | `herdr_capabilities` | readonly | → `caller{pane_id,tab_id,workspace_id}?`, `caller_verified`, `tool_mode`, `session`, `herdr{version, protocol}`, `agents[{kind, mcp: global\|injected\|injectable\|unsupported, active_version}]`, `wait_cap_ms` | `ping`, `server.agent_manifests` |
 | `herdr_list` | readonly | `scope` (`all`/`workspace`/`tab`), `kind` (`agent`/`process`/`shell`), `status[]`, `label_contains` → tree of workspaces → tabs → panes `{id, kind, agent?, name?, status?, foreground?, cwd, label, worktree?}` | `session.snapshot`, `agent.list`, `pane.process_info`, `worktree.list` |
 | `herdr_read` | readonly | `target?` (default caller), `source` (`recent`/`visible`), `lines` (default 120, max 1000), `max_chars` (default 32k, max 100k) → `text`, `truncated`, `more_above`, `status`, `note?` | `agent.read` / `pane.read`, `agent.get` |
-| `herdr_launch` | destructive | `kind`, `name`, `instructions?`, `where`, `cwd?`, `env?`, `label?`, `control?`, `wait` (`none`/`turn`), `start_timeout_ms` → `phase`, `pane`, `tab`, `workspace`, `created`, `mcp`, `turn?`, then the wait result | `tab.create` / `pane.split` / `worktree.create`, `agent.start`, `agent.prompt`, `events.subscribe`, `agent.get` |
+| `herdr_launch` | destructive | `kind`, `name`, `instructions?`, `where`, `cwd?`, `env?`, `label?`, `control?`, `wait` (`none`/`turn`), `reply` (`screen`/`mail`), `start_timeout_ms` → `phase`, `pane`, `tab`, `workspace`, `created`, `mcp`, `turn?`, then the wait result | `tab.create` / `pane.split` / `worktree.create`, `agent.start`, `agent.prompt`, `events.subscribe`, `agent.get` |
 | `herdr_run` | destructive | `command`, `where`, `cwd?`, `env?`, `label?`, `ready?{match, timeout_ms}` → `pane`, `pgid`, `ready_matched?`, `timed_out`, `excerpt`, `note?` | `tab.create` / `pane.split`, `pane.read`, `pane.send_input`, `pane.process_info` |
-| `herdr_send` | destructive | `target`, then `prompt` with `mode` (`auto`/`after_idle`/`steer`/`restart`), or `text`, or `keys[]`; `answer_blocked?`, `timeout_ms?`, `allow_self?` → `result`, `mode`, `pane`, `turn` | `agent.prompt`, `agent.get`, `pane.send_text`, `pane.send_keys` |
+| `herdr_send` | destructive | `target`, then `prompt` with `mode` (`auto`/`after_idle`/`steer`/`restart`), with `wait?` (`turn`/`none`) and `reply?` (`screen`/`mail`), or `text`, or `keys[]`; `answer_blocked?`, `timeout_ms?`, `allow_self?` → `result`, `mode`, `pane`, `turn` | `agent.prompt`, `agent.get`, `pane.send_text`, `pane.send_keys` |
 | `herdr_wait` | readonly | `target`, then one of `turn` (token), `until[]` (agent states), `output{match}` or `process_exit{pgid?}`; `timeout_ms` → `matched`, `timed_out`, `status`, `excerpt`, `pgid` | `agent.get`, `events.subscribe`, `pane.read`, `pane.process_info` |
 | `herdr_interrupt` | destructive | `target`, `method` (`auto`/`keys`/`signal`), `signal?` (`INT`/`TERM`) → `result` (`interrupt_requested`/`no_active_work`), `status_after` | `agent.send_keys` / `pane.send_keys`, `pane.process_info`, local `kill(-pgid)` |
 | `herdr_close` | destructive | `target` (required; pane, tab or agent name), `allow_self?`, `force?` → `closed`, `kind`, `id` | `pane.close` / `tab.close` |
+| `herdr_move` | destructive | `target`, `workspace_id`, `label?`, `allow_self?`, `force?` → `moved`, `previous{pane, tab, workspace}`, `pane`, `tab`, `workspace`, `cwd`, `note?`, `closed_workspace?` | `pane.move` |
+| `herdr_file_read` | readonly | `target` (pane or agent), `path` (relative to the pane's opening directory, or absolute inside it), `offset?`, `max_bytes?` (default 50000, max 75000) → `path`, `size`, `offset`, `bytes`, `encoding` (`utf8`/`base64`), `content`, `next_offset`, `eof` | `session.snapshot` (pane `cwd`); the file is read by the bridge |
 
 Semantics:
 - **Turn tokens.** [probed] Herdr gates activity and the bridge tracks completion.

@@ -48,8 +48,9 @@ Herdr's own docs give the fix for long answers: have the agent write a file, the
 
 ### U3. `herdr_file_read`
 
-- Control mode only. `{path, offset, max_bytes}`; text as text, other bytes as base64; returns `size`, `next_offset`, `eof`.
-- Allowed roots: a Herdr workspace's or pane's cwd, and the temp directory, compared on real paths, so a symlink cannot leave them.
+- Control mode only. `{target, path, offset, max_bytes}`; text as text, other bytes as base64; returns `size`, `next_offset`, `eof`.
+- Reads only under the directory the target pane was opened in, on real paths; a pane in `/` or the home directory reads nothing. The open file's real path is checked again, and files with other hard links are refused.
+- A short list of credential names (`.ssh`, `.env` files and others) is refused in any case, as a speed bump: an agent with a shell can read them.
 - The audit log keeps the path and byte count, never the content.
 - **Files:** `src/tools/file_read.rs`, `src/server.rs`, `src/audit.rs`, README, docs; tests in a new `tests/tools_file_read.rs`.
 
