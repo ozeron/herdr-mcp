@@ -653,9 +653,25 @@ async fn read_tops_up_once_when_blank_lines_leave_too_few() {
         .filter(|r| r["method"] == "agent.read")
         .map(|r| r["params"]["lines"].clone())
         .collect();
-    assert_eq!(rows, vec![json!(16), json!(48)]);
+    assert_eq!(rows, vec![json!(16), json!(32)]);
     assert_eq!(read["truncated"], false, "nothing asked for was cut");
     assert_eq!(read["more_above"], true);
+}
+
+#[tokio::test]
+async fn a_failed_top_up_keeps_the_first_read() {
+    let h = start(None).await;
+    h.fake.on_seq(
+        "agent.read",
+        vec![
+            Script::Reply(read_more("w1:p4", "a\n\nb\n")),
+            Script::error("herdr_timeout", "slow"),
+        ],
+    );
+    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 4})).await;
+
+    assert_eq!(read["text"], "a\nb");
+    assert_eq!(count(&h.fake, "agent.read"), 2);
 }
 
 #[tokio::test]

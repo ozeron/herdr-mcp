@@ -149,7 +149,7 @@ async fn a_file_under_a_panes_working_directory_is_allowed() {
 }
 
 #[tokio::test]
-async fn a_file_outside_every_root_is_refused_with_the_roots() {
+async fn a_file_outside_every_root_is_refused_and_panes_outside_home_are_no_root() {
     let h = start(ToolMode::Control, "/work").await;
     let out = err(&h, "herdr_file_read", json!({"path": outside_file()})).await;
     assert_eq!(out["code"], "path_not_allowed");
@@ -158,7 +158,7 @@ async fn a_file_outside_every_root_is_refused_with_the_roots() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|root| root.as_str().unwrap().ends_with("/work")),
+            .all(|root| !root.as_str().unwrap().ends_with("/work")),
         "{out}"
     );
 }
@@ -230,4 +230,91 @@ async fn read_mode_has_no_file_read_tool() {
     let h = start(ToolMode::Read, "/work").await;
     let tools = h.client.list_all_tools().await.unwrap();
     assert!(tools.iter().all(|tool| tool.name != "herdr_file_read"));
+}
+
+#[tokio::test]
+async fn a_pane_in_a_system_or_hidden_home_directory_opens_nothing() {
+    let home = std::env::var("HOME").unwrap();
+    for cwd in [
+        "/private".to_owned(),
+        "/etc".to_owned(),
+        format!("{home}/Library"),
+        format!("{home}/.config"),
+    ] {
+        let h = start(ToolMode::Control, &cwd).await;
+        assert_eq!(
+            err_code(&h, "herdr_file_read", json!({"path": "/etc/hosts"})).await,
+            "path_not_allowed",
+            "{cwd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn env_files_and_git_config_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env.local"), "TOKEN=x").unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join(".git/config"), "[remote]").unwrap();
+    let h = start(ToolMode::Control, "/work").await;
+    for name in [".env.local", ".git/config"] {
+        assert_eq!(
+            err_code(
+                &h,
+                "herdr_file_read",
+                read(&dir.path().join(name), json!({}))
+            )
+            .await,
+            "path_not_allowed",
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_relative_path_is_invalid() {
+    let h = start(ToolMode::Control, "/work").await;
+    assert_eq!(
+        err_code(&h, "herdr_file_read", json!({"path": "Cargo.toml"})).await,
+        "invalid_params"
+    );
+}
+
+#[tokio::test]
+async fn a_page_smaller_than_a_character_takes_the_whole_character() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("euro.txt");
+    std::fs::write(&file, "€€").unwrap();
+    let h = start(ToolMode::Control, "/work").await;
+
+    let out = ok(&h, "herdr_file_read", read(&file, json!({"max_bytes": 1}))).await;
+
+    assert_eq!(out["encoding"], "utf8");
+    assert_eq!(out["content"], "€");
+    assert_eq!(out["next_offset"], 3);
+}
+
+#[tokio::test]
+async fn an_offset_inside_a_character_starts_at_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("euro.txt");
+    std::fs::write(&file, "€ab").unwrap();
+    let h = start(ToolMode::Control, "/work").await;
+
+    let out = ok(&h, "herdr_file_read", read(&file, json!({"offset": 1}))).await;
+
+    assert_eq!(out["content"], "ab");
+    assert_eq!(out["offset"], 3);
+    assert!(out["note"].as_str().unwrap().contains("inside a character"));
+    assert_eq!(out["eof"], true);
+}
+
+#[tokio::test]
+async fn the_refusal_names_the_path_as_asked_not_a_symlink_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("escape");
+    std::os::unix::fs::symlink(outside_file(), &link).unwrap();
+    let h = start(ToolMode::Control, "/work").await;
+    let out = err(&h, "herdr_file_read", read(&link, json!({}))).await;
+    assert!(!out.to_string().contains("Cargo.toml"), "{out}");
 }

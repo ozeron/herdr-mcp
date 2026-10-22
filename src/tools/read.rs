@@ -78,18 +78,19 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     let status = agent.map(|agent| agent.agent_status);
     let (mut result, used) = fetched?;
     // A full-screen agent's history is read by scrolling it, so the first read asks for few rows
-    // and one more is made only when blank lines left too few and more exists.
+    // and one more is made only when blank lines left too few and more exists. If that one
+    // fails, the first read stands.
     if used == Source::Recent
         && result.truncated
         && rows < MAX_LINES
         && meaningful_count(&result.text) < lines as usize
-        && let (more, Source::Recent) = fetch(
+        && let Ok((more, Source::Recent)) = fetch(
             &client,
             &target,
             used,
-            rows.saturating_mul(3).min(MAX_LINES),
+            rows.saturating_mul(2).min(MAX_LINES),
         )
-        .await?
+        .await
     {
         result = more;
     }

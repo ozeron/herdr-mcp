@@ -3499,7 +3499,8 @@ async fn send_reply_mail_with_wait_turn_returns_the_mailed_answer() {
         Some("w1:p1"),
         vec![rev("idle", 3), rev("working", 5)],
     );
-    let answer = mail_from("w1:p4", Some("rev"), "the whole answer");
+    let mut answer = mail_from("w1:p4", Some("rev"), "the whole answer");
+    answer.ts_ms = now_ms() + 100;
     let sent = deliver_later(&env, Duration::from_millis(200), answer.clone());
 
     let out = ok(
@@ -3591,4 +3592,32 @@ async fn send_reply_applies_to_a_prompt_only() {
     )
     .await;
     assert_eq!(code, "invalid_params");
+}
+
+#[tokio::test]
+async fn send_reply_mail_ignores_mail_the_agent_sent_before_the_prompt() {
+    let env = mail_env(Opts::default()).await;
+    script_send(
+        &env.h.fake,
+        Some("w1:p1"),
+        vec![rev("idle", 3), rev("working", 5)],
+    );
+    let stale = mail_from("w1:p4", Some("rev"), "the answer to the last prompt");
+    env.mailbox()
+        .deliver(&recipient_key("w1:p1"), &stale)
+        .unwrap();
+    let mut fresh = mail_from("w1:p4", Some("rev"), "the answer to this prompt");
+    fresh.ts_ms = now_ms() + 150;
+    let sent = deliver_later(&env, Duration::from_millis(300), fresh);
+
+    let out = ok(
+        &env.h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "wait": "turn", "reply": "mail"}),
+    )
+    .await;
+    sent.await.unwrap();
+
+    assert_eq!(out["reply"]["body"], "the answer to this prompt", "{out}");
+    assert_eq!(env.unread(), 1, "the earlier mail stays unread");
 }

@@ -129,23 +129,36 @@ impl Inbox {
     }
 }
 
-/// Matches mail by sender: any of `ids` equal to the sender's pane ID or agent name.
+/// Matches mail by sender: any of `ids` equal to the sender's pane ID or agent name, and, with
+/// `since`, only mail sent at or after that time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderFilter {
     ids: Vec<String>,
+    since_ms: Option<u64>,
 }
 
 impl SenderFilter {
     pub fn new(ids: impl IntoIterator<Item = String>) -> Self {
         Self {
             ids: ids.into_iter().collect(),
+            since_ms: None,
         }
     }
 
-    pub fn matches(&self, from: &Party) -> bool {
-        self.ids.iter().any(|id| {
-            from.pane.as_deref() == Some(id.as_str()) || from.name.as_deref() == Some(id.as_str())
-        })
+    /// Leaves out mail sent before `ts_ms`, such as an earlier answer still unread.
+    #[must_use]
+    pub fn since(mut self, ts_ms: u64) -> Self {
+        self.since_ms = Some(ts_ms);
+        self
+    }
+
+    pub fn matches(&self, message: &Message) -> bool {
+        let from = &message.from;
+        self.since_ms.is_none_or(|since| message.ts_ms >= since)
+            && self.ids.iter().any(|id| {
+                from.pane.as_deref() == Some(id.as_str())
+                    || from.name.as_deref() == Some(id.as_str())
+            })
     }
 }
 
@@ -229,7 +242,7 @@ impl Mailbox {
             for path in list(&dir.join(NEW)) {
                 let message = from.map(|_| read_message(&path));
                 if let (Some(filter), Some(parsed)) = (from, &message)
-                    && !parsed.as_ref().is_some_and(|m| filter.matches(&m.from))
+                    && !parsed.as_ref().is_some_and(|m| filter.matches(m))
                 {
                     continue;
                 }

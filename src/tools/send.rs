@@ -16,7 +16,7 @@ use crate::herdr::{
     AgentInfo, AgentPromptParams, AgentReadParams, AgentStatus, ApiErrorCode, Client, HerdrError,
     Outcome, PaneSendInputParams, PromptWait, ReadSource,
 };
-use crate::mailbox::SenderFilter;
+use crate::mailbox::{self, SenderFilter};
 use crate::provenance;
 use crate::providers::provider;
 use crate::scope::{Scope, TargetRequest};
@@ -183,6 +183,7 @@ pub async fn run(
                 }
                 None => prompt,
             };
+            let typed_ms = mailbox::now_ms();
             let mut out = send_prompt(
                 client,
                 pane,
@@ -201,6 +202,7 @@ pub async fn run(
                     let sender = Sender {
                         pane,
                         name: name.as_deref(),
+                        since_ms: typed_ms,
                     };
                     await_mail(
                         inner, client, &mut out, plan, sender, remaining, ct, progress,
@@ -417,6 +419,8 @@ async fn await_turn(
 struct Sender<'a> {
     pane: &'a str,
     name: Option<&'a str>,
+    /// When the prompt was typed: earlier mail from this agent answers something else.
+    since_ms: u64,
 }
 
 /// Waits for the agent's mailed answer and its turn together, like `await_turn`: the prompt is
@@ -444,7 +448,8 @@ async fn await_mail(
     }
     let filter = SenderFilter::new(
         std::iter::once(sender.pane.to_owned()).chain(sender.name.map(str::to_owned)),
-    );
+    )
+    .since(sender.since_ms);
     let mailbox = inner.mailbox();
     let details = json!({"pane": sender.pane});
     let outcome = await_reply(ReplyWait {
