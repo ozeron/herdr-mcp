@@ -109,7 +109,7 @@ pub fn remote_inbox(client: Option<&str>, requested: Option<&str>) -> Result<Str
 
 /// The remote inbox for this call, refused when a live local agent already has that name: its
 /// name inbox would be shared.
-async fn checked_remote_inbox(
+pub(crate) async fn checked_remote_inbox(
     inner: &Inner,
     client: Option<&str>,
     requested: Option<&str>,

@@ -3022,7 +3022,7 @@ async fn an_async_mail_launch_returns_pending_and_the_idle_parent_is_nudged_by_c
     assert_eq!(out["reply"], "pending");
     assert_eq!(
         out["note"],
-        "The child will mail its result to you; end your turn, and the mail nudge will wake you."
+        "The agent will mail its result to you; end your turn, and the mail nudge will wake you."
     );
     assert_eq!(out["phase"], "prompted");
     assert_eq!(count(&env.h.fake, "events.subscribe"), 0);
@@ -3479,4 +3479,116 @@ async fn cancel_while_the_start_is_retrying_keeps_the_pane_and_reports_phase_pla
     assert_eq!(details["phase"], "placed");
     assert_eq!(details["pane"], "w1:p9");
     assert_no_cleanup(&fake);
+}
+
+// ---- herdr_send reply: "mail" ---------------------------------------------------------------
+
+fn prompt_text(fake: &FakeHerdr) -> String {
+    fake.requests()
+        .into_iter()
+        .find(|r| r["method"] == "agent.prompt")
+        .map(|r| r["params"]["text"].as_str().unwrap().to_owned())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn send_reply_mail_with_wait_turn_returns_the_mailed_answer() {
+    let env = mail_env(Opts::default()).await;
+    script_send(
+        &env.h.fake,
+        Some("w1:p1"),
+        vec![rev("idle", 3), rev("working", 5)],
+    );
+    let answer = mail_from("w1:p4", Some("rev"), "the whole answer");
+    let sent = deliver_later(&env, Duration::from_millis(200), answer.clone());
+
+    let out = ok(
+        &env.h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "wait": "turn", "reply": "mail"}),
+    )
+    .await;
+    sent.await.unwrap();
+
+    assert_eq!(out["delivery"], "started");
+    assert_eq!(out["reply"]["body"], "the whole answer", "{out}");
+    assert_eq!(out["reply"]["id"], answer.id);
+    assert_eq!(out["pane"], "w1:p4");
+    assert_eq!(
+        prompt_text(&env.h.fake),
+        format!("go\n\n{}", paragraph("w1:p1"))
+    );
+    assert_eq!(env.unread(), 0);
+}
+
+#[tokio::test]
+async fn send_reply_mail_without_a_wait_returns_pending() {
+    let env = mail_env(Opts::default()).await;
+    script_send(&env.h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+
+    let out = ok(
+        &env.h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "reply": "mail"}),
+    )
+    .await;
+
+    assert_eq!(out["reply"], "pending");
+    assert!(
+        out["note"].as_str().unwrap().contains("mail nudge"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn send_reply_mail_to_a_queued_prompt_is_pending_since_there_is_no_turn() {
+    let env = mail_env(Opts::default()).await;
+    script_send(
+        &env.h.fake,
+        Some("w1:p1"),
+        vec![rev_kind("working", "claude")],
+    );
+    screens(&env.h.fake, &[QUEUED_SCREEN]);
+
+    let out = ok(
+        &env.h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "next", "wait": "turn", "reply": "mail"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["reply"], "pending");
+}
+
+#[tokio::test]
+async fn send_reply_mail_from_an_unverified_caller_types_nothing() {
+    let env = mail_env(Opts::default()).await;
+    // No pane.process_info script for the caller: its shell cannot be matched.
+    env.h
+        .fake
+        .reply_seq("session.snapshot", vec![snapshot(false, None)]);
+    env.h.fake.reply_seq("agent.get", vec![rev("idle", 3)]);
+
+    let code = err_code(
+        &env.h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "reply": "mail"}),
+    )
+    .await;
+
+    assert_eq!(code, "invalid_params");
+    assert_nothing_typed(&env.h.fake);
+}
+
+#[tokio::test]
+async fn send_reply_applies_to_a_prompt_only() {
+    let h = start(Opts::default()).await;
+    let code = err_code(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "keys": ["Enter"], "reply": "mail"}),
+    )
+    .await;
+    assert_eq!(code, "invalid_params");
 }

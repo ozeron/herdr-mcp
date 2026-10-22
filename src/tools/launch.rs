@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::ToolMode;
 use crate::delegation::{
-    NO_MAIL_NOTE, ReplyWait, await_reply, mail_plan, reply_json, reply_paragraph,
-    require_verified_caller, take_reply,
+    NO_MAIL_NOTE, ReplyWait, await_reply, caller_plan, remote_plan, reply_json, reply_paragraph,
+    require_mail_tool, take_reply,
 };
 use crate::herdr::{
     AgentInfo, AgentReadParams, AgentStartParams, AgentStatus, ApiErrorCode, Client, HerdrError,
@@ -29,6 +29,7 @@ use crate::runtime_mode::{self, RuntimeMode};
 use crate::scope::Scope;
 use crate::server::Inner;
 use crate::tools::launch_session::{LaunchSession, Phase};
+use crate::tools::mail;
 use crate::tools::send::{gated_prompt, turn_for};
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::TurnFrom;
@@ -101,7 +102,7 @@ pub enum Reply {
     /// The result is read off the child's screen: the wait excerpt. Default.
     #[default]
     Screen,
-    /// The child mails its exact result to you. Needs a verified caller and a kind with the MCP server.
+    /// The child mails its exact result to you: your pane inbox, or a remote caller's inbox. Needs a kind with the MCP server.
     Mail,
 }
 
@@ -144,7 +145,7 @@ pub struct LaunchParams {
     pub control: Option<bool>,
     /// turn waits for the first turn to settle; none (default) returns the turn token.
     pub wait: Option<LaunchWait>,
-    /// screen (default) leaves the result on the child's screen. mail appends an instruction for the child to mail its exact final result to you: wait turn returns it as `reply` (and `reply: null` plus the excerpt if the child finishes without mailing), wait none returns `reply: "pending"` and the mail nudge wakes you. Needs a verified caller and a kind that gets this MCP server.
+    /// screen (default) leaves the result on the child's screen. mail appends an instruction for the child to mail its exact final result to you: wait turn returns it as `reply` (and `reply: null` plus the excerpt if the child finishes without mailing), wait none returns `reply: "pending"`: a local caller's mail nudge wakes it, a remote caller reads its inbox with herdr_mail_wait or herdr_mail_read. Needs a verified local caller or a remote one, and a kind that gets this MCP server.
     pub reply: Option<Reply>,
     /// How long the agent may take to become ready, in milliseconds. Default 30000.
     pub start_timeout_ms: Option<u64>,
@@ -234,16 +235,15 @@ pub async fn run(
     let mail_plan = match reply {
         Reply::Screen => None,
         Reply::Mail => {
-            require_verified_caller(&resolution)?;
+            let plan = if inner.is_remote() {
+                remote_plan(mail::checked_remote_inbox(inner, client_info_name, None).await?)
+            } else {
+                caller_plan(&snapshot, &resolution)?
+            };
             let found = injection(inner, &params.kind, control)?;
-            let child_has_mail_tool = found.mcp != McpStatus::Unsupported.as_str();
+            require_mail_tool(&params.kind, found.mcp != McpStatus::Unsupported.as_str())?;
             mail_injection = Some(found);
-            Some(mail_plan(
-                &params.kind,
-                child_has_mail_tool,
-                &snapshot,
-                &resolution,
-            )?)
+            Some(plan)
         }
     };
     let caller_mode = match (&resolution.caller, resolution.caller_verified) {
@@ -378,12 +378,11 @@ pub async fn run(
     out["status"] = json!(agent.agent_status);
     out["turn"] = json!(turn);
 
-    if mail_plan.is_some() && wait == LaunchWait::None {
+    if let Some(plan) = &mail_plan
+        && wait == LaunchWait::None
+    {
         out["reply"] = json!("pending");
-        add_note(
-            &mut out,
-            "The child will mail its result to you; end your turn, and the mail nudge will wake you.",
-        );
+        add_note(&mut out, &pending_note(inner.is_remote(), &plan.parent));
     }
     let mailbox = inner.mailbox();
     let filter = SenderFilter::new([session.placed().pane_id.clone(), params.name.clone()]);
@@ -474,6 +473,18 @@ pub async fn run(
             Ok(out)
         }
         Err(err) => Err(session.fail_keep(err)),
+    }
+}
+
+/// Where a pending reply will show up.
+pub(crate) fn pending_note(remote: bool, inbox: &str) -> String {
+    if remote {
+        format!(
+            "The agent will mail its result to your inbox {inbox}; get it with herdr_mail_wait or herdr_mail_read."
+        )
+    } else {
+        "The agent will mail its result to you; end your turn, and the mail nudge will wake you."
+            .to_owned()
     }
 }
 

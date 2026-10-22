@@ -658,3 +658,63 @@ async fn eventually_ok(r: &Rig) {
     }
     panic!("the bridge still refuses calls after a failed stop");
 }
+
+#[tokio::test]
+async fn a_remote_send_with_reply_mail_asks_for_mail_to_the_remote_inbox() {
+    let r = serve(ToolMode::Control, true, None, None).await;
+    r.h.fake.on_params(
+        "session.snapshot",
+        json!({}),
+        Script::Reply(harness::snapshot(None)),
+    );
+    r.h.fake.on_params(
+        "agent.get",
+        json!({"target": "w1:p4"}),
+        Script::Reply(
+            json!({"type": "agent_info", "agent": harness::agent("w1:p4", "w1:t2", "w1", "rev")}),
+        ),
+    );
+    r.h.fake.on_params(
+        "agent.get",
+        json!({}),
+        Script::error("agent_not_found", "no such agent"),
+    );
+    let mut working = harness::agent("w1:p4", "w1:t2", "w1", "rev");
+    working["agent_status"] = json!("working");
+    working["state_change_seq"] = json!(5);
+    r.h.fake.reply(
+        "agent.prompt",
+        json!({"type": "agent_prompted", "agent": working}),
+    );
+    r.h.fake.on_params(
+        "pane.process_info",
+        json!({}),
+        Script::Reply(harness::process_info("w1:p4", 300, 300)),
+    );
+
+    let out = ok(
+        &r.h,
+        "herdr_send",
+        json!({"target": "w1:p4", "prompt": "go", "reply": "mail"}),
+    )
+    .await;
+
+    assert_eq!(out["reply"], "pending", "{out}");
+    assert!(
+        out["note"].as_str().unwrap().contains("remote-test-client"),
+        "{out}"
+    );
+    let prompt =
+        r.h.fake
+            .requests()
+            .into_iter()
+            .find(|req| req["method"] == "agent.prompt")
+            .unwrap();
+    assert!(
+        prompt["params"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("herdr_mail_send call to remote-test-client."),
+        "{prompt}"
+    );
+}

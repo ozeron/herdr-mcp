@@ -9,7 +9,8 @@ use fake_herdr::FakeHerdr;
 use harness::snapshot;
 use herdr_mcp::caller::{Caller, Resolution};
 use herdr_mcp::delegation::{
-    Basis, MailPlan, ReplyOutcome, ReplyWait, await_reply, mail_plan, reply_paragraph,
+    Basis, MailPlan, ReplyOutcome, ReplyWait, await_reply, caller_plan, remote_plan,
+    reply_paragraph, require_mail_tool,
 };
 use herdr_mcp::herdr::{Client, SessionSnapshot};
 use herdr_mcp::mailbox::{
@@ -347,7 +348,7 @@ async fn the_plan_refuses_an_unverified_caller_before_anything_else() {
         resolution(Some("w1:p1"), false),
         resolution(None, true),
     ] {
-        let err = mail_plan("codex", false, &snap(), &res).unwrap_err();
+        let err = caller_plan(&snap(), &res).unwrap_err();
         assert_eq!(err.code(), "invalid_params");
         assert!(err.to_string().contains("verified caller"), "{err}");
     }
@@ -355,15 +356,26 @@ async fn the_plan_refuses_an_unverified_caller_before_anything_else() {
 
 #[tokio::test]
 async fn the_plan_refuses_a_child_without_the_mail_tool() {
-    let err = mail_plan("gemini", false, &snap(), &resolution(Some("w1:p1"), true)).unwrap_err();
+    let err = require_mail_tool("gemini", false).unwrap_err();
+    assert!(require_mail_tool("codex", true).is_ok());
     assert_eq!(err.code(), "reply_unsupported");
 }
 
 #[tokio::test]
 async fn the_plan_mails_the_callers_name_or_pane() {
-    let plain = mail_plan("codex", true, &snap(), &resolution(Some("w1:p1"), true)).unwrap();
+    let plain = caller_plan(&snap(), &resolution(Some("w1:p1"), true)).unwrap();
     assert_eq!(plain.parent, "w1:p1");
-    let named = mail_plan("codex", true, &snap(), &resolution(Some("w1:p4"), true)).unwrap();
+    let named = caller_plan(&snap(), &resolution(Some("w1:p4"), true)).unwrap();
     assert_eq!(named.parent, "rev");
     assert!(reply_paragraph("rev").contains("herdr_mail_send call to rev."));
+}
+
+#[tokio::test]
+async fn a_remote_plan_mails_the_remote_inbox_by_name() {
+    let plan = remote_plan("remote-chatgpt".into());
+    assert_eq!(plan.parent, "remote-chatgpt");
+    assert_eq!(
+        plan.inbox,
+        herdr_mcp::mailbox::Inbox::named("remote-chatgpt")
+    );
 }

@@ -8,17 +8,22 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::caller::Resolution;
+use crate::delegation::{
+    MailPlan, ReplyWait, await_reply, caller_plan, remote_plan, reply_paragraph,
+};
 use crate::guard::TargetKind;
 use crate::herdr::{
     AgentInfo, AgentPromptParams, AgentReadParams, AgentStatus, ApiErrorCode, Client, HerdrError,
     Outcome, PaneSendInputParams, PromptWait, ReadSource,
 };
+use crate::mailbox::SenderFilter;
 use crate::provenance;
 use crate::providers::provider;
 use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 use crate::tools::interrupt;
-use crate::tools::launch::visible_dialog;
+use crate::tools::launch::{Reply, pending_note, visible_dialog};
+use crate::tools::mail;
 use crate::tools::{DEFAULT_TIMEOUT, clamp_timeout};
 use crate::turn::Turn;
 use crate::wait::{self, Condition, Progress, Request};
@@ -62,6 +67,8 @@ pub struct SendParams {
     pub wait: Option<SendWait>,
     /// For a prompt typed into a working agent that queues it (Claude Code): submit the queued prompt now with the agent's send-now key. Interrupts the agent's current turn flow; use only when the user wants the new prompt handled immediately. Ignored, with a note, for agents without such a key.
     pub send_now: Option<bool>,
+    /// For a prompt. screen (default) leaves the answer on the agent's screen. mail asks the agent to mail its exact final answer to you (your pane inbox, or a remote caller's inbox): wait turn returns it as `reply`; otherwise `reply: "pending"` and the mail arrives later. Use it when you need the whole answer, not a screen excerpt. Needs an agent that has the herdr mail tool; one without it cannot reply.
+    pub reply: Option<Reply>,
     /// Answer a blocked agent's prompt, or a startup dialog on screen, with text or keys. Only for an agent you launched; refused otherwise.
     pub answer_blocked: Option<bool>,
     /// How long after_idle and restart wait for idle, in milliseconds. Default 30000, capped at the wait cap.
@@ -101,6 +108,11 @@ fn validate(params: &SendParams) -> Result<(), HerdrError> {
     if raw && params.wait.is_some() {
         return Err(HerdrError::invalid_params(
             "wait applies to a prompt, not to text or keys",
+        ));
+    }
+    if raw && params.reply.is_some() {
+        return Err(HerdrError::invalid_params(
+            "reply applies to a prompt, not to text or keys",
         ));
     }
     if raw && params.send_now.is_some() {
@@ -156,6 +168,21 @@ pub async fn run(
                 timeout,
             };
             let send_now = params.send_now.unwrap_or(false);
+            let plan = match params.reply.unwrap_or_default() {
+                Reply::Screen => None,
+                Reply::Mail if inner.is_remote() => Some(remote_plan(
+                    mail::checked_remote_inbox(inner, client_info_name, None).await?,
+                )),
+                Reply::Mail => Some(caller_plan(&scoped.snapshot, resolution)?),
+            };
+            let with_reply;
+            let prompt = match &plan {
+                Some(plan) => {
+                    with_reply = format!("{prompt}\n\n{}", reply_paragraph(&plan.parent));
+                    with_reply.as_str()
+                }
+                None => prompt,
+            };
             let mut out = send_prompt(
                 client,
                 pane,
@@ -166,9 +193,28 @@ pub async fn run(
                 ct,
             )
             .await?;
-            if params.wait == Some(SendWait::Turn) {
-                let remaining = cap.saturating_sub(started.elapsed());
-                await_turn(client, inner, &mut out, remaining, ct, progress).await;
+            let remaining = cap.saturating_sub(started.elapsed());
+            let waits = params.wait == Some(SendWait::Turn);
+            match &plan {
+                Some(plan) if waits && !out["turn"].is_null() => {
+                    let name = agent.and_then(|agent| agent.name.clone());
+                    let sender = Sender {
+                        pane,
+                        name: name.as_deref(),
+                    };
+                    await_mail(
+                        inner, client, &mut out, plan, sender, remaining, ct, progress,
+                    )
+                    .await;
+                }
+                Some(plan) => {
+                    out["reply"] = json!("pending");
+                    add_note(&mut out, &pending_note(inner.is_remote(), &plan.parent));
+                }
+                None if waits => {
+                    await_turn(client, inner, &mut out, remaining, ct, progress).await;
+                }
+                None => {}
             }
             Ok(out)
         }
@@ -361,27 +407,92 @@ async fn await_turn(
         }
     };
     match outcome {
-        Ok(outcome) => {
-            let fields = outcome.to_json();
-            if let (Some(fields), Some(target)) = (fields.as_object(), out.as_object_mut()) {
-                for (key, value) in fields {
-                    if key != "pane" && key != "note" {
-                        target.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-            if let Some(note) = fields["note"].as_str() {
-                add_note(out, note);
-            }
+        Ok(outcome) => merge_wait(out, &outcome.to_json()),
+        Err(err) => wait_failed(out, &err),
+    }
+}
+
+/// The agent a reply is expected from.
+#[derive(Debug, Clone, Copy)]
+struct Sender<'a> {
+    pane: &'a str,
+    name: Option<&'a str>,
+}
+
+/// Waits for the agent's mailed answer and its turn together, like `await_turn`: the prompt is
+/// delivered, so nothing here fails the call.
+#[allow(clippy::too_many_arguments)]
+async fn await_mail(
+    inner: &Inner,
+    client: &Client,
+    out: &mut Value,
+    plan: &MailPlan,
+    sender: Sender<'_>,
+    remaining: Duration,
+    ct: &CancellationToken,
+    progress: Option<UnboundedSender<Progress>>,
+) {
+    let Ok(turn) = serde_json::from_value::<Turn>(out["turn"].clone()) else {
+        return;
+    };
+    let name = sender.name.unwrap_or(sender.pane);
+    if remaining.is_zero() {
+        out["timed_out"] = json!(true);
+        out["reply"] = json!("pending");
+        add_note(out, &pending_note(inner.is_remote(), &plan.parent));
+        return;
+    }
+    let filter = SenderFilter::new(
+        std::iter::once(sender.pane.to_owned()).chain(sender.name.map(str::to_owned)),
+    );
+    let mailbox = inner.mailbox();
+    let details = json!({"pane": sender.pane});
+    let outcome = await_reply(ReplyWait {
+        client,
+        mailbox: &mailbox,
+        wait: &inner.wait,
+        mail_poll: inner.launch.mail_poll,
+        reply_grace: inner.launch.reply_grace,
+        plan,
+        filter: &filter,
+        turn,
+        name,
+        remaining,
+        ticks: progress,
+        cancel: ct,
+        details: &details,
+    })
+    .await;
+    match outcome {
+        Ok(outcome) => merge_wait(out, &outcome.to_json()),
+        Err(err) if err.code() == "cancelled" => {
+            out["timed_out"] = json!(true);
+            out["reply"] = json!("pending");
         }
-        Err(err) => {
-            out["wait_error"] = json!({"code": err.code(), "message": err.to_string()});
-            add_note(
-                out,
-                "the prompt was delivered but the wait failed; do not resend. Retry herdr_wait with the turn, or read the pane",
-            );
+        Err(err) => wait_failed(out, &err),
+    }
+}
+
+/// Merges a wait's fields into `out`, keeping its pane and adding to its note.
+fn merge_wait(out: &mut Value, fields: &Value) {
+    if let (Some(fields), Some(target)) = (fields.as_object(), out.as_object_mut()) {
+        for (key, value) in fields {
+            if key != "pane" && key != "note" {
+                target.insert(key.clone(), value.clone());
+            }
         }
     }
+    if let Some(note) = fields["note"].as_str() {
+        add_note(out, note);
+    }
+}
+
+fn wait_failed(out: &mut Value, err: &HerdrError) {
+    out["wait_error"] = json!({"code": err.code(), "message": err.to_string()});
+    add_note(
+        out,
+        "the prompt was delivered but the wait failed; do not resend. Retry herdr_wait with the turn, or read the pane",
+    );
 }
 
 /// Appends `text` to the note in `out`, keeping any earlier one.

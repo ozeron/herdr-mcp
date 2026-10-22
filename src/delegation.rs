@@ -34,23 +34,12 @@ pub fn require_verified_caller(resolution: &Resolution) -> Result<&Caller, Herdr
     }
 }
 
-/// Checked before anything is created: replies go to the caller's inbox, and the child needs the
-/// mail tool (`child_has_mail_tool`) to send one.
-pub fn mail_plan(
-    kind: &str,
-    child_has_mail_tool: bool,
+/// The verified local caller's plan: its pane inbox, under its agent name when it has one.
+pub fn caller_plan(
     snapshot: &SessionSnapshot,
     resolution: &Resolution,
 ) -> Result<MailPlan, HerdrError> {
     let caller = require_verified_caller(resolution)?;
-    if !child_has_mail_tool {
-        return Err(HerdrError::tool(
-            "reply_unsupported",
-            format!(
-                "kind {kind:?} gets no herdr MCP server here, so the child would have no mail tool to reply with; use reply screen"
-            ),
-        ));
-    }
     let name = snapshot
         .agents
         .iter()
@@ -60,6 +49,28 @@ pub fn mail_plan(
         inbox: Inbox::new(&caller.pane_id, name.as_deref()),
         parent: name.unwrap_or_else(|| caller.pane_id.clone()),
     })
+}
+
+/// A remote caller's plan: the child mails the caller's name inbox, `slug`.
+pub fn remote_plan(slug: String) -> MailPlan {
+    MailPlan {
+        inbox: Inbox::named(&slug),
+        parent: slug,
+    }
+}
+
+/// The child needs the mail tool (`child_has_mail_tool`) to reply; checked before anything is
+/// created.
+pub fn require_mail_tool(kind: &str, child_has_mail_tool: bool) -> Result<(), HerdrError> {
+    if child_has_mail_tool {
+        return Ok(());
+    }
+    Err(HerdrError::tool(
+        "reply_unsupported",
+        format!(
+            "kind {kind:?} gets no herdr MCP server here, so the child would have no mail tool to reply with; use reply screen"
+        ),
+    ))
 }
 
 pub fn reply_paragraph(parent: &str) -> String {
