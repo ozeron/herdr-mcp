@@ -383,7 +383,7 @@ impl Destination {
 
 /// `path` as the file system sees it: `~` expanded, `..` folded, and symlinks such as `/tmp`
 /// resolved in the longest part that exists, so the cwd check compares real locations.
-fn real_path(path: &str) -> PathBuf {
+pub(crate) fn real_path(path: &str) -> PathBuf {
     let expanded = match (path.strip_prefix('~'), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
             PathBuf::from(home).join(rest.trim_start_matches('/'))

@@ -76,6 +76,7 @@ Read mode registers the four observe tools, the three mail tools and the two ses
 | `herdr_interrupt` | Cancel the current work without closing the pane | `target`, `method` (auto, keys, signal), `signal` | `result`, `status_after` |
 | `herdr_close` | Close a pane or tab | `target`, `allow_self`, `force` | `closed`, `kind`, `id` |
 | `herdr_move` | Move a pane you launched into a new tab of another workspace, keeping its process | `target`, `workspace_id`, `label`, `allow_self`, `force` | `moved`, `previous{pane, tab, workspace}`, `pane`, `tab`, `workspace`, `cwd`, `note` |
+| `herdr_file_read` | Read a file an agent wrote, in pages | `path`, `offset` (0), `max_bytes` (50000, max 75000) | `path`, `size`, `offset`, `bytes`, `encoding` (`utf8` or `base64`), `content`, `next_offset`, `eof` |
 
 Behaviour worth knowing:
 - A `target` is a pane ID or an agent name. `herdr_close` also takes a tab ID, and refuses a workspace.
@@ -98,11 +99,13 @@ Behaviour worth knowing:
 - `where` takes at most one of `pane`, `split` (`right` or `down`), `tab`, `workspace` or `worktree{branch, base}`. The default is a new tab. `split` takes `of`, the pane to split (pane ID or agent name); it defaults to the calling pane, and external callers must give it. `of` without `split` is an error, and so is an unknown key.
 - A new tab or worktree goes into `where.workspace_id` (a workspace ID, or a label matched case-insensitively; an ID wins) when given, else the verified calling pane's workspace. A remote caller (a tunnel bridge, such as ChatGPT) never counts as a pane, whatever process started the bridge, and must give `workspace_id`: it gets `destination_required` with the list of workspaces instead of landing in whatever workspace has focus. A local caller with no verified pane keeps the focused workspace, with a `warning` saying so. A `cwd` outside the destination's worktree is allowed and returns a `warning`. Results give the resolved `workspace`, `tab`, `pane` and `cwd`.
 - `herdr_move` fixes a misplaced pane without a restart: Herdr moves it, process and all, into a new tab of the named workspace. Its pane ID changes with the workspace; the result gives `previous` and the new IDs.
+- `herdr_file_read` is how a caller with no shared filesystem, such as ChatGPT, gets a report or an artifact: a control tool, so read mode has none. The path must resolve, symlinks followed, under the working directory of a pane or agent in the active session, or under the temp directory. A pane in `/` or the home directory opens nothing, and `.ssh`, `.gnupg`, `.aws`, `.netrc` and `.git-credentials` are refused under any root. Text comes back as text, cut on a whole character; other bytes as base64. Pass `next_offset` as `offset` until `eof`. The audit log keeps the path and the byte count, never the content.
 
 Malformed arguments (a missing field, a bad enum value, an unknown key) fail with `isError` and a plain-text message naming the field, with no `code`. Tool failures return `isError` with a `code` and a `message`. Codes worth knowing:
 - `answer_refused`: `herdr_interrupt` would answer a blocked prompt.
 - `agent_needs_input`: `herdr_launch` found a startup dialog it did not answer (`dialogs: surface`, one that stayed after the answer, or more than 3). The pane is kept; details carry `pane`, `phase` and `dialog{id, excerpt}`.
 - `keys_failed`: `herdr_send` could not send the keys.
+- `path_not_allowed`, `file_not_found`, `not_a_file`, `file_unreadable`: `herdr_file_read` refused or could not read the path. `path_not_allowed` lists the allowed `roots`.
 - `cancelled`: the client cancelled a `herdr_send`, `herdr_launch` or `herdr_mail_wait`. Launch keeps the pane and reports `pane`, `phase` and `turn`.
 - `runtime_mode_unsupported`: `herdr_launch` got a non-inherit `runtime_mode` for a kind other than codex or claude. Nothing is created.
 - `runtime_mode_escalation_denied`: the requested `runtime_mode` is above the caller's mode, or `full-access` from an unknown caller without `allow_full_access`. Details carry `runtime_mode` and `caller_runtime_mode`. Nothing is created.

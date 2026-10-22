@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod close;
+pub mod file_read;
 pub mod interrupt;
 pub mod launch;
 pub mod launch_session;

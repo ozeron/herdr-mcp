@@ -139,6 +139,8 @@ const SUMMARY_KEYS: &[&str] = &[
     "ready_matched",
     "phase",
     "status",
+    "bytes",
+    "eof",
 ];
 const MAX_ERROR_CHARS: usize = 300;
 
