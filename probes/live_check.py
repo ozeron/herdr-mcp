@@ -112,6 +112,19 @@ def main(binary):
 
                 read, err = bridge.tool("herdr_read", {"target": pane, "source": "visible"})
                 check("read visible works", not err and read.get("source") == "visible")
+                check("read reports more_above", "more_above" in read, json.dumps(read)[:200])
+
+                with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as report:
+                    report.write("# live check\n")
+                try:
+                    got, err = bridge.tool("herdr_file_read", {"path": report.name})
+                    check("file read returns a temp file", not err and got.get("content") == "# live check\n",
+                          json.dumps(got)[:200])
+                finally:
+                    os.unlink(report.name)
+                got, err = bridge.tool("herdr_file_read", {"path": "/etc/hosts"})
+                check("file read refuses a path outside the roots",
+                      err and got.get("code") == "path_not_allowed", json.dumps(got)[:200])
 
                 moved, err = bridge.tool("herdr_move", {"target": pane, "workspace_id": b})
                 new = moved.get("pane")
