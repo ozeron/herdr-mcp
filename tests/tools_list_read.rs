@@ -456,14 +456,18 @@ async fn list_tail_adds_each_panes_last_lines() {
     assert_eq!(find(&list, "w2:p1")["tail"], json!(["two", "three"]));
     assert_eq!(find(&list, "w1:p2")["tail"], json!(["VITE ready"]));
     assert!(find(&list, "w1:p3").get("tail").is_none());
-    let lines: Vec<Value> = h
+    let lines: Vec<(Value, Value)> = h
         .fake
         .requests()
         .into_iter()
         .filter(|r| r["method"] == "agent.read" && r["params"]["target"] == "w2:p1")
-        .map(|r| r["params"]["lines"].clone())
+        .map(|r| (r["params"]["lines"].clone(), r["params"]["source"].clone()))
         .collect();
-    assert_eq!(lines, [json!(8)]);
+    assert_eq!(
+        lines,
+        [(json!(8), json!("visible"))],
+        "a listing reads the screen passively, never scrolling an agent"
+    );
 }
 
 #[tokio::test]
@@ -589,9 +593,10 @@ async fn read_defaults_to_the_caller_with_120_lines() {
         .find(|r| r["method"] == "agent.read")
         .unwrap();
     assert_eq!(
-        request["params"]["lines"], 480,
-        "fetches extra rows to fill 120 meaningful lines"
+        request["params"]["lines"], 190,
+        "a margin of rows for blank lines, not 4x: each row of an agent's history costs a scroll"
     );
+    assert_eq!(read["more_above"], false);
     assert_eq!(request["params"]["source"], "recent");
 }
 
@@ -621,6 +626,59 @@ async fn read_caps_lines_at_1000_and_marks_truncated() {
         .find(|r| r["method"] == "agent.read")
         .unwrap();
     assert_eq!(request["params"]["lines"], 1000);
+}
+
+fn read_more(pane_id: &str, text: &str) -> Value {
+    let mut result = read_result(pane_id, text);
+    result["read"]["truncated"] = json!(true);
+    result
+}
+
+#[tokio::test]
+async fn read_tops_up_once_when_blank_lines_leave_too_few() {
+    let h = start(None).await;
+    let sparse = "a\n\n\nb\n";
+    let full = "x\ny\nz\na\nb\n";
+    h.fake.reply_seq(
+        "agent.read",
+        vec![read_more("w1:p4", sparse), read_more("w1:p4", full)],
+    );
+    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 4})).await;
+
+    assert_eq!(read["text"], "y\nz\na\nb");
+    let rows: Vec<_> = h
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|r| r["method"] == "agent.read")
+        .map(|r| r["params"]["lines"].clone())
+        .collect();
+    assert_eq!(rows, vec![json!(16), json!(48)]);
+    assert_eq!(read["truncated"], false, "nothing asked for was cut");
+    assert_eq!(read["more_above"], true);
+}
+
+#[tokio::test]
+async fn read_makes_no_top_up_when_no_more_history_exists() {
+    let h = start(None).await;
+    h.fake.reply("agent.read", read_result("w1:p4", "a\n\nb\n"));
+    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 4})).await;
+
+    assert_eq!(read["text"], "a\nb");
+    assert_eq!(count(&h.fake, "agent.read"), 1);
+    assert_eq!(read["more_above"], false);
+}
+
+#[tokio::test]
+async fn read_marks_more_above_without_calling_it_truncated() {
+    let h = start(None).await;
+    h.fake
+        .reply("agent.read", read_more("w1:p4", "one\ntwo\nthree\n"));
+    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 2})).await;
+
+    assert_eq!(read["text"], "two\nthree");
+    assert_eq!(read["truncated"], false);
+    assert_eq!(read["more_above"], true);
 }
 
 #[tokio::test]
@@ -668,7 +726,7 @@ async fn read_skips_blank_lines_and_tui_rules() {
         .filter(|r| r["method"] == "agent.read")
         .map(|r| r["params"]["lines"].clone())
         .collect();
-    assert_eq!(rows, vec![json!(12)]);
+    assert_eq!(rows, vec![json!(14)]);
 }
 
 #[tokio::test]

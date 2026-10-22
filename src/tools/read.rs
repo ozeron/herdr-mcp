@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::herdr::{
     AgentReadParams, ApiErrorCode, Client, HerdrError, PaneReadParams, PaneReadResult, ReadSource,
 };
-use crate::output::{last_meaningful, strip_ansi, truncate_tail};
+use crate::output::{is_meaningful, last_meaningful, strip_ansi, truncate_tail};
 use crate::server::Inner;
 
 pub const DEFAULT_LINES: u32 = 120;
@@ -68,9 +68,7 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     if requested > lines {
         notes.push(format!("lines capped at {MAX_LINES}"));
     }
-    // Room for the blank lines and UI rules that are skipped.
-    let rows = lines.saturating_mul(4).min(MAX_LINES);
-
+    let rows = rows_for(lines);
     let (fetched, agent) = tokio::join!(fetch(&client, &target, source, rows), async {
         match inner.client() {
             Ok(client) => client.agent_get(&target).await.ok(),
@@ -78,7 +76,23 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         }
     });
     let status = agent.map(|agent| agent.agent_status);
-    let (result, used) = fetched?;
+    let (mut result, used) = fetched?;
+    // A full-screen agent's history is read by scrolling it, so the first read asks for few rows
+    // and one more is made only when blank lines left too few and more exists.
+    if used == Source::Recent
+        && result.truncated
+        && rows < MAX_LINES
+        && meaningful_count(&result.text) < lines as usize
+        && let (more, Source::Recent) = fetch(
+            &client,
+            &target,
+            used,
+            rows.saturating_mul(3).min(MAX_LINES),
+        )
+        .await?
+    {
+        result = more;
+    }
     if used != source {
         source = used;
         notes.push(
@@ -92,13 +106,14 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     if cut {
         notes.push(format!("text cut to the last {max_chars} characters"));
     }
-    let truncated = result.truncated || cut || requested > lines;
+    let more_above = result.truncated || meaningful_count(&result.text) > lines as usize;
     let mut out = json!({
         "pane_id": result.pane_id,
         "source": source.herdr(),
         "lines": lines,
         "text": text,
-        "truncated": truncated,
+        "truncated": cut || requested > lines,
+        "more_above": more_above,
     });
     if let Some(status) = status {
         out["status"] = json!(status);
@@ -133,10 +148,27 @@ async fn fetch(
     }
 }
 
-/// The last `lines` meaningful lines of a pane, for a listing; `None` when it cannot be read.
+/// Terminal rows to ask for to fill `lines` meaningful lines: a margin for blank lines and UI
+/// rules, since every row of a full-screen agent's history costs a scroll.
+fn rows_for(lines: u32) -> u32 {
+    lines
+        .saturating_add(lines / 2)
+        .saturating_add(10)
+        .min(MAX_LINES)
+}
+
+fn meaningful_count(text: &str) -> usize {
+    strip_ansi(text)
+        .lines()
+        .filter(|line| is_meaningful(line))
+        .count()
+}
+
+/// The last `lines` meaningful lines of a pane's screen, for a listing; `None` when it cannot be
+/// read. The visible screen is read passively, so a listing never scrolls an agent.
 pub async fn tail(client: &Client, target: &str, lines: u32) -> Option<Vec<String>> {
     let rows = lines.saturating_mul(4).min(MAX_LINES);
-    let (result, _) = fetch(client, target, Source::Recent, rows).await.ok()?;
+    let (result, _) = fetch(client, target, Source::Visible, rows).await.ok()?;
     let text = last_meaningful(&strip_ansi(&result.text), lines as usize);
     Some(text.lines().map(str::to_owned).collect())
 }
