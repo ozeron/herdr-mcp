@@ -1005,14 +1005,15 @@ async fn a_stalled_herdr_cannot_push_a_turn_wait_past_its_cap() {
         run(
             &fake,
             &fast(),
-            request(Condition::Turn(token(41, TurnFrom::Working)), 300),
+            request(Condition::Turn(token(41, TurnFrom::Working)), 1000),
         ),
     )
     .await
     .expect("the wait hung");
 
+    // The cap, then one 500 ms last look.
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_millis(1700),
         "{:?}",
         started.elapsed()
     );
@@ -1102,6 +1103,64 @@ async fn a_process_exit_wait_whose_last_poll_lands_at_the_deadline_times_out_cle
 
     assert_eq!(out["matched"], false);
     assert_eq!(out["timed_out"], true);
+}
+
+/// The first `agent.get` answers at once; every later one answers after 2 s.
+fn late_after_first(fake: &FakeHerdr, status: &str) {
+    fake.on_seq(
+        "agent.get",
+        vec![
+            Script::Reply(info(status, 41, None)),
+            Script::Delayed(
+                Duration::from_secs(2),
+                Box::new(Script::Reply(info(status, 41, None))),
+            ),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_turn_wait_whose_last_look_answers_late_times_out_on_what_it_saw_last() {
+    let fake = FakeHerdr::start().await;
+    hold_stream(&fake, vec![]);
+    late_after_first(&fake, "working");
+
+    let started = Instant::now();
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(Condition::Turn(token(41, TurnFrom::Working)), 300),
+    )
+    .await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+    assert_eq!(out["status"], "working");
+    assert_eq!(out["turn"]["after"], 41);
+    assert!(out["note"].to_string().contains("last seen"), "{out}");
+}
+
+#[tokio::test]
+async fn an_until_wait_whose_last_look_answers_late_times_out_on_what_it_saw_last() {
+    let fake = FakeHerdr::start().await;
+    hold_stream(&fake, vec![]);
+    late_after_first(&fake, "working");
+
+    let out = run_ok(
+        &fake,
+        &fast(),
+        request(Condition::Until(vec![AgentStatus::Idle]), 300),
+    )
+    .await;
+
+    assert_eq!(out["timed_out"], true);
+    assert_eq!(out["status"], "working");
+    assert!(out["note"].to_string().contains("last seen"), "{out}");
 }
 
 #[tokio::test]

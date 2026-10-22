@@ -19,9 +19,11 @@ pub const OBSERVE_WINDOW: Duration = Duration::from_secs(2);
 pub const RECHECK_DELAY: Duration = Duration::from_millis(300);
 
 const EXCERPT_TIMEOUT: Duration = Duration::from_secs(2);
-const LAST_LOOK: Duration = Duration::from_millis(100);
+/// Herdr often takes about 100 ms to answer, so the look at the deadline gets more than that.
+const LAST_LOOK: Duration = Duration::from_millis(500);
 const UNKNOWN_NOTE: &str =
     "status is unknown: read the pane before concluding anything about the turn";
+const LATE_NOTE: &str = "Herdr did not answer the last look in time, so the status is as last seen";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
@@ -459,6 +461,7 @@ async fn wait_for_turn(
     let mut wakeups = Wakeups::open(client, &turn.pane, tuning.poll_interval, deadline).await?;
     let mut pane = turn.pane.clone();
     let mut terminal_id = Some(turn.terminal_id.clone());
+    let mut last = None;
     loop {
         // The shell probe runs beside the lookup, on the pane as last known. If the lookup finds
         // the agent in another pane, the probe is repeated there.
@@ -476,7 +479,11 @@ async fn wait_for_turn(
                 }
             }
         );
-        let agent = found?.map_err(Lost::into_error)?;
+        let agent = match found {
+            Ok(found) => found.map_err(Lost::into_error)?,
+            Err(err) => return late(client, err, deadline, last, Some(&turn)).await,
+        };
+        last = Some(agent.clone());
         turn.pane.clone_from(&agent.pane_id);
         let shell = match (turn.shell_pid, early_shell) {
             (Some(_), Some(shell)) if agent.pane_id == probed => shell,
@@ -520,6 +527,25 @@ async fn wait_for_turn(
     }
 }
 
+/// A lookup that runs out of time at the deadline ends the wait as a timeout on what it saw
+/// last, not as an error.
+async fn late(
+    client: &Client,
+    err: HerdrError,
+    deadline: Instant,
+    last: Option<AgentInfo>,
+    turn: Option<&Turn>,
+) -> Result<Outcome, HerdrError> {
+    match last {
+        Some(agent) if err.code() == "herdr_timeout" && Instant::now() >= deadline => {
+            let mut out = agent_result(client, &agent, agent.agent_status, false, None, turn).await;
+            out.add_note(LATE_NOTE);
+            Ok(out)
+        }
+        _ => Err(err),
+    }
+}
+
 async fn wait_for_status(
     client: &Client,
     tuning: &Tuning,
@@ -530,14 +556,19 @@ async fn wait_for_status(
     let mut wakeups = Wakeups::open(client, pane, tuning.poll_interval, deadline).await?;
     let mut pane = pane.to_string();
     let mut terminal_id = None;
+    let mut last = None;
     loop {
-        let agent = bounded(
+        let agent = match bounded(
             client,
             deadline,
             lookup(client, &mut pane, &mut terminal_id),
         )
-        .await?
-        .map_err(|_| not_running())?;
+        .await
+        {
+            Ok(found) => found.map_err(|_| not_running())?,
+            Err(err) => return late(client, err, deadline, last, None).await,
+        };
+        last = Some(agent.clone());
         if statuses.contains(&agent.agent_status) {
             return Ok(agent_result(client, &agent, agent.agent_status, true, None, None).await);
         }
