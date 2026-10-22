@@ -182,6 +182,17 @@ async fn a_pane_opened_in_the_root_or_home_directory_reads_nothing() {
 }
 
 #[tokio::test]
+async fn a_hard_link_is_refused_since_its_file_may_live_outside() {
+    let (h, dir) = pane_in_dir(ToolMode::Control).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "outside").unwrap();
+    std::fs::hard_link(outside.path().join("secret"), dir.path().join("notes.txt")).unwrap();
+    let out = err(&h, "herdr_file_read", read("notes.txt", json!({}))).await;
+    assert_eq!(out["code"], "path_not_allowed");
+    assert!(!out.to_string().contains("outside\""), "{out}");
+}
+
+#[tokio::test]
 async fn credential_directories_are_refused() {
     let (h, dir) = pane_in_dir(ToolMode::Control).await;
     std::fs::create_dir(dir.path().join(".ssh")).unwrap();
@@ -189,7 +200,7 @@ async fn credential_directories_are_refused() {
     std::fs::write(dir.path().join(".env"), "TOKEN=x").unwrap();
     std::fs::write(dir.path().join(".env.local"), "TOKEN=x").unwrap();
     std::fs::write(dir.path().join(".envrc.md"), "notes").unwrap();
-    for path in [".ssh/id_ed25519", ".env", ".env.local"] {
+    for path in [".ssh/id_ed25519", ".SSH/id_ed25519", ".env", ".ENV.local"] {
         assert_eq!(
             err_code(&h, "herdr_file_read", read(path, json!({}))).await,
             "path_not_allowed",

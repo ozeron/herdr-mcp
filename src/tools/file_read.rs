@@ -3,7 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine;
@@ -107,7 +107,9 @@ fn check(real: &Path, root: &Path, asked: &str) -> Result<(), HerdrError> {
     let secret = real.components().any(|part| match part {
         Component::Normal(name) => {
             let name = name.to_string_lossy();
-            SECRETS.contains(&name.as_ref()) || name == ".env" || name.starts_with(".env.")
+            // Lowercased: macOS paths ignore case, so .SSH is .ssh.
+            let name = name.to_lowercase();
+            SECRETS.contains(&name.as_str()) || name == ".env" || name.starts_with(".env.")
         }
         _ => false,
     });
@@ -141,14 +143,25 @@ fn read_page(
             }
             _ => unreadable(err),
         })?;
-    if let Some(opened) = open_path(&file) {
-        check(&opened, root, asked)?;
-    }
+    let opened = open_path(&file).ok_or_else(|| {
+        HerdrError::tool(
+            "file_unreadable",
+            format!("{asked}: the open file's real path cannot be checked here"),
+        )
+    })?;
+    check(&opened, root, asked)?;
     let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() {
         return Err(HerdrError::tool(
             "not_a_file",
             format!("{asked} is not a regular file"),
+        ));
+    }
+    // A hard link has an inside name for a file that may live anywhere.
+    if meta.nlink() > 1 {
+        return Err(HerdrError::tool(
+            "path_not_allowed",
+            format!("{asked} has other hard links, so where it lives cannot be checked"),
         ));
     }
     if offset > meta.len() {
@@ -201,7 +214,8 @@ fn char_end(buf: &[u8], max_bytes: usize) -> usize {
     end
 }
 
-/// The path an open file really has, or `None` where the platform cannot say.
+/// The path an open file really has, or `None` where the platform cannot say; then nothing is
+/// read.
 #[cfg(target_os = "macos")]
 fn open_path(file: &File) -> Option<PathBuf> {
     use std::ffi::OsStr;
