@@ -186,9 +186,19 @@ async fn credential_directories_are_refused() {
     let (h, dir) = pane_in_dir(ToolMode::Control).await;
     std::fs::create_dir(dir.path().join(".ssh")).unwrap();
     std::fs::write(dir.path().join(".ssh/id_ed25519"), "secret").unwrap();
+    std::fs::write(dir.path().join(".env"), "TOKEN=x").unwrap();
+    std::fs::write(dir.path().join(".env.local"), "TOKEN=x").unwrap();
+    std::fs::write(dir.path().join(".envrc.md"), "notes").unwrap();
+    for path in [".ssh/id_ed25519", ".env", ".env.local"] {
+        assert_eq!(
+            err_code(&h, "herdr_file_read", read(path, json!({}))).await,
+            "path_not_allowed",
+            "{path}"
+        );
+    }
     assert_eq!(
-        err_code(&h, "herdr_file_read", read(".ssh/id_ed25519", json!({}))).await,
-        "path_not_allowed"
+        ok(&h, "herdr_file_read", read(".envrc.md", json!({}))).await["content"],
+        "notes"
     );
 }
 

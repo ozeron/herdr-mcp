@@ -20,7 +20,8 @@ pub const DEFAULT_BYTES: usize = 50_000;
 /// 100000 characters once base64-encoded, the most a read returns.
 pub const MAX_BYTES: usize = 75_000;
 
-/// Refused under any pane. A speed bump, not a boundary: an agent with a shell can read these.
+/// Refused under any pane, along with `.env` files. A speed bump, not a boundary: an agent with
+/// a shell can read these.
 const SECRETS: &[&str] = &[".ssh", ".gnupg", ".aws", ".netrc", ".git-credentials"];
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -103,8 +104,12 @@ fn check(real: &Path, root: &Path, asked: &str) -> Result<(), HerdrError> {
             format!("{asked} is outside {}", root.display()),
         ));
     }
-    let secret = real.components().any(|part| {
-        matches!(part, Component::Normal(name) if SECRETS.iter().any(|secret| name == *secret))
+    let secret = real.components().any(|part| match part {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            SECRETS.contains(&name.as_ref()) || name == ".env" || name.starts_with(".env.")
+        }
+        _ => false,
     });
     if secret {
         return Err(HerdrError::tool(
