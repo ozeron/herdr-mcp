@@ -18,6 +18,10 @@ use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Imple
 use serde_json::{Value, json};
 
 async fn start(env_pane: Option<&'static str>) -> Harness {
+    start_with_sessions(env_pane, false).await
+}
+
+async fn start_with_sessions(env_pane: Option<&'static str>, sessions: bool) -> Harness {
     let fake = FakeHerdr::start().await;
     let log_dir = tempfile::tempdir().unwrap();
     let config = BridgeConfig {
@@ -31,7 +35,13 @@ async fn start(env_pane: Option<&'static str>) -> Harness {
             workspace_id: env_pane.map(|_| "w1".into()),
         },
         logger: Logger::to_dir(log_dir.path().join("logs")).unwrap(),
-        install_env: None,
+        install_env: sessions.then(|| herdr_mcp::install::InstallEnv {
+            home: log_dir.path().to_path_buf(),
+            claude_config_dir: None,
+            codex_home: None,
+            path: Default::default(),
+            exe: "herdr-mcp".into(),
+        }),
     };
     let state = log_dir.path().join("state");
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
@@ -905,4 +915,487 @@ async fn read_includes_status_for_an_agent_but_not_a_plain_pane() {
     let read = ok(&h, "herdr_read", json!({"target": "w1:p2"})).await;
     assert_eq!(read["text"], "plain");
     assert!(read.get("status").is_none());
+}
+
+const SESSION_ID: &str = "019a1234-5678-7000-8000-0123456789ab";
+
+fn session_agent(kind: &str) -> Value {
+    let mut a = agent("w1:p4", "w1:t2", "w1", "rev", kind, "working");
+    a["agent_session"] = json!({
+        "source": format!("herdr:{kind}"), "agent": kind, "kind": "id", "value": SESSION_ID,
+    });
+    json!({"type": "agent_info", "agent": a})
+}
+
+fn write_session(h: &Harness, kind: &str, records: &[Value]) -> std::path::PathBuf {
+    let path = if kind == "claude" {
+        h._log_dir
+            .path()
+            .join(".claude/projects/project")
+            .join(format!("{SESSION_ID}.jsonl"))
+    } else {
+        h._log_dir
+            .path()
+            .join(".codex/sessions/2026/11/05")
+            .join(format!("rollout-{SESSION_ID}.jsonl"))
+    };
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+fn claude_message(text: &str) -> Value {
+    json!({"type": "assistant", "sessionId": SESSION_ID, "uuid": "answer",
+    "message": {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "PRIVATE-THOUGHT"},
+        {"type": "text", "text": text},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "PRIVATE-TOOL"}},
+    ]}})
+}
+
+fn codex_meta() -> Value {
+    json!({"type": "session_meta", "payload": {"id": SESSION_ID}})
+}
+
+fn codex_message(text: &str) -> Value {
+    json!({"type": "response_item", "payload": {"type": "message", "role": "assistant",
+        "phase": "final_answer", "content": [{"type": "output_text", "text": text}]}})
+}
+
+#[tokio::test]
+async fn session_read_returns_claude_text_without_reading_or_typing_into_the_terminal() {
+    let h = start_with_sessions(None, true).await;
+    let mut other = claude_message("OTHER-SESSION");
+    other["sessionId"] = json!("other");
+    let mut sidechain = claude_message("SIDECHAIN");
+    sidechain["isSidechain"] = json!(true);
+    write_session(
+        &h,
+        "claude",
+        &[other, sidechain, claude_message("café — Київ\nanswer")],
+    );
+    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "session"}),
+    )
+    .await;
+    assert_eq!(read["source"], "session");
+    assert_eq!(read["text"], "café — Київ\nanswer");
+    assert_eq!(read["provider"], "claude");
+    assert_eq!(read["session_id"], SESSION_ID);
+    assert_eq!(
+        read["status"], "working",
+        "status comes from Herdr, not the saved answer"
+    );
+    assert!(read["next_cursor"].is_string());
+    assert_eq!(count(&h.fake, "agent.read"), 0);
+    assert_eq!(count(&h.fake, "pane.read"), 0);
+    assert!(h.fake.requests().iter().all(|r| r["method"] == "agent.get"));
+}
+
+#[tokio::test]
+async fn session_read_returns_codex_messages_once_and_applies_existing_output_bounds() {
+    let h = start_with_sessions(None, true).await;
+    write_session(
+        &h,
+        "codex",
+        &[
+            codex_meta(),
+            json!({"type": "event_msg", "payload": {"type": "agent_message", "message": "duplicate"}}),
+            json!({"type": "response_item", "payload": {"type": "reasoning", "summary": "PRIVATE"}}),
+            codex_message("older\none\néééééééééé"),
+        ],
+    );
+    h.fake.reply_seq("agent.get", vec![session_agent("codex")]);
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "session", "lines": 2, "max_chars": 5}),
+    )
+    .await;
+    assert_eq!(read["text"], "ééééé");
+    assert_eq!(read["provider"], "codex");
+    assert_eq!(read["truncated"], true);
+    assert_eq!(read["more_above"], true);
+}
+
+#[tokio::test]
+async fn session_cursor_reads_appended_complete_records_and_retries_partial_json() {
+    use std::io::Write;
+    for provider in ["claude", "codex"] {
+        let h = start_with_sessions(None, true).await;
+        let message = if provider == "claude" {
+            claude_message
+        } else {
+            codex_message
+        };
+        let mut records = vec![message("first")];
+        if provider == "codex" {
+            records.insert(0, codex_meta());
+        }
+        let path = write_session(&h, provider, &records);
+        h.fake.reply_seq("agent.get", vec![session_agent(provider)]);
+        let first = ok(
+            &h,
+            "herdr_read",
+            json!({"target": "rev", "source": "session"}),
+        )
+        .await;
+        let encoded = format!("{}\n", message("second"));
+        let split = encoded.len() / 2;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&encoded.as_bytes()[..split]).unwrap();
+        let partial = ok(
+            &h,
+            "herdr_read",
+            json!({"target": "rev", "source": "session", "after": first["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(partial["text"], "");
+        assert_eq!(partial["next_cursor"], first["next_cursor"]);
+        file.write_all(&encoded.as_bytes()[split..]).unwrap();
+        let second = ok(
+            &h,
+            "herdr_read",
+            json!({"target": "rev", "source": "session", "after": partial["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(second["text"], "second");
+        let empty = ok(
+            &h,
+            "herdr_read",
+            json!({"target": "rev", "source": "session", "after": second["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(empty["text"], "");
+        assert_ne!(first["next_cursor"], second["next_cursor"]);
+    }
+}
+
+#[tokio::test]
+async fn session_read_fails_explicitly_without_metadata_and_does_not_scroll_as_a_fallback() {
+    let h = start_with_sessions(None, true).await;
+    h.fake.reply("agent.get", json!({"type":"agent_info", "agent": agent("w1:p4", "w1:t2", "w1", "rev", "codex", "done")}));
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+    assert_eq!(count(&h.fake, "agent.read"), 0);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"visible", "after":"bad"})
+        )
+        .await,
+        "invalid_params"
+    );
+}
+
+#[tokio::test]
+async fn session_read_rejects_foreign_identity_and_ambiguous_files() {
+    let h = start_with_sessions(None, true).await;
+    let mut meta = codex_meta();
+    meta["payload"]["id"] = json!("foreign");
+    let path = write_session(&h, "codex", &[meta, codex_message("FOREIGN")]);
+    h.fake.reply_seq("agent.get", vec![session_agent("codex")]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+    std::fs::write(
+        &path,
+        format!("{}\n{}\n", codex_meta(), codex_message("answer")),
+    )
+    .unwrap();
+    let second = path
+        .parent()
+        .unwrap()
+        .join(format!("another-{SESSION_ID}.jsonl"));
+    std::fs::copy(&path, second).unwrap();
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn session_read_refuses_symlinks_and_path_like_session_ids() {
+    let h = start_with_sessions(None, true).await;
+    let path = write_session(&h, "claude", &[claude_message("secret")]);
+    let outside = h._log_dir.path().join("outside.jsonl");
+    std::fs::rename(&path, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+    let mut a = session_agent("claude");
+    a["agent"]["agent_session"]["value"] = json!("../../outside");
+    h.fake.reply_seq("agent.get", vec![a]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn session_cursor_rejects_replacement_truncation_and_malformed_tokens() {
+    let h = start_with_sessions(None, true).await;
+    let path = write_session(&h, "codex", &[codex_meta(), codex_message("first")]);
+    h.fake.reply_seq("agent.get", vec![session_agent("codex")]);
+    let first = ok(
+        &h,
+        "herdr_read",
+        json!({"target":"rev", "source":"session"}),
+    )
+    .await;
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session", "after":"not-a-cursor"})
+        )
+        .await,
+        "invalid_params"
+    );
+    std::fs::write(&path, format!("{}\n", codex_meta())).unwrap();
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session", "after":first["next_cursor"]})
+        )
+        .await,
+        "stale_cursor"
+    );
+    let replacement = path.with_extension("new");
+    std::fs::write(
+        &replacement,
+        format!(
+            "{}\n{}\n",
+            codex_meta(),
+            codex_message("replacement longer than first")
+        ),
+    )
+    .unwrap();
+    std::fs::rename(replacement, path).unwrap();
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session", "after":first["next_cursor"]})
+        )
+        .await,
+        "stale_cursor"
+    );
+}
+
+#[tokio::test]
+async fn session_read_rechecks_the_pane_identity_before_returning_text() {
+    let h = start_with_sessions(None, true).await;
+    write_session(&h, "claude", &[claude_message("do not return after reuse")]);
+    let before = session_agent("claude");
+    let mut changed = before.clone();
+    changed["agent"]["terminal_id"] = json!("replacement-terminal");
+    h.fake.reply_seq("agent.get", vec![before, changed]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_changed"
+    );
+    assert_eq!(count(&h.fake, "agent.read"), 0);
+}
+
+#[tokio::test]
+async fn session_read_takes_a_bounded_tail_of_a_large_transcript() {
+    let h = start_with_sessions(None, true).await;
+    write_session(
+        &h,
+        "codex",
+        &[
+            codex_meta(),
+            json!({"type": "response_item", "payload": {"type":"function_call_output", "output": "x".repeat(9 * 1024 * 1024)}}),
+            codex_message("last answer"),
+        ],
+    );
+    h.fake.reply_seq("agent.get", vec![session_agent("codex")]);
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target":"rev", "source":"session"}),
+    )
+    .await;
+    assert_eq!(read["text"], "last answer");
+    assert_eq!(read["more_above"], true);
+    assert_eq!(read["more_after"], false);
+    let next = ok(
+        &h,
+        "herdr_read",
+        json!({"target":"rev", "source":"session", "after":read["next_cursor"]}),
+    )
+    .await;
+    assert_eq!(next["text"], "");
+    assert_eq!(next["next_cursor"], read["next_cursor"]);
+}
+
+#[tokio::test]
+async fn session_read_rejects_malformed_complete_records_instead_of_claiming_a_clean_result() {
+    use std::io::Write;
+    let h = start_with_sessions(None, true).await;
+    let path = write_session(&h, "claude", &[claude_message("answer")]);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(b"not-json\n")
+        .unwrap();
+    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn session_read_reports_an_oversized_latest_record_instead_of_an_empty_answer() {
+    let h = start_with_sessions(None, true).await;
+    write_session(
+        &h,
+        "codex",
+        &[codex_meta(), codex_message(&"x".repeat(9 * 1024 * 1024))],
+    );
+    h.fake.reply_seq("agent.get", vec![session_agent("codex")]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn session_read_rejects_hard_linked_transcripts_for_both_providers() {
+    for provider in ["claude", "codex"] {
+        let h = start_with_sessions(None, true).await;
+        let records = if provider == "claude" {
+            vec![claude_message("do not expose")]
+        } else {
+            vec![codex_meta(), codex_message("do not expose")]
+        };
+        let path = write_session(&h, provider, &records);
+        std::fs::hard_link(path, h._log_dir.path().join("another-name.jsonl")).unwrap();
+        h.fake.reply_seq("agent.get", vec![session_agent(provider)]);
+        assert_eq!(
+            err_code(
+                &h,
+                "herdr_read",
+                json!({"target":"rev", "source":"session"})
+            )
+            .await,
+            "session_unavailable"
+        );
+        assert_eq!(count(&h.fake, "agent.read"), 0);
+    }
+}
+
+#[tokio::test]
+async fn session_read_rejects_a_provider_change_even_if_the_old_session_reference_lingers() {
+    let h = start_with_sessions(None, true).await;
+    write_session(&h, "claude", &[claude_message("old provider")]);
+    let before = session_agent("claude");
+    let mut changed = before.clone();
+    changed["agent"]["agent"] = json!("codex");
+    h.fake.reply_seq("agent.get", vec![before, changed]);
+    assert_eq!(
+        err_code(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session"})
+        )
+        .await,
+        "session_changed"
+    );
+}
+
+#[tokio::test]
+async fn session_read_keeps_a_complete_record_aligned_at_the_tail_budget() {
+    const RECORD_BUDGET: usize = 8 * 1024 * 1024;
+    for provider in ["claude", "codex"] {
+        let h = start_with_sessions(None, true).await;
+        let message = if provider == "claude" {
+            claude_message
+        } else {
+            codex_message
+        };
+        let framing = message("").to_string().len() + 1;
+        let record = message(&"x".repeat(RECORD_BUDGET - framing));
+        assert_eq!(record.to_string().len() + 1, RECORD_BUDGET);
+        let prefix = if provider == "codex" {
+            codex_meta()
+        } else {
+            json!({"type":"mode", "sessionId":SESSION_ID})
+        };
+        write_session(&h, provider, &[prefix, record]);
+        h.fake.reply_seq("agent.get", vec![session_agent(provider)]);
+        let out = ok(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session", "max_chars":5}),
+        )
+        .await;
+        assert_eq!(out["text"], "xxxxx");
+        assert_eq!(out["truncated"], true);
+        let next = ok(
+            &h,
+            "herdr_read",
+            json!({"target":"rev", "source":"session", "after":out["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(next["text"], "");
+    }
 }

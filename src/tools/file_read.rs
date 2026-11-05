@@ -1,9 +1,7 @@
 //! `herdr_file_read`: a file under the directory a pane was opened in, in pages. File contents
 //! are never logged.
 
-use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine;
@@ -15,6 +13,7 @@ use serde_json::{Value, json};
 use crate::herdr::{HerdrError, SessionSnapshot};
 use crate::place::real_path;
 use crate::server::Inner;
+use crate::verified_file::{self, Error as FileError};
 
 pub const DEFAULT_BYTES: usize = 50_000;
 /// 100000 characters once base64-encoded, the most a read returns.
@@ -104,6 +103,10 @@ fn check(real: &Path, root: &Path, asked: &str) -> Result<(), HerdrError> {
             format!("{asked} is outside {}", root.display()),
         ));
     }
+    check_credentials(real, asked)
+}
+
+fn check_credentials(real: &Path, asked: &str) -> Result<(), HerdrError> {
     let secret = real.components().any(|part| match part {
         Component::Normal(name) => {
             let name = name.to_string_lossy();
@@ -133,37 +136,31 @@ fn read_page(
 ) -> Result<Value, HerdrError> {
     let unreadable =
         |err: std::io::Error| HerdrError::tool("file_unreadable", format!("{asked}: {err}"));
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(real)
-        .map_err(|err| match err.kind() {
-            ErrorKind::NotFound => {
-                HerdrError::tool("file_not_found", format!("{asked} does not exist"))
-            }
-            _ => unreadable(err),
-        })?;
-    let opened = open_path(&file).ok_or_else(|| {
-        HerdrError::tool(
-            "file_unreadable",
-            format!("{asked}: the open file's real path cannot be checked here"),
-        )
-    })?;
-    check(&opened, root, asked)?;
-    let meta = file.metadata().map_err(unreadable)?;
-    if !meta.is_file() {
-        return Err(HerdrError::tool(
-            "not_a_file",
-            format!("{asked} is not a regular file"),
-        ));
-    }
-    // A hard link has an inside name for a file that may live anywhere.
-    if meta.nlink() > 1 {
-        return Err(HerdrError::tool(
-            "path_not_allowed",
-            format!("{asked} has other hard links, so where it lives cannot be checked"),
-        ));
-    }
+    let (mut file, meta) =
+        verified_file::open(real, root, |opened| check_credentials(opened, asked)).map_err(
+            |err| match err {
+                FileError::Open(err) if err.kind() == ErrorKind::NotFound => {
+                    HerdrError::tool("file_not_found", format!("{asked} does not exist"))
+                }
+                FileError::Open(err) | FileError::Metadata(err) => unreadable(err),
+                FileError::PathUnavailable => HerdrError::tool(
+                    "file_unreadable",
+                    format!("{asked}: the open file's real path cannot be checked here"),
+                ),
+                FileError::OutsideRoot => HerdrError::tool(
+                    "path_not_allowed",
+                    format!("{asked} is outside {}", root.display()),
+                ),
+                FileError::Policy(err) => err,
+                FileError::NotFile => {
+                    HerdrError::tool("not_a_file", format!("{asked} is not a regular file"))
+                }
+                FileError::MultipleLinks => HerdrError::tool(
+                    "path_not_allowed",
+                    format!("{asked} has other hard links, so where it lives cannot be checked"),
+                ),
+            },
+        )?;
     if offset > meta.len() {
         return Err(HerdrError::invalid_params(format!(
             "offset {offset} is past the end of {asked} ({} bytes)",
@@ -212,31 +209,4 @@ fn char_end(buf: &[u8], max_bytes: usize) -> usize {
         }
     }
     end
-}
-
-/// The path an open file really has, or `None` where the platform cannot say; then nothing is
-/// read.
-#[cfg(target_os = "macos")]
-fn open_path(file: &File) -> Option<PathBuf> {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::AsRawFd;
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which has that length.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
-        return None;
-    }
-    let len = buf.iter().position(|byte| *byte == 0)?;
-    Some(PathBuf::from(OsStr::from_bytes(&buf[..len])))
-}
-
-#[cfg(target_os = "linux")]
-fn open_path(file: &File) -> Option<PathBuf> {
-    use std::os::unix::io::AsRawFd;
-    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn open_path(_file: &File) -> Option<PathBuf> {
-    None
 }

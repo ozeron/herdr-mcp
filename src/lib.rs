@@ -25,4 +25,5 @@ pub mod sessions;
 pub mod tools;
 pub mod tunnel;
 pub mod turn;
+mod verified_file;
 pub mod wait;

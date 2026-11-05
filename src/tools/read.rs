@@ -8,6 +8,8 @@ use crate::herdr::{
 use crate::output::{is_meaningful, last_meaningful, strip_ansi, truncate_tail};
 use crate::server::Inner;
 
+mod session;
+
 pub const DEFAULT_LINES: u32 = 120;
 pub const MAX_LINES: u32 = 1000;
 pub const DEFAULT_MAX_CHARS: usize = 32_000;
@@ -19,13 +21,17 @@ pub const MAX_CHARS: usize = 100_000;
 pub enum Source {
     Recent,
     Visible,
+    Session,
 }
 
 impl Source {
-    fn herdr(self) -> ReadSource {
+    fn herdr(self) -> Result<ReadSource, HerdrError> {
         match self {
-            Self::Recent => ReadSource::Recent,
-            Self::Visible => ReadSource::Visible,
+            Self::Recent => Ok(ReadSource::Recent),
+            Self::Visible => Ok(ReadSource::Visible),
+            Self::Session => Err(HerdrError::invalid_params(
+                "session output is not a terminal source",
+            )),
         }
     }
 }
@@ -35,8 +41,10 @@ impl Source {
 pub struct ReadParams {
     /// Pane ID or agent name. Defaults to the calling pane.
     pub target: Option<String>,
-    /// `recent` (default) is the latest output, scrollback included; `visible` is exactly what is on screen now.
+    /// `recent` (default) reads terminal history; `visible` reads the screen; `session` reads saved Claude/Codex assistant text without scrolling. Session output can lag and differs from the screen.
     pub source: Option<Source>,
+    /// For `source: session` only: pass `next_cursor` to read newly appended complete records. Omit for the recent tail. This is an incremental cursor, not pagination of text cut by lines/max_chars.
+    pub after: Option<String>,
     /// Lines to return; blank lines and box-drawing rules are skipped. Default 120, enough for an agent's latest turn: leave it unset. Capped at 1000.
     pub lines: Option<u32>,
     /// Character cap on the returned text; the oldest output is cut first. Default 32000, capped at 100000.
@@ -64,6 +72,21 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         .unwrap_or(DEFAULT_MAX_CHARS)
         .clamp(1, MAX_CHARS);
     let mut source = params.source.unwrap_or(Source::Recent);
+    if source == Source::Session {
+        return read_session(
+            inner,
+            &client,
+            &target,
+            params.after,
+            requested,
+            lines,
+            max_chars,
+        )
+        .await;
+    }
+    if params.after.is_some() {
+        return Err(HerdrError::invalid_params("after requires source: session"));
+    }
     let mut notes = Vec::new();
     if requested > lines {
         notes.push(format!("lines capped at {MAX_LINES}"));
@@ -110,7 +133,7 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     let more_above = result.truncated || meaningful_count(&result.text) > lines as usize;
     let mut out = json!({
         "pane_id": result.pane_id,
-        "source": source.herdr(),
+        "source": source.herdr()?,
         "lines": lines,
         "text": text,
         "truncated": cut || requested > lines,
@@ -123,6 +146,62 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         out["note"] = Value::String(notes.join("; "));
     }
     Ok(out)
+}
+
+async fn read_session(
+    inner: &Inner,
+    client: &Client,
+    target: &str,
+    after: Option<String>,
+    requested: u32,
+    lines: u32,
+    max_chars: usize,
+) -> Result<Value, HerdrError> {
+    let agent = client.agent_get(target).await?;
+    let env = inner.install_env.clone().ok_or_else(|| {
+        HerdrError::tool(
+            "session_unavailable",
+            "agent data directories are unavailable",
+        )
+    })?;
+    let snapshot = agent.clone();
+    let output =
+        tokio::task::spawn_blocking(move || session::read(&snapshot, &env, after.as_deref()))
+            .await
+            .map_err(|_| {
+                HerdrError::tool("session_unavailable", "session reader did not finish")
+            })??;
+    // A pane may have been reused or switched sessions while its file was read.
+    let current = client.agent_get(&agent.pane_id).await?;
+    if current.terminal_id != agent.terminal_id
+        || current.agent != agent.agent
+        || current.agent_session != agent.agent_session
+    {
+        return Err(HerdrError::tool(
+            "session_changed",
+            "the pane changed sessions during the read; read again without a cursor",
+        ));
+    }
+    let clean = strip_ansi(&output.text);
+    let more_above = output.more_above || meaningful_count(&clean) > lines as usize;
+    let (text, cut) = truncate_tail(last_meaningful(&clean, lines as usize), max_chars);
+    let mut notes = vec!["saved assistant text only; prompts, tools and reasoning are omitted. Saved output can lag live output; status comes from Herdr".to_string()];
+    if requested > lines {
+        notes.push(format!("lines capped at {MAX_LINES}"));
+    }
+    if cut {
+        notes.push(format!("text cut to the last {max_chars} characters"));
+    }
+    if output.pending {
+        notes.push("an unfinished transcript record is pending; the cursor will retry it".into());
+    }
+    Ok(json!({
+        "pane_id": current.pane_id, "source": "session", "provider": output.provider,
+        "session_id": output.session_id, "status": current.agent_status,
+        "lines": lines, "text": text, "truncated": cut || requested > lines,
+        "more_above": more_above, "more_after": output.more_after,
+        "next_cursor": output.next_cursor, "note": notes.join("; "),
+    }))
 }
 
 /// Reads an agent, or a plain pane when `target` is no agent. A busy full-screen agent has no
@@ -181,7 +260,7 @@ async fn read_agent(
     lines: u32,
 ) -> Result<PaneReadResult, HerdrError> {
     let mut params = AgentReadParams::new(target);
-    params.source = source.herdr();
+    params.source = source.herdr()?;
     params.lines = Some(lines);
     client.agent_read(&params).await
 }
@@ -193,7 +272,7 @@ async fn read_pane(
     lines: u32,
 ) -> Result<PaneReadResult, HerdrError> {
     let mut params = PaneReadParams::new(target);
-    params.source = source.herdr();
+    params.source = source.herdr()?;
     params.lines = Some(lines);
     match client.pane_read(&params).await {
         Err(HerdrError::Api {
