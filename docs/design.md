@@ -379,3 +379,49 @@ U11 ran the acceptance workflows live: 9/9 passed ("Live acceptance" in probes.m
 - **No wake-up; the user is notified instead.** This uses Herdr's existing notifications and leaves agents unaware.
 
 Recommendation: ship polling first, and prototype the event-hook wake-up behind `notify: true` once the turn-token probe passes.
+
+## 11. Audit-driven backlog (2026-11-05)
+
+These four ideas are proposed follow-ups, in priority order. They are not implemented.
+
+The audit review covered 653 remote audit records and 3,051 general log records from 2026-10-21 through 2026-11-05. The logs overlap and include probes, so these counts do not establish a production success rate. A normal wait timeout is recorded as `outcome: ok`; task completion must be measured separately.
+
+### A1. Structured diagnostics for every connection
+
+**Evidence:** Detailed auditing runs only in tunnel mode. Local connections record the tool, outcome and duration, but cannot show which read source or build was used. None of the 653 remote audit records carried an MCP session ID. The plugin update also left an existing client on the old binary until it reconnected.
+
+**Idea:** Add structured, content-free diagnostics for both local stdio and remote connections. Record a schema version, bridge build SHA, bridge instance ID, request ID, transport and available caller/session identity. Read summaries should include requested and actual source, provider, cursor presence, character count and clipping; wait summaries should retain match and timeout flags. Expose bridge build identity in capabilities so an operator can identify a stale client.
+
+**Done when:** Local and remote calls can be compared by build and source; separate bridge instances can be distinguished; a normal timeout can be separated from a tool error. Diagnostics omit prompts, commands, transcript text, credentials and raw cursors. Preserve the existing remote audit policy as a separate concern.
+
+**Starting points:** `src/log.rs`, `src/audit.rs`, `src/server.rs`, `src/tools/capabilities.rs`.
+
+### A2. Record failures before dispatch and interrupted calls
+
+**Evidence:** Argument decoding happens before the tool handler reaches `finish`. The observed rejection of `source: session` by an old client process therefore did not appear in the normal call logs.
+
+**Idea:** Track the call lifecycle at the dispatch boundary, including unknown tools, argument validation failures, cancellation and shutdown. Keep those outcomes distinct from failures returned by a tool and from normal wait timeouts. Avoid recording a completed call twice.
+
+**Done when:** A malformed call produces a diagnostic without running the tool; cancellation and shutdown leave an identifiable terminal outcome; a successful call has one terminal record. Error diagnostics do not copy raw arguments or provider output.
+
+**Starting points:** `HerdrMcp::call_tool` and `HerdrMcp::finish` in `src/server.rs`.
+
+### A3. Teach the difference between activity and completion waits
+
+**Evidence:** On 2026-11-03, one target received 26 waits for `working` or `blocked` that timed out with final status `done`, consuming 22.54 minutes of cumulative call duration. This suggests a caller-condition problem; the log does not establish the caller's intent. Across all remote waits, 108 of 159 timed out normally.
+
+**Idea:** In both local and remote instructions, recommend `herdr_send {wait: "turn"}` for submitted work and `herdr_wait {turn}` with the returned token when further waiting is needed. Explain that waiting for `working` detects activity and is not a completion condition. Retain explicit status waits for callers that need them.
+
+**Done when:** Both instruction sets contain a short completion example and explain the activity case. Existing timeout and status-wait semantics remain unchanged.
+
+**Starting points:** `src/instructions.md`, `src/instructions_remote.md`, the wait tool description in `src/server.rs`.
+
+### A4. Guide answer reads toward sessions and cursors
+
+**Evidence:** Of the historical remote reads with source summaries, 30 of 89 `recent` reads were clipped; p95 duration was 5,626 ms. The 68 `visible` reads had p95 duration 216 ms and none were clipped. These observations predate session-reader adoption. The new reader passed live checks, but the current logs cannot measure its adoption or compare its performance by source.
+
+**Idea:** Teach both local and remote clients to use explicit `source: "session"` for saved Claude/Codex assistant answers, pass `next_cursor` as `after` for appended output, and use `visible` for dialogs. Use mail or files for complete reports. Keep `recent` as the compatibility default and preserve explicit errors when a session transcript is unavailable.
+
+**Done when:** Both instruction sets explain source selection and cursor use, including saved-output lag and the fact that cursors do not recover text clipped by output limits. After A1, diagnostics can measure adoption, duration and clipping without retaining answer text.
+
+**Starting points:** `src/instructions.md`, `src/instructions_remote.md`, the read tool description in `src/server.rs`, `README.md`.

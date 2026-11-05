@@ -6,6 +6,8 @@ It is a stdio bridge: each MCP client spawns its own copy, and Herdr holds all t
 
 Design: [docs/design.md](docs/design.md). Brief: [docs/brief.md](docs/brief.md). Probe results: [docs/probes.md](docs/probes.md).
 
+Backlog: [audit-driven improvements](docs/design.md#11-audit-driven-backlog-2026-11-05).
+
 ## Install
 
 Install the plugin, then run one of its panes. Nothing is written to your Claude or Codex config until you confirm.
