@@ -38,7 +38,7 @@ pub struct Where {
     pub of: Option<String>,
     /// A new tab. This is the default. It goes into `workspace_id` when given, else the calling pane's workspace; a caller with no verified pane (a remote client) must give `workspace_id`.
     pub tab: Option<bool>,
-    /// Workspace ID, or label matched case-insensitively (an ID wins), from herdr_list, for a new tab or worktree. Wins over the calling pane's workspace. Required for remote callers. A cwd outside this workspace's worktree is allowed and returns a warning.
+    /// Existing workspace ID or label for a new tab or worktree. Required for remote callers creating a tab or worktree; a new workspace has no existing parent and needs only `workspace: true`.
     pub workspace_id: Option<String>,
     /// A new workspace.
     pub workspace: Option<bool>,
@@ -139,7 +139,7 @@ fn plan<'a>(where_: Option<&'a Where>, options: &Options) -> Result<Plan<'a>, He
     };
     if where_.workspace_id.is_some() && !matches!(plan, Plan::Tab | Plan::Worktree(_)) {
         return Err(HerdrError::invalid_params(
-            "workspace_id places a new tab or worktree; it does not apply to pane, split or a new workspace",
+            "workspace_id selects an existing workspace for a new tab or worktree; a new workspace has no parent (use workspace: true alone), and pane/split already name their target",
         ));
     }
     match plan {

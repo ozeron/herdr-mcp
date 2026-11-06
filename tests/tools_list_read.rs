@@ -6,7 +6,7 @@ mod harness;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fake_herdr::{FakeHerdr, Script};
+use fake_herdr::{FakeHerdr, Script, StreamEnd};
 use harness::{Harness, count, err_code, ok, process_info_named as process_info};
 use herdr_mcp::caller::{CallerEnv, StaticAncestry};
 use herdr_mcp::cli::ToolMode;
@@ -130,6 +130,200 @@ fn fixture() -> (Value, Value) {
 fn script_tree(fake: &FakeHerdr) {
     let (snapshot, _) = fixture();
     script_tree_with(fake, snapshot);
+}
+
+#[tokio::test]
+async fn wait_change_reports_multiple_agent_changes_without_claiming_completion() {
+    let h = start(None).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.on(
+        "events.subscribe",
+        Script::Stream {
+            events: vec![],
+            end: StreamEnd::Hold,
+        },
+    );
+    let mut first = agent("w1:p4", "w1:t2", "w1", "rev", "codex", "working");
+    first["state_change_seq"] = json!(4);
+    let mut second = agent("w2:p1", "w2:t1", "w2", "solo", "claude", "blocked");
+    second["state_change_seq"] = json!(8);
+    h.fake.reply_params(
+        "agent.get",
+        json!({"target": "w1:p4"}),
+        json!({"type": "agent_info", "agent": first}),
+    );
+    h.fake.reply_params(
+        "agent.get",
+        json!({"target": "w2:p1"}),
+        json!({"type": "agent_info", "agent": second}),
+    );
+
+    let out = ok(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [
+        {"target": "w1:p4", "after": 3}, {"target": "w2:p1", "after": 7}
+    ], "timeout_ms": 1000}),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true);
+    assert_eq!(out["changed"].as_array().unwrap().len(), 2);
+    assert_eq!(out["changed"][0]["status"], "working");
+    assert_eq!(out["changed"][1]["status"], "blocked");
+    assert_eq!(count(&h.fake, "events.subscribe"), 1);
+}
+
+#[tokio::test]
+async fn wait_change_wakes_on_an_event_and_reads_the_new_sequence() {
+    let h = start(None).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.on(
+        "events.subscribe",
+        Script::Stream {
+            events: vec![json!({"event": "pane.agent_status_changed", "data": {
+                "pane_id": "w1:p4", "agent_status": "done"
+            }})],
+            end: StreamEnd::Hold,
+        },
+    );
+    let mut before = agent("w1:p4", "w1:t2", "w1", "rev", "codex", "working");
+    before["state_change_seq"] = json!(3);
+    let mut after = before.clone();
+    after["agent_status"] = json!("done");
+    after["state_change_seq"] = json!(4);
+    h.fake.reply_seq(
+        "agent.get",
+        vec![
+            json!({"type": "agent_info", "agent": before}),
+            json!({"type": "agent_info", "agent": after}),
+        ],
+    );
+
+    let out = ok(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [
+        {"target": "w1:p4", "after": 3}
+    ], "timeout_ms": 1000}),
+    )
+    .await;
+
+    assert_eq!(out["changed"][0]["status"], "done");
+    assert_eq!(out["changed"][0]["state_change_seq"], 4);
+    assert_eq!(count(&h.fake, "agent.get"), 2);
+}
+
+#[tokio::test]
+async fn wait_change_refuses_a_sequence_from_a_different_agent_lifetime() {
+    let h = start(None).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.on(
+        "events.subscribe",
+        Script::Stream {
+            events: vec![],
+            end: StreamEnd::Hold,
+        },
+    );
+    let mut current = agent("w1:p4", "w1:t2", "w1", "rev", "codex", "working");
+    current["state_change_seq"] = json!(2);
+    h.fake.reply_params(
+        "agent.get",
+        json!({"target": "w1:p4"}),
+        json!({"type": "agent_info", "agent": current}),
+    );
+
+    let error = harness::err(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [
+            {"target": "w1:p4", "after": 9}
+        ]}),
+    )
+    .await;
+
+    assert_eq!(error["code"], "stale_sequence");
+}
+
+#[tokio::test]
+async fn wait_change_times_out_without_mutating_agents() {
+    let h = start(None).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.on(
+        "events.subscribe",
+        Script::Stream {
+            events: vec![],
+            end: StreamEnd::Hold,
+        },
+    );
+    let mut agent = agent("w1:p4", "w1:t2", "w1", "rev", "codex", "working");
+    agent["state_change_seq"] = json!(3);
+    h.fake.reply_params(
+        "agent.get",
+        json!({"target": "w1:p4"}),
+        json!({"type": "agent_info", "agent": agent}),
+    );
+
+    let out = ok(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [
+        {"target": "w1:p4", "after": 3}
+    ], "timeout_ms": 30}),
+    )
+    .await;
+
+    assert_eq!(out["matched"], false);
+    assert_eq!(out["timed_out"], true);
+    assert_eq!(count(&h.fake, "agent.prompt"), 0);
+}
+
+#[tokio::test]
+async fn wait_change_rejects_own_pane_and_duplicate_targets() {
+    let h = start(Some("w1:p1")).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.reply_params(
+        "pane.process_info",
+        json!({"pane_id": "w1:p1"}),
+        process_info("w1:p1", 4242, 4242, "zsh", "zsh"),
+    );
+    let own = harness::err(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [{"target": "w1:p1", "after": 3}]}),
+    )
+    .await;
+    assert_eq!(own["code"], "self_target");
+    let duplicate = harness::err(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [
+            {"target": "w1:p4", "after": 3}, {"target": "w1:p4", "after": 3}
+        ]}),
+    )
+    .await;
+    assert_eq!(duplicate["code"], "invalid_params");
+    assert_eq!(count(&h.fake, "events.subscribe"), 0);
 }
 
 fn script_tree_with(fake: &FakeHerdr, snapshot: Value) {
@@ -782,6 +976,7 @@ async fn read_falls_back_to_visible_when_the_agent_is_not_idle() {
 
     assert_eq!(read["text"], "screen");
     assert_eq!(read["source"], "visible");
+    assert_eq!(read["terminal_history_unavailable"], true);
     assert!(!read["note"].as_str().unwrap().is_empty());
     let reads: Vec<Value> = h
         .fake
@@ -963,6 +1158,118 @@ fn codex_message(text: &str) -> Value {
         "phase": "final_answer", "content": [{"type": "output_text", "text": text}]}})
 }
 
+fn user_message(provider: &str, text: &str) -> Value {
+    if provider == "claude" {
+        json!({"type": "user", "sessionId": SESSION_ID,
+            "message": {"role": "user", "content": [{"type": "text", "text": text},
+                {"type": "tool_result", "content": "PRIVATE-TOOL-OUTPUT"}]}})
+    } else {
+        json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": "PRIVATE-IMAGE"}]}})
+    }
+}
+
+#[tokio::test]
+async fn conversation_reads_user_and_assistant_text_without_tools_for_both_providers() {
+    for provider in ["claude", "codex"] {
+        let h = start_with_sessions(None, true).await;
+        let mut records = Vec::new();
+        if provider == "codex" {
+            records.push(codex_meta());
+        }
+        records.push(user_message(provider, "What changed?"));
+        records.push(if provider == "claude" {
+            claude_message("Done")
+        } else {
+            codex_message("Done")
+        });
+        write_session(&h, provider, &records);
+        h.fake.reply_seq("agent.get", vec![session_agent(provider)]);
+        let out = ok(
+            &h,
+            "herdr_read",
+            json!({"target": "rev", "source": "conversation"}),
+        )
+        .await;
+        assert_eq!(out["text"], "user: What changed?\nassistant: Done");
+        assert_eq!(out["context_complete"], false);
+        assert_eq!(out["freshness"], "saved");
+        assert_eq!(count(&h.fake, "agent.read"), 0);
+        assert!(!out.to_string().contains("PRIVATE"));
+    }
+}
+
+#[tokio::test]
+async fn default_busy_read_prefers_saved_conversation_over_visible_screen() {
+    let h = start_with_sessions(None, true).await;
+    write_session(
+        &h,
+        "claude",
+        &[
+            user_message("claude", "Check status"),
+            claude_message("Working"),
+        ],
+    );
+    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
+
+    let out = ok(&h, "herdr_read", json!({"target": "rev"})).await;
+
+    assert_eq!(out["source"], "conversation");
+    assert_eq!(out["text"], "user: Check status\nassistant: Working");
+    assert_eq!(out["status"], "working");
+    assert_eq!(count(&h.fake, "agent.get"), 2);
+    assert_eq!(count(&h.fake, "agent.read"), 0);
+    assert_eq!(count(&h.fake, "pane.read"), 0);
+}
+
+#[tokio::test]
+async fn default_busy_read_marks_visible_fallback_when_transcript_is_missing() {
+    let h = start_with_sessions(None, true).await;
+    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
+    h.fake
+        .on("agent.read", Script::error("agent_not_idle", "busy"));
+    h.fake
+        .reply("agent.read", read_result("w1:p4", "visible fragment"));
+
+    let out = ok(&h, "herdr_read", json!({"target": "rev"})).await;
+
+    assert_eq!(out["source"], "visible");
+    assert_eq!(out["terminal_history_unavailable"], true);
+    assert_eq!(out["text"], "visible fragment");
+}
+
+#[tokio::test]
+async fn assistant_only_cursor_cannot_skip_user_text_in_conversation_view() {
+    let h = start_with_sessions(None, true).await;
+    write_session(
+        &h,
+        "codex",
+        &[
+            codex_meta(),
+            user_message("codex", "Prompt"),
+            codex_message("Reply"),
+        ],
+    );
+    h.fake.reply_seq("agent.get", vec![session_agent("codex")]);
+    let assistant = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "session"}),
+    )
+    .await;
+    assert_eq!(assistant["text"], "Reply");
+    let error = harness::err(
+        &h,
+        "herdr_read",
+        json!({
+            "target": "rev", "source": "conversation", "after": assistant["next_cursor"]
+        }),
+    )
+    .await;
+    assert_eq!(error["code"], "stale_cursor");
+}
+
 #[tokio::test]
 async fn session_read_returns_claude_text_without_reading_or_typing_into_the_terminal() {
     let h = start_with_sessions(None, true).await;
@@ -1058,6 +1365,7 @@ async fn session_cursor_reads_appended_complete_records_and_retries_partial_json
         )
         .await;
         assert_eq!(partial["text"], "");
+        assert_eq!(partial["transcript_pending"], true);
         assert_eq!(partial["next_cursor"], first["next_cursor"]);
         file.write_all(&encoded.as_bytes()[split..]).unwrap();
         let second = ok(

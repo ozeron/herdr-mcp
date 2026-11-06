@@ -37,6 +37,8 @@ struct Cursor {
     device: u64,
     inode: u64,
     offset: u64,
+    #[serde(default)]
+    include_user: bool,
 }
 
 fn unavailable(message: &str) -> HerdrError {
@@ -65,6 +67,7 @@ pub(super) fn read(
     agent: &AgentInfo,
     env: &InstallEnv,
     after: Option<&str>,
+    include_user: bool,
 ) -> Result<Output, HerdrError> {
     let session = agent.agent_session.as_ref().ok_or_else(|| {
         unavailable("no session reference is available; Herdr's agent integration must report it")
@@ -110,6 +113,7 @@ pub(super) fn read(
                 || c.device != meta.dev()
                 || c.inode != meta.ino()
                 || c.offset > meta.len()
+                || c.include_user != include_user
             {
                 return Err(stale());
             }
@@ -175,7 +179,7 @@ pub(super) fn read(
     {
         let record: Value = serde_json::from_slice(line)
             .map_err(|_| unavailable("the transcript contains a malformed complete record"))?;
-        if let Some(message) = assistant_text(&record, provider, &session.value) {
+        if let Some(message) = record_text(&record, provider, &session.value, include_user) {
             text.push(message);
         }
     }
@@ -186,6 +190,7 @@ pub(super) fn read(
         device: meta.dev(),
         inode: meta.ino(),
         offset,
+        include_user,
     };
     let next_cursor =
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&next).expect("serializable cursor"));
@@ -282,9 +287,9 @@ fn check_codex_id(file: &mut File, id: &str) -> Result<(), HerdrError> {
     Ok(())
 }
 
-fn assistant_text(record: &Value, provider: &str, id: &str) -> Option<String> {
+fn record_text(record: &Value, provider: &str, id: &str, include_user: bool) -> Option<String> {
     let message = if provider == "claude" {
-        if record["type"] != "assistant"
+        if !matches!(record["type"].as_str(), Some("assistant") | Some("user"))
             || record["sessionId"] != id
             || record["isSidechain"] == true
         {
@@ -297,18 +302,28 @@ fn assistant_text(record: &Value, provider: &str, id: &str) -> Option<String> {
         }
         &record["payload"]
     };
-    if message["role"] != "assistant" {
+    let role = message["role"].as_str()?;
+    if role != "assistant" && !(include_user && role == "user") {
         return None;
     }
-    let text = message["content"]
-        .as_array()?
-        .iter()
-        .filter_map(|block| match block["type"].as_str()? {
-            "text" if provider == "claude" => block["text"].as_str(),
-            "output_text" if provider == "codex" => block["text"].as_str(),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.is_empty()).then_some(text)
+    let text = if let Some(text) = message["content"].as_str() {
+        text.to_owned()
+    } else {
+        message["content"]
+            .as_array()?
+            .iter()
+            .filter_map(|block| match (provider, role, block["type"].as_str()?) {
+                ("claude", _, "text")
+                | ("codex", "assistant", "output_text")
+                | ("codex", "user", "input_text") => block["text"].as_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    (!text.is_empty()).then_some(if include_user {
+        format!("{role}: {text}")
+    } else {
+        text
+    })
 }

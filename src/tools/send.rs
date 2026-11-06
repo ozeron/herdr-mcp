@@ -11,12 +11,11 @@ use crate::caller::Resolution;
 use crate::delegation::{ReplyWait, await_reply, caller_plan, remote_plan, reply_paragraph};
 use crate::guard::TargetKind;
 use crate::herdr::{
-    AgentInfo, AgentPromptParams, AgentReadParams, AgentStatus, ApiErrorCode, Client, HerdrError,
-    Outcome, PaneSendInputParams, PromptWait, ReadSource,
+    AgentInfo, AgentPromptParams, AgentStatus, ApiErrorCode, Client, HerdrError, Outcome,
+    PaneSendInputParams, PromptWait,
 };
 use crate::mailbox::{self, SenderFilter};
 use crate::provenance;
-use crate::providers::provider;
 use crate::scope::{Scope, TargetRequest};
 use crate::server::Inner;
 use crate::tools::interrupt;
@@ -59,11 +58,11 @@ pub struct SendParams {
     pub text: Option<String>,
     /// Raw keys to send, such as ["Enter"] or ["y"].
     pub keys: Option<Vec<String>>,
-    /// For a prompt. auto (default) starts a turn on an idle agent. On a working agent it queues the prompt only for kinds that queue typed input (Claude Code: delivery queued, or unconfirmed when the queue marker never shows); any other working agent returns busy at once with nothing typed. after_idle waits for idle, then sends; steer types into the running turn and returns no turn; restart interrupts, waits for idle, then sends.
+    /// For a prompt. auto (default) starts a turn on an idle agent. For a working Claude agent it submits once and reports unconfirmed handling; for other working kinds it returns busy without typing. after_idle waits for idle, steer submits into a working agent without a turn, and restart interrupts first.
     pub mode: Option<SendMode>,
-    /// For a prompt. turn waits for the turn it started to settle and returns the excerpt, bounded by the wait cap; on timed_out, pass the turn to herdr_wait. none (default) returns once delivered. A queued prompt has no turn yet, so it returns at once.
+    /// For a prompt. turn waits for the turn it started to settle and returns the excerpt, bounded by the wait cap; on timed_out, pass the turn to herdr_wait. none (default) returns once submitted. A working-agent submission has no turn token, so it returns at once.
     pub wait: Option<SendWait>,
-    /// For a prompt typed into a working agent that queues it (Claude Code): submit the queued prompt now with the agent's send-now key. Interrupts the agent's current turn flow; use only when the user wants the new prompt handled immediately. Ignored, with a note, for agents without such a key.
+    /// Deprecated. Any supplied value is rejected before typing; queue ownership cannot be verified.
     pub send_now: Option<bool>,
     /// For a prompt. screen (default) leaves the answer on the agent's screen. mail asks the agent to mail its exact final answer to you (your pane inbox, or a remote caller's inbox): wait turn returns it as `reply`; otherwise `reply: "pending"` and the mail arrives later. Use it when you need the whole answer, not a screen excerpt. Needs an agent that has the herdr mail tool; one without it cannot reply.
     pub reply: Option<Reply>,
@@ -113,9 +112,9 @@ fn validate(params: &SendParams) -> Result<(), HerdrError> {
             "reply applies to a prompt, not to text or keys",
         ));
     }
-    if raw && params.send_now.is_some() {
+    if params.send_now.is_some() {
         return Err(HerdrError::invalid_params(
-            "send_now applies to a prompt, not to text or keys",
+            "send_now is unsupported because a queue marker cannot identify this prompt; use explicit keys only after inspecting the agent",
         ));
     }
     if params.prompt.is_some() && params.answer_blocked == Some(true) {
@@ -165,7 +164,6 @@ pub async fn run(
                 settle: inner.interrupt_settle,
                 timeout,
             };
-            let send_now = params.send_now.unwrap_or(false);
             let plan = match params.reply.unwrap_or_default() {
                 Reply::Screen => None,
                 Reply::Mail if inner.is_remote() => Some(remote_plan(
@@ -182,16 +180,7 @@ pub async fn run(
                 None => prompt,
             };
             let typed_ms = mailbox::now_ms();
-            let mut out = send_prompt(
-                client,
-                pane,
-                agent,
-                prompt,
-                Options { mode, send_now },
-                pacing,
-                ct,
-            )
-            .await?;
+            let mut out = send_prompt(client, pane, agent, prompt, mode, pacing, ct).await?;
             let remaining = cap.saturating_sub(started.elapsed());
             let waits = params.wait == Some(SendWait::Turn);
             let turn = serde_json::from_value::<Turn>(out["turn"].clone()).ok();
@@ -260,12 +249,6 @@ struct Pacing {
     timeout: Duration,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Options {
-    mode: SendMode,
-    send_now: bool,
-}
-
 /// Cancellation while waiting for idle, with nothing typed.
 fn cancelled(pane: &str, interrupted: bool) -> HerdrError {
     HerdrError::detailed(
@@ -282,11 +265,10 @@ async fn send_prompt(
     pane: &str,
     agent: Option<&AgentInfo>,
     prompt: &str,
-    options: Options,
+    mode: SendMode,
     pacing: Pacing,
     ct: &CancellationToken,
 ) -> Result<Value, HerdrError> {
-    let Options { mode, send_now } = options;
     let current = client.agent_get(pane).await?;
     let status = current.agent_status;
     let kind = current.agent.as_deref();
@@ -296,30 +278,18 @@ async fn send_prompt(
     let deadline = Instant::now() + pacing.timeout;
     let (result, interrupted) = match mode {
         SendMode::Steer => {
-            return steer(client, pane, prompt, status, kind, send_now, pacing.settle).await;
+            return steer(client, pane, prompt, status).await;
         }
         SendMode::Auto => match status {
             AgentStatus::Idle | AgentStatus::Done => ("started", false),
-            // Decided before typing: only a kind that queues typed input gets it while working.
-            AgentStatus::Working if provider(kind).queue_marker.is_some() => {
+            // Claude accepts a busy submission, but this bridge cannot observe how it handles it.
+            AgentStatus::Working if kind == Some("claude") => {
                 refuse_dialog(client, pane, kind).await?;
                 if ct.is_cancelled() {
                     return Err(cancelled(pane, false));
                 }
-                let mut out =
-                    steer(client, pane, prompt, status, kind, send_now, pacing.settle).await?;
+                let mut out = steer(client, pane, prompt, status).await?;
                 out["mode"] = json!(SendMode::Auto);
-                if out["delivery"] == "steered" {
-                    // The kind queues, but its queue marker never showed: say so, never guess.
-                    out["delivery"] = json!("unconfirmed");
-                    let mut note = UNCONFIRMED_NOTE.to_owned();
-                    if send_now {
-                        note.push_str(
-                            " send_now was not pressed, since no queued prompt was seen.",
-                        );
-                    }
-                    out["note"] = json!(note);
-                }
                 out["result"] = out["delivery"].clone();
                 return Ok(out);
             }
@@ -379,9 +349,6 @@ async fn send_prompt(
         "result": result, "mode": mode, "pane": pane,
         "status": agent.agent_status, "turn": turn, "delivery": "started",
     });
-    if send_now && provider(kind).send_now_key.is_none() {
-        out["note"] = json!(no_send_now_note(kind));
-    }
     if mode == SendMode::Restart {
         out["interrupted"] = json!(interrupted);
     }
@@ -402,7 +369,7 @@ async fn await_turn(
     let Some(turn) = serde_json::from_value::<Turn>(out["turn"].clone()).ok() else {
         add_note(
             out,
-            "there is no turn to wait on (the prompt was queued, steered or unconfirmed); read the pane",
+            "there is no turn to wait on for this working-agent submission; read the pane or saved session output",
         );
         return;
     };
@@ -463,14 +430,7 @@ fn add_note(out: &mut Value, text: &str) {
     out["note"] = json!(note);
 }
 
-fn no_send_now_note(kind: Option<&str>) -> String {
-    format!(
-        "send_now is not supported for {}; ignored",
-        kind.unwrap_or("this agent kind")
-    )
-}
-
-const UNCONFIRMED_NOTE: &str = "The agent was working; its queue marker never showed, so it is not confirmed whether the prompt was queued or taken into the running turn. Read the pane before sending again.";
+const UNCONFIRMED_NOTE: &str = "Herdr accepted one prompt submission, but this bridge cannot tell whether the agent queued it or took it into the current turn. This is not a failed send. Do not retry automatically; read the pane or saved session output first.";
 
 /// Refuses before typing when a known startup or permission dialog is on screen: typed text
 /// would answer it.
@@ -488,77 +448,25 @@ async fn refuse_dialog(client: &Client, pane: &str, kind: Option<&str>) -> Resul
     }
 }
 
-/// Screen reads after typing into a working agent, `settle` apart, looking for its queue marker.
-const QUEUE_READS: usize = 3;
-
-const QUEUED_NOTE: &str = "The agent is mid-turn and queued this prompt; it runs when the current turn ends. Use send_now to submit it immediately, or herdr_wait on the agent to know when it finishes.";
-
-/// Whether the visible screen shows the kind's queue marker.
-async fn shows_queue_marker(client: &Client, pane: &str, marker: &str) -> bool {
-    let mut params = AgentReadParams::new(pane);
-    params.source = ReadSource::Visible;
-    client
-        .agent_read(&params)
-        .await
-        .is_ok_and(|read| read.text.to_lowercase().contains(marker))
-}
-
-/// Types the prompt without waiting for activity. For a working agent whose kind queues input,
-/// one visible-screen read after `settle` tells a queued prompt from a steering one.
+/// Types a prompt without waiting for activity. Its handling inside a working agent is unknown.
 async fn steer(
     client: &Client,
     pane: &str,
     prompt: &str,
     status: AgentStatus,
-    kind: Option<&str>,
-    send_now: bool,
-    settle: Duration,
 ) -> Result<Value, HerdrError> {
     client
         .agent_prompt(&AgentPromptParams::new(pane, prompt))
         .await
         .map_err(|err| prompt_error(err, pane, json!({"phase": "prompted", "pane": pane})))?;
-    let provider = provider(kind);
-    let working = status == AgentStatus::Working;
-    let mut delivery = if working { "steered" } else { "started" };
-    let mut note = None;
-    if working && let Some(marker) = provider.queue_marker {
-        // The marker can take a redraw or two to appear.
-        let mut seen = false;
-        for _ in 0..QUEUE_READS {
-            sleep(settle).await;
-            if shows_queue_marker(client, pane, marker).await {
-                seen = true;
-                break;
-            }
-        }
-        if seen {
-            delivery = "queued";
-            note = Some(QUEUED_NOTE.to_string());
-            if send_now && let Some(key) = provider.send_now_key {
-                client
-                    .agent_send_keys(pane, &[key.to_string()])
-                    .await
-                    .map_err(|err| {
-                        HerdrError::detailed(
-                            "send_now_failed",
-                            format!("the prompt was typed into {pane} and queued but {key} failed: {err}"),
-                            json!({"pane": pane, "prompt_sent": true, "cause": err.code()}),
-                        )
-                    })?;
-                delivery = "sent_now";
-                note = None;
-            }
-        }
-    }
-    if send_now && provider.send_now_key.is_none() {
-        note = Some(no_send_now_note(kind));
-    }
+    let handling_unconfirmed = !matches!(status, AgentStatus::Idle | AgentStatus::Done);
     let mut out = json!({
-        "result": "steered", "mode": "steer", "pane": pane, "turn": null, "delivery": delivery,
+        "result": "steered", "mode": "steer", "pane": pane, "turn": null,
+        "delivery": if handling_unconfirmed { "unconfirmed" } else { "started" },
+        "input_submitted": true,
     });
-    if let Some(note) = note {
-        out["note"] = json!(note);
+    if handling_unconfirmed {
+        out["note"] = json!(UNCONFIRMED_NOTE);
     }
     Ok(out)
 }

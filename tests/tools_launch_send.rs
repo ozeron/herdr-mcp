@@ -1640,7 +1640,7 @@ async fn auto_to_an_idle_agent_starts_a_turn() {
 }
 
 #[tokio::test]
-async fn auto_to_a_working_claude_queues_the_prompt() {
+async fn auto_to_a_working_claude_submits_once_without_claiming_queue_delivery() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
     screens(&h.fake, &[QUEUED_SCREEN]);
@@ -1653,10 +1653,12 @@ async fn auto_to_a_working_claude_queues_the_prompt() {
     .await;
 
     assert_eq!(out["mode"], "auto");
-    assert_eq!(out["result"], "queued");
-    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["result"], "unconfirmed");
+    assert_eq!(out["delivery"], "unconfirmed");
+    assert_eq!(out["input_submitted"], true);
     assert!(out["turn"].is_null());
     assert_eq!(count(&h.fake, "agent.prompt"), 1);
+    assert_eq!(count(&h.fake, "agent.read"), 1); // dialog check only
 }
 
 #[tokio::test]
@@ -1729,7 +1731,7 @@ async fn the_waits_own_note_survives_wait_turn() {
 }
 
 #[tokio::test]
-async fn wait_turn_on_a_queued_prompt_returns_at_once() {
+async fn wait_turn_on_a_working_agent_submission_returns_at_once() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
     screens(&h.fake, &[QUEUED_SCREEN]);
@@ -1741,7 +1743,7 @@ async fn wait_turn_on_a_queued_prompt_returns_at_once() {
     )
     .await;
 
-    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["delivery"], "unconfirmed");
     assert!(out.get("matched").is_none());
 }
 
@@ -1788,19 +1790,10 @@ async fn auto_to_a_working_codex_is_busy_at_once_and_types_nothing() {
 }
 
 #[tokio::test]
-async fn a_late_queue_marker_still_counts_as_queued() {
+async fn a_queue_marker_does_not_claim_delivery_of_this_prompt() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
-    // The dialog check, then two reads before the marker shows.
-    screens(
-        &h.fake,
-        &[
-            WORKING_SCREEN,
-            WORKING_SCREEN,
-            WORKING_SCREEN,
-            QUEUED_SCREEN,
-        ],
-    );
+    screens(&h.fake, &[QUEUED_SCREEN]);
 
     let out = ok(
         &h,
@@ -1809,12 +1802,13 @@ async fn a_late_queue_marker_still_counts_as_queued() {
     )
     .await;
 
-    assert_eq!(out["delivery"], "queued");
-    assert_eq!(out["result"], "queued");
+    assert_eq!(out["delivery"], "unconfirmed");
+    assert_eq!(out["result"], "unconfirmed");
+    assert_eq!(count(&h.fake, "agent.read"), 1); // no post-send screen reads
 }
 
 #[tokio::test]
-async fn a_queue_marker_that_never_shows_is_unconfirmed_with_a_note() {
+async fn a_working_screen_is_unconfirmed_with_a_note() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev_kind("working", "claude")]);
     screens(&h.fake, &[WORKING_SCREEN]);
@@ -1828,8 +1822,13 @@ async fn a_queue_marker_that_never_shows_is_unconfirmed_with_a_note() {
 
     assert_eq!(out["delivery"], "unconfirmed");
     assert_eq!(out["result"], "unconfirmed");
+    assert_eq!(out["input_submitted"], true);
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
     assert!(
-        out["note"].as_str().unwrap().contains("not confirmed"),
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("Do not retry automatically"),
         "{out}"
     );
 }
@@ -1946,6 +1945,24 @@ async fn steer_types_into_a_working_agent_with_no_turn() {
     assert!(prompt.get("wait").is_none_or(Value::is_null));
 }
 
+#[tokio::test]
+async fn steer_with_unknown_status_does_not_claim_a_started_turn() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("unknown", 3)]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "check", "mode": "steer"}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "unconfirmed");
+    assert_eq!(out["input_submitted"], true);
+    assert!(out["turn"].is_null());
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+}
+
 fn rev_kind(status: &'static str, kind: &'static str) -> Value {
     json!({"type": "agent_info", "agent": Rev {status, seq: 3, parent: Some("w1:p1"), kind}.json()})
 }
@@ -1981,81 +1998,61 @@ async fn an_idle_agent_gets_delivery_started() {
 }
 
 #[tokio::test]
-async fn a_working_claude_that_queues_the_prompt_is_delivery_queued_with_a_note() {
+async fn a_working_claude_steer_is_unconfirmed_even_with_a_queue_marker() {
     let (h, out) = steer_with("claude", QUEUED_SCREEN, json!({})).await;
 
-    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["delivery"], "unconfirmed");
     assert_eq!(out["result"], "steered");
     assert!(out["turn"].is_null());
     let note = out["note"].as_str().unwrap();
-    assert!(note.contains("queued this prompt"), "{note}");
-    assert!(note.contains("send_now"), "{note}");
+    assert!(note.contains("cannot tell whether"), "{note}");
     assert!(typed_keys(&h).is_empty());
 }
 
 #[tokio::test]
-async fn send_now_presses_ctrl_enter_on_a_queued_claude_prompt() {
-    let (h, out) = steer_with("claude", QUEUED_SCREEN, json!({"send_now": true})).await;
-
-    assert_eq!(out["delivery"], "sent_now");
-    assert!(out.get("note").is_none());
-    assert_eq!(typed_keys(&h), [json!(["ctrl+enter"])]);
-    assert!(index_of(&h.fake, "agent.prompt") < index_of(&h.fake, "agent.send_keys"));
-}
-
-#[tokio::test]
-async fn send_now_without_a_queue_marker_presses_nothing() {
-    let (h, out) = steer_with("claude", WORKING_SCREEN, json!({"send_now": true})).await;
-
-    assert_eq!(out["delivery"], "steered");
-    assert!(typed_keys(&h).is_empty());
-}
-
-#[tokio::test]
-async fn a_working_claude_without_the_queue_marker_is_steered() {
+async fn a_working_claude_without_a_queue_marker_is_unconfirmed() {
     let (_h, out) = steer_with("claude", WORKING_SCREEN, json!({})).await;
 
-    assert_eq!(out["delivery"], "steered");
-    assert!(out.get("note").is_none());
+    assert_eq!(out["delivery"], "unconfirmed");
+    assert!(out.get("note").is_some());
 }
 
 #[tokio::test]
 async fn a_working_codex_is_steered_without_reading_the_screen() {
     let (h, out) = steer_with("codex", QUEUED_SCREEN, json!({})).await;
 
-    assert_eq!(out["delivery"], "steered");
+    assert_eq!(out["delivery"], "unconfirmed");
     assert_eq!(count(&h.fake, "agent.read"), 0);
 }
 
 #[tokio::test]
-async fn send_now_for_a_kind_without_the_key_is_noted_and_presses_nothing() {
-    let (h, out) = steer_with("codex", QUEUED_SCREEN, json!({"send_now": true})).await;
-
-    assert_eq!(out["delivery"], "steered");
-    assert!(
-        out["note"]
-            .as_str()
-            .unwrap()
-            .contains("send_now is not supported for codex")
-    );
-    assert!(typed_keys(&h).is_empty());
-}
-
-#[tokio::test]
-async fn send_now_on_an_idle_codex_start_is_noted() {
+async fn send_now_on_an_idle_agent_is_rejected_before_typing() {
     let h = start(Opts::default()).await;
     script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
 
-    let out = ok(
+    let out = err(
         &h,
         "herdr_send",
         json!({"target": "rev", "prompt": "go", "send_now": true}),
     )
     .await;
 
-    assert_eq!(out["delivery"], "started");
-    assert!(out["note"].as_str().unwrap().contains("not supported"));
+    assert_eq!(out["code"], "invalid_params");
+    assert_nothing_typed(&h.fake);
     assert!(typed_keys(&h).is_empty());
+}
+
+#[tokio::test]
+async fn send_now_on_a_working_claude_is_rejected_before_typing() {
+    let h = start(Opts::default()).await;
+    let out = err(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "send_now": true}),
+    )
+    .await;
+    assert_eq!(out["code"], "invalid_params");
+    assert_nothing_typed(&h.fake);
 }
 
 #[tokio::test]
@@ -3542,7 +3539,7 @@ async fn send_reply_mail_without_a_wait_returns_pending() {
 }
 
 #[tokio::test]
-async fn send_reply_mail_to_a_queued_prompt_is_pending_since_there_is_no_turn() {
+async fn send_reply_mail_to_a_working_agent_is_pending_since_there_is_no_turn() {
     let env = mail_env(Opts::default()).await;
     script_send(
         &env.h.fake,
@@ -3558,7 +3555,7 @@ async fn send_reply_mail_to_a_queued_prompt_is_pending_since_there_is_no_turn() 
     )
     .await;
 
-    assert_eq!(out["delivery"], "queued");
+    assert_eq!(out["delivery"], "unconfirmed");
     assert_eq!(out["reply"], "pending");
 }
 

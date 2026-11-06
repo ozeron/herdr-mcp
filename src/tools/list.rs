@@ -421,6 +421,7 @@ fn pane_json(
         out.insert("caller".into(), json!(true));
     }
     if let Some(agent) = agent {
+        out.insert("state_change_seq".into(), json!(agent.state_change_seq));
         if let Some(kind) = &agent.agent {
             out.insert("agent".into(), json!(kind));
         }

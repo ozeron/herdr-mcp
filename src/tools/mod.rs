@@ -12,6 +12,7 @@ pub mod run;
 pub mod send;
 pub mod sessions;
 pub mod wait;
+pub mod wait_change;
 
 use rmcp::RoleServer;
 use rmcp::model::{CallToolResult, ProgressNotificationParam};

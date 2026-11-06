@@ -141,7 +141,7 @@ async fn wait_cap_ms(opts: Opts) -> u64 {
 }
 
 #[tokio::test]
-async fn read_mode_lists_exactly_the_nine_read_tools() {
+async fn read_mode_lists_exactly_the_ten_read_tools() {
     let h = start(Opts::default()).await;
     let names: BTreeSet<String> = h
         .client
@@ -156,6 +156,7 @@ async fn read_mode_lists_exactly_the_nine_read_tools() {
         "herdr_list",
         "herdr_read",
         "herdr_wait",
+        "herdr_wait_change",
         "herdr_mail_send",
         "herdr_mail_read",
         "herdr_mail_wait",
@@ -178,20 +179,21 @@ async fn read_mode_rejects_control_tool_calls() {
 }
 
 #[tokio::test]
-async fn control_mode_lists_all_sixteen_with_annotations() {
+async fn control_mode_lists_all_seventeen_with_annotations() {
     let h = start(Opts {
         mode: ToolMode::Control,
         ..Opts::default()
     })
     .await;
     let tools = h.client.list_all_tools().await.unwrap();
-    assert_eq!(tools.len(), 16);
+    assert_eq!(tools.len(), 17);
     let read_only = [
         "herdr_capabilities",
         "herdr_file_read",
         "herdr_list",
         "herdr_read",
         "herdr_wait",
+        "herdr_wait_change",
         "herdr_mail_read",
         "herdr_mail_wait",
         "herdr_sessions",
@@ -353,7 +355,7 @@ async fn herdr_not_running_is_a_tool_error_and_the_server_stays_up() {
         result.structured_content.unwrap()["code"],
         "herdr_not_running"
     );
-    assert_eq!(h.client.list_all_tools().await.unwrap().len(), 9);
+    assert_eq!(h.client.list_all_tools().await.unwrap().len(), 10);
 }
 
 #[tokio::test]

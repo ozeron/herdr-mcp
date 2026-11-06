@@ -9,10 +9,6 @@ pub struct Provider {
     pub kind: &'static str,
     pub interrupt_key: &'static str,
     pub interrupt_note: Option<&'static str>,
-    /// Visible text, lowercase, that shows a prompt typed into a working agent was queued.
-    pub queue_marker: Option<&'static str>,
-    /// Key that submits the queued prompt now, interrupting the current turn flow.
-    pub send_now_key: Option<&'static str>,
     /// Codex under older detection rules settles to `unknown` while ready.
     pub ready_at_unknown: bool,
     /// Per-launch MCP arguments for the herdr server, given the binary and the tool mode.
@@ -94,8 +90,6 @@ const FALLBACK: Provider = Provider {
     kind: "",
     interrupt_key: "esc",
     interrupt_note: UNVERIFIED,
-    queue_marker: None,
-    send_now_key: None,
     ready_at_unknown: false,
     mcp_args: None,
     mode_args: None,
@@ -108,8 +102,6 @@ const PROVIDERS: &[Provider] = &[
         kind: "claude",
         interrupt_key: "esc",
         interrupt_note: None,
-        queue_marker: Some("queued message"),
-        send_now_key: Some("ctrl+enter"),
         ready_at_unknown: false,
         mcp_args: Some(claude_mcp_args),
         mode_args: None,
@@ -120,8 +112,6 @@ const PROVIDERS: &[Provider] = &[
         kind: "codex",
         interrupt_key: "esc",
         interrupt_note: None,
-        queue_marker: None,
-        send_now_key: None,
         ready_at_unknown: true,
         mcp_args: Some(codex_mcp_args),
         mode_args: Some(codex_mode_args),

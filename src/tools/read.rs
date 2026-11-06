@@ -3,7 +3,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::herdr::{
-    AgentReadParams, ApiErrorCode, Client, HerdrError, PaneReadParams, PaneReadResult, ReadSource,
+    AgentInfo, AgentReadParams, ApiErrorCode, Client, HerdrError, PaneReadParams, PaneReadResult,
+    ReadSource,
 };
 use crate::output::{is_meaningful, last_meaningful, strip_ansi, truncate_tail};
 use crate::server::Inner;
@@ -22,6 +23,7 @@ pub enum Source {
     Recent,
     Visible,
     Session,
+    Conversation,
 }
 
 impl Source {
@@ -29,8 +31,8 @@ impl Source {
         match self {
             Self::Recent => Ok(ReadSource::Recent),
             Self::Visible => Ok(ReadSource::Visible),
-            Self::Session => Err(HerdrError::invalid_params(
-                "session output is not a terminal source",
+            Self::Session | Self::Conversation => Err(HerdrError::invalid_params(
+                "session and conversation output are not terminal sources",
             )),
         }
     }
@@ -41,9 +43,9 @@ impl Source {
 pub struct ReadParams {
     /// Pane ID or agent name. Defaults to the calling pane.
     pub target: Option<String>,
-    /// `recent` (default) reads terminal history; `visible` reads the screen; `session` reads saved Claude/Codex assistant text without scrolling. Session output can lag and differs from the screen.
+    /// The default first tries saved `conversation` text for a working agent with a local session, then terminal `recent`. Explicit `recent` reads terminal history; `visible` reads the screen; `session` reads saved assistant text; `conversation` reads saved user and assistant text. Saved data can lag and omits tools/reasoning.
     pub source: Option<Source>,
-    /// For `source: session` only: pass `next_cursor` to read newly appended complete records. Omit for the recent tail. This is an incremental cursor, not pagination of text cut by lines/max_chars.
+    /// For `source: session` or `conversation`: pass that view's `next_cursor` to read newly appended complete records. Omit for the recent tail. This is an incremental cursor, not pagination of text cut by lines/max_chars.
     pub after: Option<String>,
     /// Lines to return; blank lines and box-drawing rules are skipped. Default 120, enough for an agent's latest turn: leave it unset. Capped at 1000.
     pub lines: Option<u32>,
@@ -71,8 +73,9 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         .max_chars
         .unwrap_or(DEFAULT_MAX_CHARS)
         .clamp(1, MAX_CHARS);
-    let mut source = params.source.unwrap_or(Source::Recent);
-    if source == Source::Session {
+    let implicit_source = params.source.is_none();
+    let source = params.source.unwrap_or(Source::Recent);
+    if matches!(source, Source::Session | Source::Conversation) {
         return read_session(
             inner,
             &client,
@@ -81,11 +84,31 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
             requested,
             lines,
             max_chars,
+            source == Source::Conversation,
         )
         .await;
     }
     if params.after.is_some() {
-        return Err(HerdrError::invalid_params("after requires source: session"));
+        return Err(HerdrError::invalid_params(
+            "after requires source: session or conversation",
+        ));
+    }
+    if implicit_source
+        && inner.install_env.is_some()
+        && let Ok(agent) = client.agent_get(&target).await
+        && agent.agent_status == crate::herdr::AgentStatus::Working
+        && agent.agent_session.is_some()
+        && let Ok(mut saved) = read_session_for_agent(
+            inner, &client, agent, None, requested, lines, max_chars, true,
+        )
+        .await
+        && !saved["text"].as_str().unwrap_or_default().is_empty()
+    {
+        let note = saved["note"].as_str().unwrap_or_default();
+        saved["note"] = json!(format!(
+            "working agent: selected saved conversation without terminal read; {note}; use source: visible for live dialogs"
+        ));
+        return Ok(saved);
     }
     let mut notes = Vec::new();
     if requested > lines {
@@ -118,9 +141,8 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
         result = more;
     }
     if used != source {
-        source = used;
         notes.push(
-            "agent is busy in a full-screen UI, so scrollback is unavailable; returned the visible screen"
+            "agent is busy in a full-screen UI; only the visible screen was returned. Terminal history was not inspected. For saved assistant text, use source: session (which can lag and omits tools)"
                 .to_string(),
         );
     }
@@ -133,12 +155,15 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
     let more_above = result.truncated || meaningful_count(&result.text) > lines as usize;
     let mut out = json!({
         "pane_id": result.pane_id,
-        "source": source.herdr()?,
+        "source": used.herdr()?,
         "lines": lines,
         "text": text,
         "truncated": cut || requested > lines,
         "more_above": more_above,
     });
+    if used == Source::Visible && source == Source::Recent {
+        out["terminal_history_unavailable"] = json!(true);
+    }
     if let Some(status) = status {
         out["status"] = json!(status);
     }
@@ -156,8 +181,32 @@ async fn read_session(
     requested: u32,
     lines: u32,
     max_chars: usize,
+    include_user: bool,
 ) -> Result<Value, HerdrError> {
     let agent = client.agent_get(target).await?;
+    read_session_for_agent(
+        inner,
+        client,
+        agent,
+        after,
+        requested,
+        lines,
+        max_chars,
+        include_user,
+    )
+    .await
+}
+
+async fn read_session_for_agent(
+    inner: &Inner,
+    client: &Client,
+    agent: AgentInfo,
+    after: Option<String>,
+    requested: u32,
+    lines: u32,
+    max_chars: usize,
+    include_user: bool,
+) -> Result<Value, HerdrError> {
     let env = inner.install_env.clone().ok_or_else(|| {
         HerdrError::tool(
             "session_unavailable",
@@ -165,12 +214,11 @@ async fn read_session(
         )
     })?;
     let snapshot = agent.clone();
-    let output =
-        tokio::task::spawn_blocking(move || session::read(&snapshot, &env, after.as_deref()))
-            .await
-            .map_err(|_| {
-                HerdrError::tool("session_unavailable", "session reader did not finish")
-            })??;
+    let output = tokio::task::spawn_blocking(move || {
+        session::read(&snapshot, &env, after.as_deref(), include_user)
+    })
+    .await
+    .map_err(|_| HerdrError::tool("session_unavailable", "session reader did not finish"))??;
     // A pane may have been reused or switched sessions while its file was read.
     let current = client.agent_get(&agent.pane_id).await?;
     if current.terminal_id != agent.terminal_id
@@ -185,7 +233,11 @@ async fn read_session(
     let clean = strip_ansi(&output.text);
     let more_above = output.more_above || meaningful_count(&clean) > lines as usize;
     let (text, cut) = truncate_tail(last_meaningful(&clean, lines as usize), max_chars);
-    let mut notes = vec!["saved assistant text only; prompts, tools and reasoning are omitted. Saved output can lag live output; status comes from Herdr".to_string()];
+    let mut notes = vec![if include_user {
+        "saved user and assistant text only; tools, reasoning, and other context are omitted. Saved output can lag live output; status comes from Herdr".to_string()
+    } else {
+        "saved assistant text only; prompts, tools and reasoning are omitted. Saved output can lag live output; status comes from Herdr".to_string()
+    }];
     if requested > lines {
         notes.push(format!("lines capped at {MAX_LINES}"));
     }
@@ -196,8 +248,10 @@ async fn read_session(
         notes.push("an unfinished transcript record is pending; the cursor will retry it".into());
     }
     Ok(json!({
-        "pane_id": current.pane_id, "source": "session", "provider": output.provider,
+        "pane_id": current.pane_id, "source": if include_user { "conversation" } else { "session" }, "provider": output.provider,
         "session_id": output.session_id, "status": current.agent_status,
+        "content_scope": if include_user { "user_assistant_text" } else { "assistant_text" },
+        "context_complete": false, "freshness": "saved", "transcript_pending": output.pending,
         "lines": lines, "text": text, "truncated": cut || requested > lines,
         "more_above": more_above, "more_after": output.more_after,
         "next_cursor": output.next_cursor, "note": notes.join("; "),

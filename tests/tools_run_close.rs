@@ -675,10 +675,84 @@ async fn workspace_id_with_split_or_a_new_workspace_is_invalid() {
         )
         .await;
         assert!(
-            out.to_string().contains("workspace_id places a new tab"),
+            out.to_string()
+                .contains("workspace_id selects an existing workspace"),
             "{out}"
         );
     }
+}
+
+#[tokio::test]
+async fn remote_new_workspace_needs_no_existing_workspace_id() {
+    let h = start(remote()).await;
+    h.fake.reply(
+        "workspace.create",
+        json!({"type": "workspace_created", "workspace": workspace("w3", 3, "w3:t1"),
+               "tab": tab("w3:t1", "w3", 1),
+               "root_pane": pane("w3:p1", "w3:t1", "w3", None)}),
+    );
+    h.fake.reply("pane.report_metadata", ok_reply());
+    h.fake.reply("pane.send_input", ok_reply());
+    h.fake.reply("pane.read", read_result("w3:p1", "$ "));
+    h.fake
+        .reply("pane.process_info", process_info("w3:p1", 31337, 31337));
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "true", "where": {"workspace": true}}),
+    )
+    .await;
+
+    assert_eq!(out["workspace"], "w3");
+    assert_eq!(count(&h.fake, "workspace.create"), 1);
+    assert_eq!(count(&h.fake, "tab.create"), 0);
+}
+
+#[tokio::test]
+async fn local_new_workspace_uses_the_same_parentless_contract() {
+    let h = start(Opts::default()).await;
+    script_caller(&h.fake);
+    h.fake.reply(
+        "workspace.create",
+        json!({"type": "workspace_created", "workspace": workspace("w3", 3, "w3:t1"),
+               "tab": tab("w3:t1", "w3", 1),
+               "root_pane": pane("w3:p1", "w3:t1", "w3", None)}),
+    );
+    h.fake.reply("pane.report_metadata", ok_reply());
+    h.fake.reply("pane.send_input", ok_reply());
+    h.fake.reply("pane.read", read_result("w3:p1", "$ "));
+    h.fake
+        .reply("pane.process_info", process_info("w3:p1", 31337, 31337));
+
+    let out = ok(
+        &h,
+        "herdr_run",
+        json!({"command": "true", "where": {"workspace": true}}),
+    )
+    .await;
+
+    assert_eq!(out["workspace"], "w3");
+    assert_eq!(count(&h.fake, "workspace.create"), 1);
+}
+
+#[tokio::test]
+async fn remote_existing_pane_uses_its_target_without_workspace_id() {
+    let h = start(remote()).await;
+    h.fake.reply("session.snapshot", snapshot(None));
+    h.fake
+        .reply("pane.process_info", process_info("w1:p2", 100, 555));
+
+    let code = err_code(
+        &h,
+        "herdr_run",
+        json!({"command": "ls", "where": {"pane": "w1:p2"}}),
+    )
+    .await;
+
+    assert_eq!(code, "pane_busy");
+    assert_eq!(count(&h.fake, "pane.send_input"), 0);
+    assert_eq!(count(&h.fake, "tab.create"), 0);
 }
 
 #[tokio::test]
