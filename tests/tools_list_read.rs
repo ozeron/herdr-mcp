@@ -14,7 +14,11 @@ use herdr_mcp::log::Logger;
 use herdr_mcp::profile::Profile;
 use herdr_mcp::server::{BridgeConfig, HerdrMcp};
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest,
+    Implementation,
+};
+use rmcp::service::PeerRequestOptions;
 use serde_json::{Value, json};
 
 async fn start(env_pane: Option<&'static str>) -> Harness {
@@ -223,6 +227,52 @@ async fn wait_change_wakes_on_an_event_and_reads_the_new_sequence() {
 }
 
 #[tokio::test]
+async fn wait_change_catches_a_change_after_subscribing_before_the_first_scan() {
+    let h = start(None).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.on(
+        "events.subscribe",
+        Script::Stream {
+            events: vec![],
+            end: StreamEnd::Hold,
+        },
+    );
+    let mut changed = agent("w1:p4", "w1:t2", "w1", "rev", "codex", "done");
+    changed["state_change_seq"] = json!(4);
+    h.fake.on_after(
+        "agent.get",
+        "events.subscribe",
+        Script::Reply(json!({"type": "agent_info", "agent": changed})),
+    );
+
+    let out = ok(
+        &h,
+        "herdr_wait_change",
+        json!({"targets": [{"target": "rev", "after": 3}], "timeout_ms": 1000}),
+    )
+    .await;
+
+    assert_eq!(out["matched"], true);
+    assert_eq!(out["changed"][0]["state_change_seq"], 4);
+    let methods: Vec<_> = h
+        .fake
+        .requests()
+        .into_iter()
+        .map(|r| r["method"].as_str().unwrap().to_owned())
+        .collect();
+    let subscribe = methods
+        .iter()
+        .position(|m| m == "events.subscribe")
+        .unwrap();
+    let scan = methods.iter().position(|m| m == "agent.get").unwrap();
+    assert!(subscribe < scan, "{methods:?}");
+}
+
+#[tokio::test]
 async fn wait_change_refuses_a_sequence_from_a_different_agent_lifetime() {
     let h = start(None).await;
     let (snapshot, _) = fixture();
@@ -292,6 +342,52 @@ async fn wait_change_times_out_without_mutating_agents() {
     assert_eq!(out["matched"], false);
     assert_eq!(out["timed_out"], true);
     assert_eq!(count(&h.fake, "agent.prompt"), 0);
+}
+
+#[tokio::test]
+async fn cancelling_wait_change_closes_its_subscription() {
+    let h = start(None).await;
+    let (snapshot, _) = fixture();
+    h.fake.reply_seq(
+        "session.snapshot",
+        vec![json!({"type": "session_snapshot", "snapshot": snapshot})],
+    );
+    h.fake.on(
+        "events.subscribe",
+        Script::Stream {
+            events: vec![],
+            end: StreamEnd::Hold,
+        },
+    );
+    let mut current = agent("w1:p4", "w1:t2", "w1", "rev", "codex", "working");
+    current["state_change_seq"] = json!(3);
+    h.fake.reply_params(
+        "agent.get",
+        json!({"target": "w1:p4"}),
+        json!({"type": "agent_info", "agent": current}),
+    );
+
+    let mut params = CallToolRequestParams::new("herdr_wait_change");
+    params.arguments = json!({"targets": [{"target": "rev", "after": 3}], "timeout_ms": 5000})
+        .as_object()
+        .cloned();
+    let handle = h
+        .client
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while count(&h.fake, "agent.get") == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(count(&h.fake, "agent.get"), 1, "wait never scanned");
+    handle.cancel(Some("test".into())).await.unwrap();
+    h.fake.wait_disconnect().await;
 }
 
 #[tokio::test]

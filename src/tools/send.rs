@@ -62,7 +62,7 @@ pub struct SendParams {
     pub mode: Option<SendMode>,
     /// For a prompt. turn waits for the turn it started to settle and returns the excerpt, bounded by the wait cap; on timed_out, pass the turn to herdr_wait. none (default) returns once submitted. A working-agent submission has no turn token, so it returns at once.
     pub wait: Option<SendWait>,
-    /// Deprecated. Any supplied value is rejected before typing; queue ownership cannot be verified.
+    /// Deprecated. `false` is accepted as a no-op; `true` is rejected before typing because queue ownership cannot be verified.
     pub send_now: Option<bool>,
     /// For a prompt. screen (default) leaves the answer on the agent's screen. mail asks the agent to mail its exact final answer to you (your pane inbox, or a remote caller's inbox): wait turn returns it as `reply`; otherwise `reply: "pending"` and the mail arrives later. Use it when you need the whole answer, not a screen excerpt. Needs an agent that has the herdr mail tool; one without it cannot reply.
     pub reply: Option<Reply>,
@@ -112,7 +112,7 @@ fn validate(params: &SendParams) -> Result<(), HerdrError> {
             "reply applies to a prompt, not to text or keys",
         ));
     }
-    if params.send_now.is_some() {
+    if params.send_now == Some(true) {
         return Err(HerdrError::invalid_params(
             "send_now is unsupported because a queue marker cannot identify this prompt; use explicit keys only after inspecting the agent",
         ));

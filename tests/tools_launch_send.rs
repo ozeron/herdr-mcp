@@ -2043,6 +2043,23 @@ async fn send_now_on_an_idle_agent_is_rejected_before_typing() {
 }
 
 #[tokio::test]
+async fn send_now_false_keeps_the_default_prompt_behavior() {
+    let h = start(Opts::default()).await;
+    script_send(&h.fake, Some("w1:p1"), vec![rev("idle", 3)]);
+
+    let out = ok(
+        &h,
+        "herdr_send",
+        json!({"target": "rev", "prompt": "go", "send_now": false}),
+    )
+    .await;
+
+    assert_eq!(out["delivery"], "started");
+    assert_eq!(count(&h.fake, "agent.prompt"), 1);
+    assert!(typed_keys(&h).is_empty());
+}
+
+#[tokio::test]
 async fn send_now_on_a_working_claude_is_rejected_before_typing() {
     let h = start(Opts::default()).await;
     let out = err(
