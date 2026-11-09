@@ -43,7 +43,7 @@ impl Source {
 pub struct ReadParams {
     /// Pane ID or agent name. Defaults to the calling pane.
     pub target: Option<String>,
-    /// The default first tries saved `conversation` text for a working agent with a local session, then terminal `recent`. Explicit `recent` reads terminal history; `visible` reads the screen; `session` reads saved assistant text; `conversation` reads saved user and assistant text. Saved data can lag and omits tools/reasoning.
+    /// The default reads saved `conversation` text for an agent in any state, with no terminal fallback; plain process panes use terminal `recent`. Explicit `recent` reads terminal history; `visible` reads the screen; `session` reads saved assistant text; `conversation` reads saved user and assistant text. Saved data can lag and omits tools/reasoning.
     pub source: Option<Source>,
     /// For `source: session` or `conversation`: pass that view's `next_cursor` to read newly appended complete records. Omit for the recent tail. This is an incremental cursor, not pagination of text cut by lines/max_chars.
     pub after: Option<String>,
@@ -93,22 +93,20 @@ pub async fn run(inner: &Inner, params: ReadParams) -> Result<Value, HerdrError>
             "after requires source: session or conversation",
         ));
     }
-    if implicit_source
-        && inner.install_env.is_some()
-        && let Ok(agent) = client.agent_get(&target).await
-        && agent.agent_status == crate::herdr::AgentStatus::Working
-        && agent.agent_session.is_some()
-        && let Ok(mut saved) = read_session_for_agent(
-            inner, &client, agent, None, requested, lines, max_chars, true,
-        )
-        .await
-        && !saved["text"].as_str().unwrap_or_default().is_empty()
-    {
-        let note = saved["note"].as_str().unwrap_or_default();
-        saved["note"] = json!(format!(
-            "working agent: selected saved conversation without terminal read; {note}; use source: visible for live dialogs"
-        ));
-        return Ok(saved);
+    if implicit_source {
+        match client.agent_get(&target).await {
+            Ok(agent) => {
+                return read_session_for_agent(
+                    inner, &client, agent, None, requested, lines, max_chars, true,
+                )
+                .await;
+            }
+            Err(HerdrError::Api {
+                code: ApiErrorCode::AgentNotFound,
+                ..
+            }) => {}
+            Err(error) => return Err(error),
+        }
     }
     let mut notes = Vec::new();
     if requested > lines {

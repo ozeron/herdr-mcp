@@ -8,7 +8,8 @@ Rules of use:
 
 - Call `herdr_capabilities` first. It shows your caller pane, the tool mode, the wait cap and which agent kinds are supported.
 - Every tool acts on the active Herdr session. Pick it with `herdr_sessions` and `herdr_use_session`. The caller pane exists only in the home session, the one the bridge started in; elsewhere you are an external caller, so mail needs the home session.
-- Check with `herdr_read` before re-sending anything. A send that looks lost may already have landed.
+- Agent reads default to saved conversation; scrolling needs explicit `recent`.
+- Read before re-sending: a send that looks lost may have landed.
 - `herdr_wait {process_exit}` returning `result: no_active_work` (`matched: false`, `timed_out: false`) means nothing was running. Do not re-wait.
 - Launch failures that keep the pane (`agent_not_ready`, `agent_prompt_stalled`, `cancelled`) carry `pane`, `phase` and `turn` details. Continue with `herdr_send`, `herdr_wait` or `herdr_close`; never relaunch.
 - Turn tokens come from `herdr_launch` and `herdr_send`. Pass them to `herdr_wait {turn}` unchanged.

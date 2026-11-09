@@ -169,7 +169,7 @@ async fn each_call_appends_one_json_line_with_tool_session_target_outcome_and_ms
     ok(
         &r.h,
         "herdr_read",
-        json!({"target": "w1:p4", "lines": 20, "max_chars": 50}),
+        json!({"target": "w1:p4", "source": "recent", "lines": 20, "max_chars": 50}),
     )
     .await;
     ok(&r.h, "herdr_sessions", json!({})).await;
@@ -192,12 +192,22 @@ async fn each_call_appends_one_json_line_with_tool_session_target_outcome_and_ms
 async fn each_line_carries_the_client_a_result_summary_and_the_error() {
     let r = serve(ToolMode::Read, true, None, None).await;
     r.h.fake.reply("agent.read", read_result(SECRET));
-    ok(&r.h, "herdr_read", json!({"target": "w1:p4"})).await;
+    ok(
+        &r.h,
+        "herdr_read",
+        json!({"target": "w1:p4", "source": "recent"}),
+    )
+    .await;
     r.h.fake
         .on("agent.read", Script::error("agent_not_found", "no agent"));
     r.h.fake
         .on("pane.read", Script::error("pane_not_found", "no pane"));
-    err_code(&r.h, "herdr_read", json!({"target": "ghost"})).await;
+    err_code(
+        &r.h,
+        "herdr_read",
+        json!({"target": "ghost", "source": "recent"}),
+    )
+    .await;
 
     let lines = r.lines();
     let read = &lines[0];
@@ -218,7 +228,12 @@ async fn each_line_carries_the_client_a_result_summary_and_the_error() {
 async fn read_tools_never_log_pane_output_or_results() {
     let r = serve(ToolMode::Read, true, None, None).await;
     r.h.fake.reply("agent.read", read_result(SECRET));
-    let read = ok(&r.h, "herdr_read", json!({"target": "w1:p4"})).await;
+    let read = ok(
+        &r.h,
+        "herdr_read",
+        json!({"target": "w1:p4", "source": "recent"}),
+    )
+    .await;
     assert!(read.to_string().contains(SECRET), "the tool does return it");
     ok(&r.h, "herdr_sessions", json!({})).await;
     err_code(

@@ -881,7 +881,7 @@ async fn read_defaults_to_the_caller_with_120_lines() {
         json!({"target": "w1:p1"}),
         read_result("w1:p1", "hello"),
     );
-    let read = ok(&h, "herdr_read", json!({})).await;
+    let read = ok(&h, "herdr_read", json!({"source": "recent"})).await;
 
     assert_eq!(read["pane_id"], "w1:p1");
     assert_eq!(read["text"], "hello");
@@ -914,7 +914,12 @@ async fn read_without_target_or_caller_is_an_error() {
 async fn read_caps_lines_at_1000_and_marks_truncated() {
     let h = start(None).await;
     h.fake.reply("agent.read", read_result("w1:p4", "tail"));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 2000})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 2000}),
+    )
+    .await;
 
     assert_eq!(read["truncated"], true);
     assert_eq!(read["lines"], 1000);
@@ -943,7 +948,12 @@ async fn read_tops_up_once_when_blank_lines_leave_too_few() {
         "agent.read",
         vec![read_more("w1:p4", sparse), read_more("w1:p4", full)],
     );
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 4})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 4}),
+    )
+    .await;
 
     assert_eq!(read["text"], "y\nz\na\nb");
     let rows: Vec<_> = h
@@ -968,7 +978,12 @@ async fn a_failed_top_up_keeps_the_first_read() {
             Script::error("herdr_timeout", "slow"),
         ],
     );
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 4})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 4}),
+    )
+    .await;
 
     assert_eq!(read["text"], "a\nb");
     assert_eq!(count(&h.fake, "agent.read"), 2);
@@ -978,7 +993,12 @@ async fn a_failed_top_up_keeps_the_first_read() {
 async fn read_makes_no_top_up_when_no_more_history_exists() {
     let h = start(None).await;
     h.fake.reply("agent.read", read_result("w1:p4", "a\n\nb\n"));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 4})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 4}),
+    )
+    .await;
 
     assert_eq!(read["text"], "a\nb");
     assert_eq!(count(&h.fake, "agent.read"), 1);
@@ -990,7 +1010,12 @@ async fn read_marks_more_above_without_calling_it_truncated() {
     let h = start(None).await;
     h.fake
         .reply("agent.read", read_more("w1:p4", "one\ntwo\nthree\n"));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 2})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 2}),
+    )
+    .await;
 
     assert_eq!(read["text"], "two\nthree");
     assert_eq!(read["truncated"], false);
@@ -1002,7 +1027,12 @@ async fn read_cuts_text_over_max_chars_on_a_character_boundary() {
     let h = start(None).await;
     let text = "é".repeat(100);
     h.fake.reply("agent.read", read_result("w1:p4", &text));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "max_chars": 10})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "max_chars": 10}),
+    )
+    .await;
 
     assert_eq!(read["text"], "é".repeat(10));
     assert_eq!(read["truncated"], true);
@@ -1012,7 +1042,12 @@ async fn read_cuts_text_over_max_chars_on_a_character_boundary() {
 async fn read_keeps_short_text_whole() {
     let h = start(None).await;
     h.fake.reply("agent.read", read_result("w1:p4", "short"));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "max_chars": 10})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "max_chars": 10}),
+    )
+    .await;
     assert_eq!(read["text"], "short");
     assert_eq!(read["truncated"], false);
 }
@@ -1024,7 +1059,12 @@ async fn read_strips_ansi_escapes() {
         "agent.read",
         read_result("w1:p4", "\u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7}ok\r\n"),
     );
-    let read = ok(&h, "herdr_read", json!({"target": "rev"})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent"}),
+    )
+    .await;
     assert_eq!(read["text"], "red ok");
 }
 
@@ -1033,7 +1073,12 @@ async fn read_skips_blank_lines_and_tui_rules() {
     let h = start(None).await;
     let screen = "reply line one\nreply line two\n\n\n\u{2500}\u{2500}\u{2500}\n\u{203a} prompt\n\n  footer\n";
     h.fake.reply("agent.read", read_result("w1:p4", screen));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 3})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 3}),
+    )
+    .await;
     assert_eq!(read["text"], "reply line two\n\u{203a} prompt\n  footer");
     let rows: Vec<_> = h
         .fake
@@ -1053,7 +1098,12 @@ async fn read_resolves_a_moved_pane_through_its_old_alias() {
         json!({"target": "w1:p9"}),
         read_result("w2:p3", "moved"),
     );
-    let read = ok(&h, "herdr_read", json!({"target": "w1:p9"})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "w1:p9", "source": "recent"}),
+    )
+    .await;
 
     assert_eq!(read["pane_id"], "w2:p3");
     assert_eq!(read["text"], "moved");
@@ -1068,7 +1118,12 @@ async fn read_falls_back_to_visible_when_the_agent_is_not_idle() {
         Script::error("agent_not_idle", "use --source visible"),
     );
     h.fake.reply("agent.read", read_result("w1:p4", "screen"));
-    let read = ok(&h, "herdr_read", json!({"target": "rev", "lines": 500})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent", "lines": 500}),
+    )
+    .await;
 
     assert_eq!(read["text"], "screen");
     assert_eq!(read["source"], "visible");
@@ -1089,6 +1144,8 @@ async fn read_falls_back_to_visible_when_the_agent_is_not_idle() {
 async fn read_a_non_agent_pane_falls_through_to_pane_read() {
     let h = start(None).await;
     h.fake
+        .on("agent.get", Script::error("agent_not_found", "no agent"));
+    h.fake
         .on("agent.read", Script::error("agent_not_found", "no agent"));
     h.fake
         .reply("pane.read", read_result("w1:p2", "VITE ready"));
@@ -1102,6 +1159,8 @@ async fn read_a_non_agent_pane_falls_through_to_pane_read() {
 #[tokio::test]
 async fn read_unknown_target_is_target_not_found() {
     let h = start(None).await;
+    h.fake
+        .on("agent.get", Script::error("agent_not_found", "no agent"));
     h.fake
         .on("agent.read", Script::error("agent_not_found", "no agent"));
     h.fake
@@ -1193,7 +1252,12 @@ async fn read_includes_status_for_an_agent_but_not_a_plain_pane() {
             "agent": agent("w1:p4", "w1:t2", "w1", "rev", "codex", "blocked")}),
     );
     h.fake.reply("agent.read", read_result("w1:p4", "x"));
-    let read = ok(&h, "herdr_read", json!({"target": "rev"})).await;
+    let read = ok(
+        &h,
+        "herdr_read",
+        json!({"target": "rev", "source": "recent"}),
+    )
+    .await;
     assert_eq!(read["status"], "blocked");
     assert_eq!(count(&h.fake, "agent.get"), 1);
 
@@ -1297,42 +1361,119 @@ async fn conversation_reads_user_and_assistant_text_without_tools_for_both_provi
 }
 
 #[tokio::test]
-async fn default_busy_read_prefers_saved_conversation_over_visible_screen() {
+async fn default_agent_read_uses_saved_conversation_in_every_state_without_terminal_reads() {
+    for provider in ["claude", "codex"] {
+        for status in ["working", "idle", "done", "blocked"] {
+            let h = start_with_sessions(None, true).await;
+            let mut records = vec![user_message(provider, "Check status")];
+            if provider == "codex" {
+                records.insert(0, codex_meta());
+            }
+            records.push(if provider == "claude" {
+                claude_message("Saved reply")
+            } else {
+                codex_message("Saved reply")
+            });
+            write_session(&h, provider, &records);
+            let mut agent = session_agent(provider);
+            agent["agent"]["agent_status"] = json!(status);
+            h.fake.reply_seq("agent.get", vec![agent]);
+
+            let out = ok(&h, "herdr_read", json!({"target": "rev"})).await;
+
+            assert_eq!(out["source"], "conversation", "{provider} {status}");
+            assert_eq!(out["text"], "user: Check status\nassistant: Saved reply");
+            assert_eq!(out["status"], status);
+            assert_eq!(count(&h.fake, "agent.get"), 2);
+            assert!(h.fake.requests().iter().all(|r| r["method"] == "agent.get"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn default_agent_read_never_falls_back_when_saved_data_is_unavailable_or_empty() {
+    for status in ["working", "idle", "done", "blocked"] {
+        for case in [
+            "missing_file",
+            "missing_session",
+            "missing_dirs",
+            "unsupported",
+            "empty",
+        ] {
+            let h = start_with_sessions(None, case != "missing_dirs").await;
+            let mut agent = session_agent("claude");
+            agent["agent"]["agent_status"] = json!(status);
+            if case == "missing_session" {
+                agent["agent"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("agent_session");
+            }
+            if case == "unsupported" {
+                agent["agent"]["agent"] = json!("other");
+            }
+            if case == "empty" {
+                write_session(&h, "claude", &[json!({"type": "system"})]);
+            }
+            h.fake.reply_seq("agent.get", vec![agent]);
+            // A terminal fallback would succeed, making it observable rather than an unscripted error.
+            h.fake.reply("agent.read", read_result("w1:p4", "TERMINAL"));
+            h.fake.reply("pane.read", read_result("w1:p4", "TERMINAL"));
+
+            if case == "empty" {
+                let out = ok(&h, "herdr_read", json!({"target": "rev"})).await;
+                assert_eq!(out["source"], "conversation");
+                assert_eq!(out["text"], "");
+                assert!(out["next_cursor"].is_string());
+            } else {
+                assert_eq!(
+                    err_code(&h, "herdr_read", json!({"target": "rev"})).await,
+                    "session_unavailable",
+                    "{status} {case}"
+                );
+            }
+            assert!(
+                h.fake.requests().iter().all(|r| r["method"] == "agent.get"),
+                "{status} {case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn default_read_does_not_touch_terminal_when_agent_lookup_fails() {
     let h = start_with_sessions(None, true).await;
-    write_session(
-        &h,
-        "claude",
-        &[
-            user_message("claude", "Check status"),
-            claude_message("Working"),
-        ],
+    h.fake
+        .on("agent.get", Script::error("timeout", "lookup timed out"));
+    h.fake.reply("agent.read", read_result("w1:p4", "TERMINAL"));
+    assert_eq!(
+        err_code(&h, "herdr_read", json!({"target": "rev"})).await,
+        "timeout"
     );
-    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
-
-    let out = ok(&h, "herdr_read", json!({"target": "rev"})).await;
-
-    assert_eq!(out["source"], "conversation");
-    assert_eq!(out["text"], "user: Check status\nassistant: Working");
-    assert_eq!(out["status"], "working");
-    assert_eq!(count(&h.fake, "agent.get"), 2);
     assert_eq!(count(&h.fake, "agent.read"), 0);
     assert_eq!(count(&h.fake, "pane.read"), 0);
 }
 
 #[tokio::test]
-async fn default_busy_read_marks_visible_fallback_when_transcript_is_missing() {
-    let h = start_with_sessions(None, true).await;
-    h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
-    h.fake
-        .on("agent.read", Script::error("agent_not_idle", "busy"));
-    h.fake
-        .reply("agent.read", read_result("w1:p4", "visible fragment"));
-
-    let out = ok(&h, "herdr_read", json!({"target": "rev"})).await;
-
-    assert_eq!(out["source"], "visible");
-    assert_eq!(out["terminal_history_unavailable"], true);
-    assert_eq!(out["text"], "visible fragment");
+async fn explicit_terminal_sources_override_saved_conversation_for_agents() {
+    for source in ["recent", "visible"] {
+        let h = start_with_sessions(None, true).await;
+        write_session(&h, "claude", &[claude_message("Saved reply")]);
+        h.fake.reply_seq("agent.get", vec![session_agent("claude")]);
+        h.fake
+            .reply("agent.read", read_result("w1:p4", "Terminal reply"));
+        let out = ok(&h, "herdr_read", json!({"target": "rev", "source": source})).await;
+        assert_eq!(out["source"], source);
+        assert_eq!(out["text"], "Terminal reply");
+        let reads: Vec<_> = h
+            .fake
+            .requests()
+            .into_iter()
+            .filter(|r| r["method"] == "agent.read")
+            .collect();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0]["params"]["source"], source);
+    }
 }
 
 #[tokio::test]
